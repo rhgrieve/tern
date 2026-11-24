@@ -1,10 +1,19 @@
 .messages { background: transparent; padding: 12px 0; }
 .messages > row { padding: 0; background: transparent; }
 .messages > row:hover { background: alpha(currentColor, 0.03); }
-.message { padding: 8px 20px 2px 20px; }
-.message.joined { padding-top: 2px; }
-.day { font-size: 0.85em; font-weight: 600; opacity: 0.6; padding: 10px 0 6px 0; }
+/* Messages of one person belong together: between people there is clearly more room. */
+.message { padding: 20px 20px 4px 20px; }
+.message.joined { padding-top: 4px; }
+.message .text { line-height: 1.12; }
+.day { font-size: 0.85em; font-weight: 600; opacity: 0.6; padding: 6px 0 18px 0; }
 .code { background: alpha(currentColor, 0.06); border-radius: 8px; padding: 8px 10px; }
+.adaptive { padding: 12px 14px; }
+.part { background: alpha(currentColor, 0.06); border-radius: 8px; padding: 10px 12px; }
+.part-accent { background: alpha(var(--accent-bg-color), 0.18); }
+.part-success { background: alpha(var(--success-bg-color), 0.18); }
+.part-warning { background: alpha(var(--warning-bg-color), 0.18); }
+.part-error { background: alpha(var(--error-bg-color), 0.18); }
+.badge { background: alpha(currentColor, 0.12); border-radius: 99px; padding: 1px 10px; font-size: 0.9em; }
 .table { padding: 8px 12px; }
 .quote { border-left: 3px solid alpha(currentColor, 0.25); padding-left: 10px; opacity: 0.85; }
 .picture { border-radius: 10px; background: alpha(currentColor, 0.06); }
@@ -27,5 +36,6 @@
 .unread-dot { min-width: 9px; min-height: 9px; border-radius: 99px; background: var(--accent-bg-color); }
 .chat.muted .unread-dot { background: alpha(currentColor, 0.4); }
 .composer { background: var(--card-bg-color); border-radius: 14px; margin: 0 16px 16px 16px; padding: 4px; box-shadow: 0 0 0 1px alpha(currentColor, 0.1); }
+.composer scrollbar slider { min-height: 16px; }
 .composer textview, .composer textview text { background: transparent; }
 .hit { padding: 6px 4px; }

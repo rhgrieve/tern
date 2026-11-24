@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use gtk4 as gtk;
 use gtk4::prelude::*;
+use gtk4::{gdk, glib};
 
 use crate::list::MessageList;
 use crate::row::Item;
@@ -32,8 +33,10 @@ pub struct Tools {
     usual: RefCell<Vec<gtk::Widget>>,
     failed: RefCell<Vec<gtk::Widget>>,
     item: RefCell<Option<Rc<Item>>>,
-    /// The emoji chooser is open: the bar stays.
+    /// The emoji chooser is open, or the bar was opened with the keyboard: it stays.
     held: Cell<bool>,
+    /// What had the keyboard focus before the bar.
+    back: RefCell<Option<gtk::Widget>>,
 }
 
 impl Tools {
@@ -50,6 +53,7 @@ impl Tools {
                 .icon_name(icon)
                 .tooltip_text(tip)
                 .build();
+            crate::row::say(&button, tip);
             button.add_css_class("flat");
             button
         };
@@ -63,6 +67,7 @@ impl Tools {
             failed: RefCell::default(),
             item: RefCell::default(),
             held: Cell::new(false),
+            back: RefCell::default(),
         });
         let used = Rc::new(used);
         let run = {
@@ -70,7 +75,7 @@ impl Tools {
             move |tool: Tool| {
                 if let Some(tools) = tools.upgrade() {
                     let item = tools.item.borrow().clone();
-                    tools.hide();
+                    tools.leave();
                     if let Some(item) = item {
                         used(&item, tool);
                     }
@@ -82,6 +87,7 @@ impl Tools {
                 .label(emoji)
                 .tooltip_text("React")
                 .build();
+            crate::row::say(&quick, &format!("React with {emoji}"));
             quick.add_css_class("flat");
             quick.connect_clicked({
                 let run = run.clone();
@@ -101,7 +107,7 @@ impl Tools {
             let tools = Rc::downgrade(&tools);
             move |_| {
                 if let Some(tools) = tools.upgrade() {
-                    tools.held.set(false);
+                    tools.held.set(tools.back.borrow().is_some());
                 }
             }
         });
@@ -159,6 +165,54 @@ impl Tools {
             }
         });
         list.over.add_controller(motion);
+
+        // Everything the pointer can do with a message, the keyboard can.
+        let keys = gtk::EventControllerKey::new();
+        // Before the list, which takes Enter for itself.
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        keys.connect_key_pressed({
+            let (tools, list) = (Rc::downgrade(&tools), list.clone());
+            move |_, key, _, modifiers| {
+                let menu = match key {
+                    gdk::Key::Menu | gdk::Key::Return | gdk::Key::KP_Enter => true,
+                    gdk::Key::F10 => modifiers.contains(gdk::ModifierType::SHIFT_MASK),
+                    _ => false,
+                };
+                match tools.upgrade() {
+                    Some(tools) if menu && tools.open(&list) => glib::Propagation::Stop,
+                    _ => glib::Propagation::Proceed,
+                }
+            }
+        });
+        list.view.add_controller(keys);
+        let escape = gtk::EventControllerKey::new();
+        escape.set_propagation_phase(gtk::PropagationPhase::Capture);
+        escape.connect_key_pressed({
+            let tools = Rc::downgrade(&tools);
+            move |_, key, _, _| match tools.upgrade() {
+                Some(tools) if key == gdk::Key::Escape => {
+                    tools.leave();
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        });
+        root.add_controller(escape);
+        let focus = gtk::EventControllerFocus::new();
+        focus.connect_leave({
+            let tools = Rc::downgrade(&tools);
+            move |_| {
+                if let Some(tools) = tools
+                    .upgrade()
+                    .filter(|tools| tools.back.borrow().is_some())
+                {
+                    tools.back.replace(None);
+                    tools.held.set(false);
+                    tools.hide();
+                }
+            }
+        });
+        root.add_controller(focus);
         list.root.vadjustment().connect_value_changed({
             let tools = Rc::downgrade(&tools);
             move |_| {
@@ -173,6 +227,38 @@ impl Tools {
     fn hide(&self) {
         self.root.set_visible(false);
         self.item.replace(None);
+    }
+
+    /// Closes the bar; the keyboard focus goes back to where it was.
+    fn leave(&self) {
+        let back = self.back.take();
+        self.held.set(false);
+        if let Some(back) = back {
+            back.grab_focus();
+        }
+        self.hide();
+    }
+
+    /// Opens the bar for the message with the keyboard focus.
+    fn open(&self, list: &MessageList) -> bool {
+        let Some((row, cell)) = list.focused() else {
+            return false;
+        };
+        // In the text itself, the keys are the text's.
+        if !cell.has_focus() {
+            return false;
+        }
+        let (Some(item), Some(bounds)) = (row.item(), row.compute_bounds(&list.root)) else {
+            return false;
+        };
+        if !(item.sent || item.failed) {
+            return false;
+        }
+        self.show(item, f64::from(bounds.y()));
+        self.held.set(true);
+        self.back.replace(Some(cell));
+        self.root.child_focus(gtk::DirectionType::TabForward);
+        true
     }
 
     fn moved(&self, list: &MessageList, x: f64, y: f64) {
@@ -201,6 +287,10 @@ impl Tools {
         {
             return;
         }
+        self.show(item, top);
+    }
+
+    fn show(&self, item: Rc<Item>, top: f64) {
         self.edit.set_visible(item.source.is_some());
         self.delete.set_visible(item.own && item.sent);
         for widget in self.usual.borrow().iter() {
@@ -212,5 +302,84 @@ impl Tools {
         self.item.replace(Some(item));
         self.root.set_margin_top((top - 10.0).max(2.0) as i32);
         self.root.set_visible(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// As the composer's test: needs a display.
+    #[test]
+    #[ignore = "needs a display"]
+    fn the_composer_is_not_the_only_thing_the_keyboard_reaches() {
+        gtk::init().unwrap();
+        libadwaita::init().unwrap();
+        let list = MessageList::default();
+        let done: Rc<RefCell<Vec<(String, Tool)>>> = Rc::default();
+        let tools = Tools::attach(&list, {
+            let done = done.clone();
+            move |item, tool| done.borrow_mut().push((item.id.clone(), tool))
+        });
+        let before = gtk::Button::with_label("before");
+        let after = gtk::Button::with_label("after");
+        let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        holder.append(&before);
+        holder.append(&list.whole);
+        holder.append(&after);
+        let window = gtk::Window::builder()
+            .default_width(600)
+            .default_height(500)
+            .child(&holder)
+            .build();
+        window.present();
+        let wait = |milliseconds: u64| {
+            let end = std::time::Instant::now() + std::time::Duration::from_millis(milliseconds);
+            while std::time::Instant::now() < end {
+                glib::MainContext::default().iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        let items = |count: usize, name: &str| {
+            (0..count)
+                .map(|at| Item {
+                    id: format!("{name}{at}"),
+                    sender: "Ann".into(),
+                    time: "10:00".into(),
+                    text: format!("{name} {at}"),
+                    sent: true,
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>()
+        };
+        for (name, count) in [("a", 60), ("b", 45), ("c", 3)] {
+            list.set(items(count, name));
+            wait(400);
+            assert!(list.is_whole());
+            assert_eq!(list.items.n_items() as usize, count);
+            before.grab_focus();
+            window.child_focus(gtk::DirectionType::TabForward);
+            wait(20);
+            let row = list.focused().expect("the list is reached").0;
+            assert_eq!(row.item().unwrap().id, format!("{name}{}", count - 1));
+            assert!(list.follows(), "walking in does not leave the end");
+            after.grab_focus();
+            list.focus_newest();
+            let (row, cell) = list.focused().unwrap();
+            assert_eq!(row.item().unwrap().id, format!("{name}{}", count - 1));
+            assert!(cell.has_focus());
+            assert!(tools.open(&list));
+            assert!(tools.root.is_visible());
+            assert!(tools.root.focus_child().is_some(), "the first button");
+            tools.leave();
+            assert!(cell.has_focus() && !tools.root.is_visible());
+            tools.open(&list);
+            let button = tools.root.first_child().unwrap();
+            button.downcast::<gtk::Button>().unwrap().emit_clicked();
+            assert!(cell.has_focus());
+            let (id, tool) = done.borrow_mut().pop().unwrap();
+            assert_eq!(id, format!("{name}{}", count - 1));
+            assert_eq!(tool, Tool::React(QUICK[0].into()));
+        }
     }
 }

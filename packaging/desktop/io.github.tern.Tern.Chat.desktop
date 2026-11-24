@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Tern chat
+Comment=Gives chat windows Tern's icon; not started by itself
+Exec=tern
+Icon=io.github.tern.Tern
+NoDisplay=true
+StartupWMClass=io.github.tern.Tern.Chat

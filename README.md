@@ -11,6 +11,9 @@ notifications you can answer. Recent pictures and faces are kept for offline use
 a tray icon shows your status and unread chats. The window shows chats and
 channels with threads, sends, answers, edits and reacts, mentions people,
 attaches pictures and files, and searches.
+Conversations can have windows of their own (Ctrl+Shift+O, or a double click), known to window
+managers as `io.github.tern.Tern.Chat`. Adaptive Cards are shown; answering one opens Teams.
+Everything works with the keyboard (Ctrl+? lists the keys) and says what it is to screen readers.
 
 | Program | What it does |
 |---|---|
@@ -28,7 +31,7 @@ attaches pictures and files, and searches.
 - The cache holds message text, in `~/.local/share/tern`, readable only by you. It is not encrypted
   by itself; `logout` keeps it. Pictures and files take at most 1 GB each.
 - Only pictures Teams itself stores are fetched ahead. Anything else would tell its owner when you
-  received a message.
+  received a message. The same goes for pictures in cards.
 
 To run a build beside the installed service: `TERN_INSTANCE=dev TERN_NO_PRESENCE=1 ternd`.
 
@@ -36,6 +39,7 @@ To run a build beside the installed service: `TERN_INSTANCE=dev TERN_NO_PRESENCE
 cargo test --workspace
 cargo run --release -p tern -- --demo
 cargo run --release -p tern --example scroll   # 10,000 messages, on a real display
+cargo run --release -p tern --example opening  # what opening chats costs, needs a display
 cargo run -p tern-cli -- sensors     # watch detection, no account needed
 ```
 

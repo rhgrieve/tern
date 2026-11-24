@@ -6,6 +6,7 @@ use teams_core::{
     files, html_to_spans, linked_message_spans, markdown_to_html, reaction_summaries,
 };
 
+use crate::card;
 use crate::rich::{self, Block};
 use crate::row::{Item, Reaction};
 
@@ -283,8 +284,16 @@ fn content(message: &MessageRecord) -> Vec<Block> {
         blocks.push(Block::Heading(rich::escape(&one_line(subject))));
     }
     blocks.extend(rich::blocks(&linked_message_spans(message)));
-    for card in teams_core::card_texts(message) {
-        blocks.push(Block::Quote(vec![Block::Text(rich::escape(card.trim()))]));
+    for attachment in teams_core::attachments(message) {
+        let card = attachment.adaptive_card().and_then(|card| {
+            let teams = card::link(&message.conversation_id, &message.message_id);
+            card::read(&card, teams)
+        });
+        if let Some(card) = card {
+            blocks.push(Block::Card(Box::new(card)));
+        } else if let Some(text) = attachment.card_text() {
+            blocks.push(Block::Quote(vec![Block::Text(rich::escape(text.trim()))]));
+        }
     }
     for file in files(message) {
         let name = rich::escape(&one_line(&file.name));

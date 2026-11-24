@@ -3,6 +3,19 @@
 use chrono::{Duration, Utc};
 use store::{ChatRecord, MemberRecord, MessageRecord, Store};
 
+const CARD: &str = r#"{"type":"AdaptiveCard","version":"1.5","body":[
+{"type":"TextBlock","text":"North buoy is off its place","size":"Large","weight":"Bolder","wrap":true},
+{"type":"Badge","text":"Needs a boat","style":"Warning"},
+{"type":"TextBlock","text":"It moved **40 m** since noon. The [chart](https://example.com/chart) shows where to.","wrap":true},
+{"type":"FactSet","facts":[{"title":"Found","value":"10:20"},{"title":"By","value":"Ada Quill"}]},
+{"type":"ColumnSet","separator":true,"columns":[
+{"type":"Column","width":"stretch","items":[{"type":"TextBlock","text":"Wind","isSubtle":true},{"type":"TextBlock","text":"6.2 m/s","size":"ExtraLarge"}]},
+{"type":"Column","width":"stretch","items":[{"type":"TextBlock","text":"Tide","isSubtle":true},{"type":"TextBlock","text":"falling","size":"ExtraLarge","color":"Good"}]}]},
+{"type":"Container","style":"attention","items":[{"type":"TextBlock","text":"Dark in two hours","wrap":true}]}],
+"actions":[{"type":"Action.OpenUrl","title":"Open chart","url":"https://example.com/chart"},
+{"type":"Action.ShowCard","title":"History","card":{"type":"AdaptiveCard","body":[{"type":"TextBlock","text":"Also in March"}]}},
+{"type":"Action.Submit","title":"Send a boat"},{"type":"Action.Submit","title":"Wait"}]}"#;
+
 pub fn store() -> Store {
     let store = Store::open_in_memory().expect("in memory");
     let _ = store.set_meta("me_user_id", "me");
@@ -83,6 +96,20 @@ pub fn store() -> Store {
             });
         }
     }
+    messages.push(MessageRecord {
+        conversation_id: "c4".into(),
+        message_id: "card".into(),
+        sender_id: Some("bo".into()),
+        sender_name: Some("Harbour watch".into()),
+        created_at: now,
+        attachments_json: serde_json::json!([{
+            "content_type": "application/vnd.microsoft.card.adaptive",
+            "id": "card",
+            "content": CARD
+        }])
+        .to_string(),
+        ..Default::default()
+    });
     let _ = store.upsert_messages(&messages);
     channel(&store);
     let unsent = |id: &str, state, payload: &str, error: Option<&str>| store::OutboxRecord {

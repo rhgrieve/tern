@@ -231,6 +231,15 @@ impl Backend for Teams {
     }
 }
 
+/// A person, or everyone in a chat, who goes by the chat's own id.
+fn mentioned(conversation: &str, id: &str, name: &str) -> MentionInput {
+    if id == conversation {
+        MentionInput::everyone(conversation, name)
+    } else {
+        MentionInput::user(id, name)
+    }
+}
+
 impl crate::outbox::Post for Teams {
     async fn post(
         &self,
@@ -241,7 +250,7 @@ impl crate::outbox::Post for Teams {
         let mentions: Vec<MentionInput> = draft
             .mentions
             .iter()
-            .map(|(id, name)| MentionInput::user(id, name))
+            .map(|(id, name)| mentioned(conversation, id, name))
             .collect();
         let mut extras = MessageExtras::default();
         for file in &draft.files {
@@ -514,6 +523,22 @@ mod tests {
         let code = teams_core::markdown_to_html("`@Sam O'Brien`");
         let (html, _) = teams_core::apply_mentions(&code, &inputs[..1]);
         println!("{html}");
+    }
+
+    #[test]
+    fn everyone_is_the_chat_itself() {
+        let everyone = mentioned("19:g@thread.v2", "19:g@thread.v2", "Everyone");
+        assert_eq!(
+            everyone,
+            MentionInput::everyone("19:g@thread.v2", "Everyone")
+        );
+        let html = teams_core::markdown_to_html("@Everyone, lunch?");
+        let (html, mentions) = teams_core::apply_mentions(&html, &[everyone]);
+        assert_eq!(mentions.len(), 1, "{html}");
+        assert_eq!(
+            mentioned("19:g@thread.v2", "u1", "Ann"),
+            MentionInput::user("u1", "Ann")
+        );
     }
 
     #[test]

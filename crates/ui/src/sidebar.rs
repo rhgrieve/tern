@@ -90,20 +90,26 @@ fn bind(widgets: &RowWidgets, row: &ChatRow) {
     };
     set("unread", row.unread && !row.muted);
     set("muted", row.muted);
-    // Screen readers get what the dot shows.
-    let state = if row.unread { ", unread" } else { "" };
-    widgets
-        .root
-        .update_property(&[gtk::accessible::Property::Label(&format!(
-            "{}{state}. {}",
-            row.title, row.preview
-        ))]);
 }
+
+/// What a screen reader says for a row, with what the dot shows.
+fn spoken(row: &ChatRow) -> String {
+    let unread = if row.unread { ", unread" } else { "" };
+    let mentions = if row.mentions { ", mentions you" } else { "" };
+    let muted = if row.muted { ", muted" } else { "" };
+    format!(
+        "{}{unread}{mentions}{muted}. {} {}",
+        row.title, row.preview, row.when
+    )
+}
+
+type Chosen = Rc<RefCell<Option<Rc<dyn Fn(&str)>>>>;
 
 #[derive(Clone)]
 pub struct Sidebar {
     pub root: gtk::ScrolledWindow,
     selection: gtk::SingleSelection,
+    view: gtk::ListView,
     items: gio::ListStore,
     rows: Rc<RefCell<Vec<ChatRow>>>,
     wanted: Rc<RefCell<Option<String>>>,
@@ -111,6 +117,8 @@ pub struct Sidebar {
     /// When the user last scrolled, and what waits for that to end.
     moved: Rc<std::cell::Cell<Option<Instant>>>,
     later: Rc<RefCell<Option<Vec<ChatRow>>>>,
+    /// Called for a row clicked twice.
+    twice: Chosen,
 }
 
 impl Sidebar {
@@ -122,9 +130,25 @@ impl Sidebar {
             .can_unselect(true)
             .build();
         let factory = gtk::SignalListItemFactory::new();
-        factory.connect_setup(|_, cell| {
+        let twice = Chosen::default();
+        let clicked = twice.clone();
+        factory.connect_setup(move |_, cell| {
             if let Some(cell) = cell.downcast_ref::<gtk::ListItem>() {
                 let widgets = build();
+                let click = gtk::GestureClick::new();
+                click.connect_pressed({
+                    let (cell, clicked) = (cell.downgrade(), clicked.clone());
+                    move |_, count, _, _| {
+                        let item = cell.upgrade().and_then(|cell| cell.item());
+                        let row = item.and_downcast::<BoxedAnyObject>();
+                        let run = clicked.borrow().clone();
+                        if let (2, Some(row), Some(run)) = (count, row, run) {
+                            let id = row.borrow::<ChatRow>().id.clone();
+                            run(&id);
+                        }
+                    }
+                });
+                widgets.root.add_controller(click);
                 cell.set_child(Some(&widgets.root));
                 // The widgets live exactly as long as the cell.
                 unsafe { cell.set_data("widgets", widgets) };
@@ -142,7 +166,9 @@ impl Sidebar {
                     .map(|widgets| widgets.as_ref())
             };
             if let Some(widgets) = widgets {
-                bind(widgets, &item.borrow::<ChatRow>());
+                let row = item.borrow::<ChatRow>();
+                bind(widgets, &row);
+                cell.set_accessible_label(&spoken(&row));
             }
         });
         let view = gtk::ListView::builder()
@@ -150,6 +176,7 @@ impl Sidebar {
             .factory(&factory)
             .build();
         view.add_css_class("navigation-sidebar");
+        crate::row::say(&view, "Chats and channels");
         let root = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
@@ -184,13 +211,20 @@ impl Sidebar {
         Sidebar {
             root,
             selection,
+            view,
             items,
             rows: Rc::default(),
             wanted,
             quiet,
             moved,
             later: Rc::default(),
+            twice,
         }
+    }
+
+    /// Calls `run` for a row that is clicked twice.
+    pub fn connect_twice(&self, run: impl Fn(&str) + 'static) {
+        self.twice.replace(Some(Rc::new(run)));
     }
 
     /// Shows `rows`, changing as little as possible so the list keeps its place. Waits while the
@@ -268,6 +302,33 @@ impl Sidebar {
         if self.selection.selected() != at {
             self.selection.set_selected(at);
         }
+    }
+
+    /// Calls `run` when Enter is pressed on a row.
+    pub fn connect_enter(&self, run: impl Fn() + 'static) {
+        self.view.connect_activate(move |_, _| run());
+    }
+
+    /// Moves the keyboard focus to the open conversation's row.
+    pub fn focus(&self) {
+        let at = match self.selection.selected() {
+            gtk::INVALID_LIST_POSITION => 0,
+            at => at,
+        };
+        if at < self.items.n_items() {
+            self.view.scroll_to(at, gtk::ListScrollFlags::FOCUS, None);
+            self.view.grab_focus();
+        }
+    }
+
+    /// The keyboard is in use in the list.
+    pub fn has_keyboard(&self) -> bool {
+        let Some(window) = self.root.root().and_downcast::<gtk::Window>() else {
+            return false;
+        };
+        window.gets_focus_visible()
+            && gtk::prelude::RootExt::focus(&window)
+                .is_some_and(|focus| focus.is_ancestor(&self.view))
     }
 
     pub fn count(&self) -> u32 {

@@ -23,6 +23,7 @@ pub enum Block {
         rows: Vec<Vec<String>>,
     },
     Picture(String),
+    Card(Box<crate::card::Card>),
     Rule,
 }
 
@@ -199,7 +200,7 @@ pub fn blocks(spans: &[Span]) -> Vec<Block> {
     builder.blocks
 }
 
-fn inline(spans: &[Span]) -> String {
+pub fn inline(spans: &[Span]) -> String {
     let mut out = String::new();
     for span in spans {
         push_inline(&mut out, span);

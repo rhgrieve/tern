@@ -1,7 +1,6 @@
 //! The main window.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,13 +16,14 @@ use tokio::sync::mpsc;
 
 use crate::client::{Client, News};
 use crate::composer::{Aim, Composer, Written};
+use crate::desk::{self, Desk};
 use crate::history::{History, Need};
 use crate::list::MessageList;
 use crate::model::{self, Conversation, Filter, OUTGOING};
-use crate::row::Item;
+use crate::row::{Item, say};
 use crate::sidebar::Sidebar;
 use crate::tools::{Tool, Tools};
-use crate::{art, drafts, mention, palette};
+use crate::{art, mention, palette};
 
 const CHATS: usize = 400;
 
@@ -55,8 +55,10 @@ pub struct Window {
     pages: gtk::Stack,
     back: gtk::Button,
     writing: gtk::Label,
-    /// The drafts as they were last saved.
-    saved: RefCell<HashMap<String, Written>>,
+    desk: Rc<Desk>,
+    /// Shows one conversation, without the list of chats.
+    own: bool,
+    out: gtk::Button,
     /// Shown while older messages are fetched.
     loading: gtk::Box,
     tools: RefCell<Option<Rc<Tools>>>,
@@ -65,7 +67,6 @@ pub struct Window {
     /// Counts reads, so that a slow one does not replace a newer.
     chats_turn: Cell<u64>,
     open_turn: Cell<u64>,
-    demo: bool,
 }
 
 /// Someone who stopped without saying so is taken off after this.
@@ -89,7 +90,9 @@ pub fn load_style() {
 }
 
 impl Window {
-    pub fn new(app: &adw::Application, client: Client, demo: bool) -> Rc<Window> {
+    /// The main window, or one with a conversation of its `own`.
+    pub fn new(desk: &Rc<Desk>, client: Client, own: bool) -> Rc<Window> {
+        let app = desk.app();
         Rc::new_cyclic(|weak: &Weak<Window>| {
             let later = |run: fn(&Rc<Window>)| {
                 let weak = weak.clone();
@@ -105,14 +108,24 @@ impl Window {
                 let weak = weak.clone();
                 move |id| {
                     if let Some(window) = weak.upgrade() {
-                        window.open(id);
+                        window.choose(id);
                     }
                 }
             });
+            sidebar.connect_twice({
+                let weak = weak.clone();
+                move |id| {
+                    if let Some(window) = weak.upgrade() {
+                        window.desk.pop_out(id);
+                    }
+                }
+            });
+            sidebar.connect_enter(later(|window| window.composer.focus()));
             let search = gtk::Button::builder()
                 .icon_name("system-search-symbolic")
                 .tooltip_text("Search (Ctrl+K)")
                 .build();
+            say(&search, "Search");
             search.connect_clicked({
                 let search = later(Window::search);
                 move |_| search()
@@ -177,10 +190,11 @@ impl Window {
             list.over.add_controller(wheel);
             let clamp = adw::Clamp::builder()
                 .maximum_size(980)
-                .child(&list.over)
+                .child(&list.whole)
                 .vexpand(true)
                 .build();
             let composer = Composer::new(
+                desk.drafts.clone(),
                 {
                     let weak = weak.clone();
                     move |id, text, aim| {
@@ -242,19 +256,35 @@ impl Window {
                 .tooltip_text("Back to the channel (Esc)")
                 .visible(false)
                 .build();
+            say(&back, "Back to the channel");
             back.connect_clicked({
                 let back = later(Window::leave_thread);
                 move |_| back()
             });
             header.pack_start(&back);
+            let out = gtk::Button::builder()
+                .icon_name("window-new-symbolic")
+                .tooltip_text("Open in its own window (Ctrl+Shift+O)")
+                .visible(false)
+                .build();
+            say(&out, "Open in its own window");
+            out.connect_clicked({
+                let out = later(Window::pop_out);
+                move |_| out()
+            });
+            header.pack_end(&out);
             let banner = adw::Banner::new("");
             let main = adw::ToolbarView::builder().content(&pages).build();
             main.add_top_bar(&header);
             main.add_top_bar(&banner);
 
+            let content = adw::NavigationPage::new(&main, "Conversation");
+            content.set_can_pop(!own);
             let split = adw::NavigationSplitView::builder()
                 .sidebar(&adw::NavigationPage::new(&side, "Chats"))
-                .content(&adw::NavigationPage::new(&main, "Conversation"))
+                .content(&content)
+                .collapsed(own)
+                .show_content(own)
                 .min_sidebar_width(260.0)
                 .max_sidebar_width(360.0)
                 .sidebar_width_fraction(0.3)
@@ -264,28 +294,37 @@ impl Window {
             let window = adw::ApplicationWindow::builder()
                 .application(app)
                 .title("Tern")
-                .default_width(1100)
+                .default_width(if own { 720 } else { 1100 })
                 .default_height(760)
                 .width_request(340)
                 .height_request(300)
                 .content(&toasts)
                 .build();
+            if own {
+                desk::name_surface(&window);
+            }
             let narrow = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
                 adw::BreakpointConditionLengthType::MaxWidth,
                 720.0,
                 adw::LengthUnit::Sp,
             ));
             narrow.add_setter(&split, "collapsed", Some(&true.to_value()));
-            window.add_breakpoint(narrow);
+            if !own {
+                window.add_breakpoint(narrow);
+            }
 
             // Keys
-            let keys: [(&str, &[&str], Run); 6] = [
+            let keys: [(&str, &[&str], Run); 10] = [
                 ("leave", &["Escape"], Window::leave_thread),
                 ("search", &["<Ctrl>k", "<Ctrl>f"], Window::search),
                 ("next", &["<Alt>Down"], |window| window.step(1)),
                 ("previous", &["<Alt>Up"], |window| window.step(-1)),
                 ("write", &["<Ctrl>r"], |window| window.composer.focus()),
                 ("newest", &["<Ctrl>End"], |window| window.list.to_end()),
+                ("out", &["<Ctrl><Shift>o"], Window::pop_out),
+                ("area", &["F6"], Window::next_area),
+                ("keys", &["<Ctrl>question"], Window::show_keys),
+                ("close", &["<Ctrl>w"], |window| window.window.close()),
             ];
             for (name, shortcuts, run) in keys {
                 let action = gio::SimpleAction::new(name, None);
@@ -323,10 +362,10 @@ impl Window {
             });
             window.add_action(&react);
             window.connect_close_request({
-                let save = later(Window::save_drafts);
+                let closed = later(Window::closed);
                 move |_| {
-                    save();
-                    glib::Propagation::Proceed
+                    closed();
+                    glib::Propagation::Stop
                 }
             });
             glib::timeout_add_local(Duration::from_secs(2), {
@@ -369,14 +408,15 @@ impl Window {
                 pages,
                 back,
                 writing,
-                saved: RefCell::default(),
+                desk: desk.clone(),
+                own,
+                out,
                 loading,
                 tools: RefCell::default(),
                 client,
                 state: RefCell::default(),
                 chats_turn: Cell::new(0),
                 open_turn: Cell::new(0),
-                demo,
             }
         })
     }
@@ -459,7 +499,7 @@ impl Window {
                     Some(post) => format!("{conversation}/{post}"),
                     None => conversation,
                 };
-                self.composer.give_back(
+                self.desk.give_back(
                     &key,
                     Written {
                         text,
@@ -483,23 +523,101 @@ impl Window {
     }
 
     fn save_drafts(self: &Rc<Self>) {
-        let path = self
-            .state
-            .borrow()
-            .account
-            .as_deref()
-            .and_then(drafts::path);
-        let Some(path) = path.filter(|_| !self.demo) else {
-            return;
+        if self.desk.is_account(self.state.borrow().account.as_deref()) {
+            self.composer.keep();
+            self.desk.save();
+        }
+    }
+
+    /// The user closed the window.
+    fn closed(self: &Rc<Self>) {
+        let (open, thread) = {
+            let state = self.state.borrow();
+            (state.open.clone(), state.thread.clone())
         };
-        let all = self.composer.all();
-        if *self.saved.borrow() == all {
-            return;
+        self.put_away();
+        if let Some(id) = open.filter(|_| self.own) {
+            self.desk.take_back(&id, thread.as_deref());
         }
-        match drafts::save(&path, &all) {
-            Ok(()) => drop(self.saved.replace(all)),
-            Err(error) => eprintln!("tern: drafts could not be saved: {error}"),
+    }
+
+    /// Windows are hidden and used again: what is in them may still be working.
+    pub fn put_away(self: &Rc<Self>) {
+        self.save_drafts();
+        if self.own {
+            self.leave();
         }
+        self.window.set_visible(false);
+        self.desk.app().remove_window(&self.window);
+    }
+
+    fn pop_out(self: &Rc<Self>) {
+        let open = self.state.borrow().open.clone();
+        if let Some(id) = open.filter(|_| !self.own) {
+            self.desk.pop_out(&id);
+        }
+    }
+
+    /// Shows no conversation.
+    pub fn leave(self: &Rc<Self>) {
+        {
+            let mut state = self.state.borrow_mut();
+            state.open = None;
+            state.thread = None;
+            state.channel = false;
+            state.history = History::new();
+            state.typing.clear();
+            state.told = None;
+        }
+        // Whatever is being read is for nobody.
+        self.open_turn.set(self.open_turn.get() + 1);
+        self.composer.close();
+        self.list.set(Vec::new());
+        self.loading.set_visible(false);
+        self.writing.set_text("");
+        self.back.set_visible(false);
+        self.out.set_visible(false);
+        self.pages.set_visible_child_name("nothing");
+        self.set_titles("", "");
+        if !self.own {
+            self.split.set_show_content(false);
+        }
+        self.sidebar.select("");
+    }
+
+    fn set_titles(&self, title: &str, subtitle: &str) {
+        self.title.set_title(title);
+        self.title.set_subtitle(subtitle);
+        // Window lists and screen readers get the conversation, too.
+        self.window.set_title(Some(match (title, self.own) {
+            ("", _) => "Tern",
+            (title, _) => title,
+        }));
+    }
+
+    /// Has this conversation open.
+    pub fn shows(&self, id: &str) -> bool {
+        self.state.borrow().open.as_deref() == Some(id)
+    }
+
+    /// A conversation is in view: one is open, and not behind the list of a narrow window.
+    pub fn is_reading(&self) -> bool {
+        !self.is_free() && (!self.split.is_collapsed() || self.split.shows_content())
+    }
+
+    /// Opens a thread without having seen its channel.
+    pub fn open_post(self: &Rc<Self>, id: &str, post: &str) {
+        self.open(id);
+        self.state.borrow_mut().channel = true;
+        self.open_thread(post);
+    }
+
+    pub fn is_free(&self) -> bool {
+        self.state.borrow().open.is_none()
+    }
+
+    pub fn composer(&self) -> &Composer {
+        &self.composer
     }
 
     fn typing(self: &Rc<Self>, conversation: &str, name: &str, active: bool) {
@@ -531,7 +649,7 @@ impl Window {
         let conversation = {
             let mut state = self.state.borrow_mut();
             // In channels nobody is told, as in threads.
-            if self.demo || state.channel || state.thread.is_some() {
+            if self.desk.demo || state.channel || state.thread.is_some() {
                 return;
             }
             let due = match (active, state.told) {
@@ -626,7 +744,7 @@ impl Window {
         self.composer.open(&key);
         self.loading.set_visible(false);
         self.read(true);
-        if !self.demo {
+        if !self.desk.demo {
             self.client.ask(Request::Look {
                 conversation,
                 post: thread,
@@ -636,20 +754,7 @@ impl Window {
 
     /// Shows the cache of `account`, or the demo.
     pub fn use_store(self: &Rc<Self>, store: Arc<Store>, account: Option<String>) {
-        let pictures = account
-            .as_deref()
-            .and_then(|account| tern_engine::database_path(account).ok())
-            .map(|path| path.with_file_name("media").join("pictures"));
-        // Those of the account before, if any, go to its own file.
-        self.save_drafts();
-        let drafts = account
-            .as_deref()
-            .and_then(drafts::path)
-            .map(|path| drafts::load(&path))
-            .unwrap_or_default();
-        self.saved.replace(drafts.clone());
-        self.composer.set_all(drafts);
-        art::set_source(store.clone(), pictures, self.window.scale_factor());
+        self.leave();
         let filter = self.state.borrow().filter;
         *self.state.borrow_mut() = State {
             store: Some(store),
@@ -657,9 +762,6 @@ impl Window {
             filter,
             ..Default::default()
         };
-        self.pages.set_visible_child_name("nothing");
-        self.title.set_title("");
-        self.title.set_subtitle("");
         self.read_chats();
     }
 
@@ -675,8 +777,15 @@ impl Window {
         if self.state.borrow().account.as_ref() == Some(&account) {
             return;
         }
-        match tern_engine::open_read_only(&account) {
-            Ok(store) => self.use_store(Arc::new(store), Some(account)),
+        if self.own {
+            // The conversation is of another account.
+            if self.state.borrow().account.is_some() && self.window.is_visible() {
+                self.window.close();
+            }
+            return;
+        }
+        match self.desk.account(&account, self.window.scale_factor()) {
+            Ok(store) => self.use_store(store, Some(account)),
             Err(error) => self.tell(&format!("The message cache cannot be read: {error}")),
         }
     }
@@ -752,6 +861,9 @@ impl Window {
     }
 
     fn read_chats(self: &Rc<Self>) {
+        if self.own {
+            return;
+        }
         let (store, filter) = {
             let state = self.state.borrow();
             (state.store.clone(), state.filter)
@@ -781,6 +893,19 @@ impl Window {
                 window.sidebar.set(rows);
             }
         });
+    }
+
+    /// The user chose a conversation in the list or by searching.
+    fn choose(self: &Rc<Self>, id: &str) {
+        if self.own || self.desk.chat(id).is_some() {
+            self.desk.open(id);
+            // The list still shows what this window has open.
+            let open = self.state.borrow().open.clone();
+            let sidebar = self.sidebar.clone();
+            glib::idle_add_local_once(move || sidebar.select(open.as_deref().unwrap_or("")));
+        } else {
+            self.open(id);
+        }
     }
 
     pub fn open(self: &Rc<Self>, id: &str) {
@@ -846,7 +971,7 @@ impl Window {
     }
 
     fn show(self: &Rc<Self>, conversation: Conversation, fresh: bool) {
-        self.title.set_title(&conversation.title);
+        self.set_titles(&conversation.title, &conversation.subtitle);
         let people = conversation
             .items
             .iter()
@@ -854,7 +979,6 @@ impl Window {
             .collect();
         let list = self.list.clone();
         art::load_faces(people, move |loaded| list.show_faces(loaded));
-        self.title.set_subtitle(&conversation.subtitle);
         let thread = {
             let mut state = self.state.borrow_mut();
             state.history.read(conversation.read.max(1));
@@ -862,6 +986,7 @@ impl Window {
             state.thread.is_some()
         };
         self.back.set_visible(thread);
+        self.out.set_visible(!self.own);
         self.composer
             .set_hint(match (conversation.channel, thread) {
                 (true, false) => "Start a new post",
@@ -870,18 +995,35 @@ impl Window {
             });
         if fresh {
             self.list.set(conversation.items);
-            self.composer.focus();
+            // Who walks through the chats with the keyboard stays in their list.
+            if !self.sidebar.has_keyboard() {
+                self.composer.focus();
+            }
         } else {
+            let before = self.list.newest();
             self.list.update(conversation.items);
+            if let (Some(before), Some(item)) = (before, self.list.newest())
+                && before.id != item.id
+                && !item.own
+                && self.list.follows()
+                && self.window.is_active()
+            {
+                self.list
+                    .view
+                    .announce(&item.spoken(), gtk::AccessibleAnnouncementPriority::Medium);
+            }
         }
         self.pages.set_visible_child_name("talk");
         self.seen();
         // Once the new rows have their place: more may be wanted still.
         let weak = Rc::downgrade(self);
-        glib::timeout_add_local_once(Duration::from_millis(120), move || {
-            if let Some(window) = weak.upgrade() {
+        glib::timeout_add_local(Duration::from_millis(120), move || match weak.upgrade() {
+            Some(window) if !window.list.is_whole() => glib::ControlFlow::Continue,
+            Some(window) => {
                 window.want_older();
+                glib::ControlFlow::Break
             }
+            None => glib::ControlFlow::Break,
         });
     }
 
@@ -908,6 +1050,9 @@ impl Window {
         let (Some(store), Some(conversation)) = (store, open) else {
             return;
         };
+        if !self.list.is_whole() {
+            return;
+        }
         let short = self.list.is_short();
         let at_start = short || (self.list.at_start() && !self.list.follows());
         if !at_start {
@@ -922,7 +1067,7 @@ impl Window {
             .state
             .borrow_mut()
             .history
-            .need(at_start, more && !self.demo);
+            .need(at_start, more && !self.desk.demo);
         match need {
             Need::Nothing => {}
             Need::Show => self.read(false),
@@ -952,7 +1097,7 @@ impl Window {
 
     /// Others see that a message was read, so this needs the user to really have it on screen.
     fn seen(self: &Rc<Self>) {
-        if self.demo || !self.window.is_active() || !self.list.at_end() {
+        if self.desk.demo || !self.window.is_active() || !self.list.at_end() {
             return;
         }
         let (store, id) = {
@@ -962,7 +1107,7 @@ impl Window {
         let (Some(store), Some(id)) = (store, id) else {
             return;
         };
-        let visible = !self.split.is_collapsed() || self.split.shows_content();
+        let visible = self.own || !self.split.is_collapsed() || self.split.shows_content();
         let unread = store
             .chat(&id)
             .ok()
@@ -1023,14 +1168,66 @@ impl Window {
         let weak = Rc::downgrade(self);
         palette::show(&self.window, store, move |id| {
             if let Some(window) = weak.upgrade() {
-                window.open(id);
+                window.choose(id);
             }
         });
     }
 
+    /// From the chats to the messages, to writing, and round again.
+    fn next_area(self: &Rc<Self>) {
+        let focus = gtk::prelude::RootExt::focus(&self.window);
+        let within = |area: &gtk::Widget| focus.as_ref().is_some_and(|w| w.is_ancestor(area));
+        let open = !self.is_free();
+        if open && within(self.list.view.upcast_ref()) {
+            self.composer.focus();
+        } else if open && (self.own || within(self.sidebar.root.upcast_ref())) {
+            self.split.set_show_content(true);
+            self.list.focus_newest();
+        } else if !self.own {
+            self.split.set_show_content(false);
+            self.sidebar.focus();
+        }
+    }
+
+    fn show_keys(self: &Rc<Self>) {
+        let dialog = adw::ShortcutsDialog::new();
+        for (title, keys) in [
+            (
+                "Moving around",
+                &[
+                    ("Search", "<Ctrl>k"),
+                    ("Next chat", "<Alt>Down"),
+                    ("Previous chat", "<Alt>Up"),
+                    ("Chats, messages, writing", "F6"),
+                    ("Newest message", "<Ctrl>End"),
+                    ("Back to the channel", "Escape"),
+                    ("Open in its own window", "<Ctrl><Shift>o"),
+                    ("Close window", "<Ctrl>w"),
+                ][..],
+            ),
+            (
+                "Messages",
+                &[
+                    ("React, reply, copy, edit, delete", "Return Menu <Shift>F10"),
+                    ("Write a message", "<Ctrl>r"),
+                    ("Send", "Return"),
+                    ("New line", "<Shift>Return"),
+                    ("Edit your last message", "Up"),
+                ][..],
+            ),
+        ] {
+            let section = adw::ShortcutsSection::new(Some(title));
+            for (what, keys) in keys {
+                section.add(adw::ShortcutsItem::new(what, keys));
+            }
+            dialog.add(section);
+        }
+        dialog.present(Some(&self.window));
+    }
+
     fn step(self: &Rc<Self>, step: i64) {
         if let Some(id) = self.sidebar.neighbour(step) {
-            self.open(&id);
+            self.choose(&id);
         }
     }
 

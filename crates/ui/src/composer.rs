@@ -11,6 +11,7 @@ use gtk4::{gdk, gio, glib};
 use serde::{Deserialize, Serialize};
 
 use crate::mention::{self, Person};
+use crate::row;
 
 /// What the text will be.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -35,6 +36,29 @@ pub struct Written {
     pub files: Vec<PathBuf>,
 }
 
+impl Written {
+    /// Both, this first.
+    pub fn before(mut self, newer: Written) -> Written {
+        if !newer.text.is_empty() {
+            self.text = if self.text.is_empty() {
+                newer.text
+            } else {
+                format!("{}\n{}", self.text, newer.text)
+            };
+        }
+        self.mentions.extend(newer.mentions);
+        for file in newer.files {
+            if !self.files.contains(&file) {
+                self.files.push(file);
+            }
+        }
+        self
+    }
+}
+
+/// What is being written, by conversation, for all windows.
+pub type Drafts = Rc<RefCell<HashMap<String, Written>>>;
+
 type Search = Rc<dyn Fn(&str) -> Vec<Person>>;
 
 #[derive(Clone)]
@@ -43,7 +67,7 @@ pub struct Composer {
     pub text: gtk::TextView,
     send: gtk::Button,
     open: Rc<RefCell<Option<String>>>,
-    drafts: Rc<RefCell<HashMap<String, Written>>>,
+    drafts: Drafts,
     files: Rc<RefCell<Vec<PathBuf>>>,
     chips: gtk::Box,
     /// People chosen while writing this text.
@@ -65,6 +89,7 @@ pub struct Composer {
 impl Composer {
     /// `sent` gets the conversation, what was written and what it is; `last` edits the last own message.
     pub fn new(
+        drafts: Drafts,
         sent: impl Fn(&str, &Written, &Aim) + 'static,
         last: impl Fn() + 'static,
     ) -> Composer {
@@ -101,6 +126,7 @@ impl Composer {
             .valign(gtk::Align::End)
             .sensitive(false)
             .build();
+        row::say(&send, "Send");
         send.add_css_class("circular");
         send.add_css_class("suggested-action");
         let about = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -116,6 +142,7 @@ impl Composer {
             .icon_name("window-close-symbolic")
             .tooltip_text("Cancel (Esc)")
             .build();
+        row::say(&cancel, "Cancel");
         cancel.add_css_class("flat");
         cancel.add_css_class("circular");
         about.append(&about_text);
@@ -125,6 +152,7 @@ impl Composer {
             .tooltip_text("Attach files")
             .valign(gtk::Align::End)
             .build();
+        row::say(&attach, "Attach files");
         attach.add_css_class("flat");
         attach.add_css_class("circular");
         let chips = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -162,7 +190,7 @@ impl Composer {
             text: text.clone(),
             send: send.clone(),
             open: Rc::default(),
-            drafts: Rc::default(),
+            drafts,
             files,
             chips,
             chosen,
@@ -437,6 +465,7 @@ impl Composer {
                 .icon_name("window-close-symbolic")
                 .tooltip_text(format!("Remove {name}"))
                 .build();
+            row::say(&remove, &format!("Remove {name}"));
             remove.add_css_class("flat");
             remove.add_css_class("circular");
             let composer = self.clone();
@@ -549,28 +578,30 @@ impl Composer {
 
     pub fn set_hint(&self, hint: &str) {
         self.hint.set_text(hint);
+        self.text
+            .update_property(&[gtk::accessible::Property::Placeholder(hint)]);
     }
 
     /// Moves to another conversation, keeping what was being written in this one.
     pub fn open(&self, id: &str) {
-        self.cancel();
-        let written = self.written();
-        if let Some(old) = self.open.replace(Some(id.to_owned())) {
-            if written == Written::default() {
-                self.drafts.borrow_mut().remove(&old);
-            } else {
-                self.drafts.borrow_mut().insert(old, written);
-            }
-        }
+        self.close();
+        self.open.replace(Some(id.to_owned()));
         let draft = self.drafts.borrow().get(id).cloned().unwrap_or_default();
         self.fill(draft);
     }
 
-    /// Everything being written, in every conversation.
-    pub fn all(&self) -> HashMap<String, Written> {
-        let mut all = self.drafts.borrow().clone();
+    /// Leaves the conversation, keeping what was being written in it.
+    pub fn close(&self) {
+        self.cancel();
+        self.keep();
+        self.open.replace(None);
+        self.fill(Written::default());
+    }
+
+    /// Puts what is being written with the drafts.
+    pub fn keep(&self) {
         let Some(id) = self.open.borrow().clone() else {
-            return all;
+            return;
         };
         // During an edit, what was put aside is what counts.
         let editing = matches!(*self.aim.borrow(), Aim::Edit { .. });
@@ -579,20 +610,16 @@ impl Composer {
         } else {
             self.written()
         };
+        let mut drafts = self.drafts.borrow_mut();
         if written == Written::default() {
-            all.remove(&id);
+            drafts.remove(&id);
         } else {
-            all.insert(id, written);
+            drafts.insert(id, written);
         }
-        all
     }
 
-    /// Starts over with these drafts, e.g. for another account.
-    pub fn set_all(&self, drafts: HashMap<String, Written>) {
-        self.cancel();
-        self.open.replace(None);
-        self.fill(Written::default());
-        self.drafts.replace(drafts);
+    pub fn is_open(&self, id: &str) -> bool {
+        self.open.borrow().as_deref() == Some(id)
     }
 
     /// Calls `changed` whenever the user changes the text: not when a draft is put in.
@@ -607,35 +634,18 @@ impl Composer {
 
     /// Gives back what could not be sent. Whatever is being written by then stays, after it.
     pub fn give_back(&self, id: &str, unsent: Written) {
-        let join = |older: Written, newer: Written| {
-            let mut both = older;
-            if !newer.text.is_empty() {
-                both.text = if both.text.is_empty() {
-                    newer.text
-                } else {
-                    format!("{}\n{}", both.text, newer.text)
-                };
-            }
-            both.mentions.extend(newer.mentions);
-            for file in newer.files {
-                if !both.files.contains(&file) {
-                    both.files.push(file);
-                }
-            }
-            both
-        };
-        let here = self.open.borrow().as_deref() == Some(id);
+        let here = self.is_open(id);
         let editing = matches!(*self.aim.borrow(), Aim::Edit { .. });
         if here && editing {
             let written = self.aside.take();
-            self.aside.replace(join(unsent, written));
+            self.aside.replace(unsent.before(written));
         } else if here {
             let written = self.written();
-            self.fill(join(unsent, written));
+            self.fill(unsent.before(written));
         } else {
             let mut drafts = self.drafts.borrow_mut();
             let written = drafts.remove(id).unwrap_or_default();
-            drafts.insert(id.to_owned(), join(unsent, written));
+            drafts.insert(id.to_owned(), unsent.before(written));
         }
     }
 
@@ -706,7 +716,9 @@ mod tests {
         gtk::init().unwrap();
         let sent: Sent = Rc::default();
         let lasts = Rc::new(std::cell::Cell::new(0));
+        let drafts = Drafts::default();
         let composer = Composer::new(
+            drafts.clone(),
             {
                 let sent = sent.clone();
                 move |id, text, aim| {
@@ -875,16 +887,28 @@ mod tests {
         composer.open("c7");
         write("seven");
         composer.edit("m9", "an edit is no draft");
-        let all = composer.all();
+        composer.keep();
+        let all = drafts.borrow().clone();
         assert_eq!(all["c7"], plain("seven"));
         assert!(
             !all.values()
                 .any(|written| written.text.contains("no draft"))
         );
-        composer.set_all(HashMap::from([("c8".to_owned(), plain("eight"))]));
+        composer.close();
+        drafts.replace(HashMap::from([("c8".to_owned(), plain("eight"))]));
         assert_eq!(composer.raw(), "");
         composer.open("c8");
         assert_eq!(composer.written(), plain("eight"));
+        // Another window sees what was written here.
+        let other = Composer::new(drafts.clone(), |_, _, _| {}, || {});
+        composer.close();
+        assert!(!composer.is_open("c8") && composer.raw().is_empty());
+        other.open("c8");
+        assert_eq!(other.written(), plain("eight"));
+        other.text.buffer().set_text("eight, and more");
+        other.close();
+        composer.open("c8");
+        assert_eq!(composer.written(), plain("eight, and more"));
         composer.open("c3");
         // Files put aside by an edit come back after it, and do not go with it.
         composer.attach([PathBuf::from("/x/b.txt")]);

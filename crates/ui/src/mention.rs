@@ -52,10 +52,15 @@ pub fn matching(all: &[Person], query: &str, limit: usize) -> Vec<Person> {
         .collect()
 }
 
-/// The people of a conversation, without the user.
+/// The people of a conversation, without the user. A group is "Everyone" first, under the id of
+/// the chat.
 pub fn people(store: &Store, conversation: &str) -> Vec<Person> {
     let me = store.meta("me_user_id").ok().flatten();
-    let mut all: Vec<Person> = match store.chat(conversation).ok().flatten() {
+    let chat = store.chat(conversation).ok().flatten();
+    let group = chat
+        .as_ref()
+        .is_some_and(|chat| chat.kind.eq_ignore_ascii_case("group"));
+    let mut all: Vec<Person> = match chat {
         Some(chat) => chat
             .members
             .into_iter()
@@ -71,6 +76,9 @@ pub fn people(store: &Store, conversation: &str) -> Vec<Person> {
     });
     all.sort_by(|a, b| a.0.cmp(&b.0));
     all.dedup_by(|a, b| a.0 == b.0);
+    if group {
+        all.insert(0, (conversation.to_owned(), "Everyone".to_owned()));
+    }
     all
 }
 
@@ -181,6 +189,12 @@ mod tests {
         assert!(
             names.contains(&"Ada Quill".to_owned()) && !names.contains(&"Robin Vale".to_owned()),
             "{names:?}"
+        );
+        assert_eq!(people(&store, "c2")[0], ("c2".into(), "Everyone".into()));
+        let alone = people(&store, "c1");
+        assert!(
+            alone.iter().all(|(id, _)| id != "c1"),
+            "a chat of two has no everyone"
         );
         assert!(!people(&store, "ch1").is_empty());
     }

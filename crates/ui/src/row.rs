@@ -45,6 +45,34 @@ pub struct Reaction {
     pub mine: bool,
 }
 
+impl Item {
+    /// The message in one line, as a screen reader says it.
+    pub fn spoken(&self) -> String {
+        let mut out = format!("{}, {}: {}", self.sender, self.time, self.text.trim());
+        for reaction in &self.reactions {
+            let who = if reaction.mine {
+                ", one of them you"
+            } else {
+                ""
+            };
+            out.push_str(&format!(". {} {}{who}", reaction.count, reaction.emoji));
+        }
+        for more in [&self.note, &self.thread, &self.divider]
+            .into_iter()
+            .flatten()
+        {
+            out.push_str(". ");
+            out.push_str(more);
+        }
+        out
+    }
+}
+
+/// Says what a button with only a picture does.
+pub fn say(button: &impl IsA<gtk::Accessible>, what: &str) {
+    button.update_property(&[gtk::accessible::Property::Label(what)]);
+}
+
 mod imp {
     use super::*;
 
@@ -93,7 +121,7 @@ mod imp {
             self.gutter.append(&self.avatar);
             line.append(&self.gutter);
 
-            let content = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
             content.set_hexpand(true);
             self.header.set_spacing(8);
             self.name.add_css_class("heading");
@@ -105,7 +133,7 @@ mod imp {
             content.append(&self.header);
 
             self.body.set_orientation(gtk::Orientation::Vertical);
-            self.body.set_spacing(6);
+            self.body.set_spacing(8);
             content.append(&self.body);
 
             self.note.add_css_class("caption");
@@ -147,7 +175,7 @@ fn clear(container: &gtk::Box) {
     }
 }
 
-fn text(markup: &str) -> gtk::Label {
+pub fn text(markup: &str) -> gtk::Label {
     let label = gtk::Label::builder()
         .xalign(0.0)
         .wrap(true)
@@ -155,6 +183,7 @@ fn text(markup: &str) -> gtk::Label {
         .natural_wrap_mode(gtk::NaturalWrapMode::Word)
         .selectable(true)
         .build();
+    label.add_css_class("text");
     label.connect_copy_clipboard(|label| {
         // The break points we added are not part of what was written.
         let Some((start, end)) = label.selection_bounds() else {
@@ -204,6 +233,7 @@ enum Kind {
     Item,
     Table,
     Picture,
+    Card,
     Rule,
 }
 
@@ -238,6 +268,7 @@ fn kind(block: &Block) -> Kind {
         Block::Item { .. } => Kind::Item,
         Block::Table { .. } => Kind::Table,
         Block::Picture(_) => Kind::Picture,
+        Block::Card(_) => Kind::Card,
         Block::Rule => Kind::Rule,
     }
 }
@@ -312,6 +343,12 @@ impl Part {
                 labels.push(missing);
                 frame.upcast()
             }
+            Kind::Card => {
+                let frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                frame.add_css_class("card");
+                frame.add_css_class("adaptive");
+                frame.upcast()
+            }
             Kind::Rule => gtk::Separator::new(gtk::Orientation::Horizontal).upcast(),
         };
         Part {
@@ -364,6 +401,14 @@ impl Part {
                 }
             }
             Block::Picture(url) => self.set_picture(url),
+            Block::Card(card) => {
+                if let Some(frame) = self.root.downcast_ref::<gtk::Box>() {
+                    clear(frame);
+                    let shown = crate::cardview::card(card);
+                    shown.set_hexpand(true);
+                    frame.append(&shown);
+                }
+            }
             Block::Rule => {}
         }
     }
@@ -495,6 +540,11 @@ impl MessageRow {
                 .sensitive(item.sent)
                 .build();
             chip.add_css_class("chip");
+            let verb = if reaction.mine { "Take back" } else { "Add" };
+            say(
+                &chip,
+                &format!("{verb} {}, {} so far", reaction.emoji, reaction.count),
+            );
             if reaction.mine {
                 chip.add_css_class("mine");
             }

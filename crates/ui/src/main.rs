@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -6,18 +6,20 @@ use std::time::{Duration, Instant};
 use gtk4::prelude::*;
 use gtk4::{gio, glib};
 use libadwaita as adw;
-use tern_ui::client::Client;
+use tern_ui::desk::Desk;
 use tern_ui::window::{Window, load_style, save_picture};
 
 const APP: &str = "io.github.tern.Tern";
 
-/// Options for trying things out: `--demo`, and with it `--open ID`, `--size WxH`, `--dark`,
+/// Options for trying things out: `--demo`, and with it `--open ID`, `--own`, `--size WxH`, `--dark`,
 /// `--light`, `--screenshot FILE`. `--measure` times the real cache without showing that
 /// anything was read.
 #[derive(Clone, Default)]
 struct Options {
     demo: bool,
     open: Option<String>,
+    /// In a window of its own.
+    own: bool,
     size: Option<(i32, i32)>,
     dark: Option<bool>,
     screenshot: Option<String>,
@@ -32,6 +34,7 @@ fn options() -> Options {
             "--demo" => options.demo = true,
             "--dark" => options.dark = Some(true),
             "--light" => options.dark = Some(false),
+            "--own" => options.own = true,
             "--measure" => options.measure = true,
             "--open" => options.open = arguments.next(),
             "--screenshot" => options.screenshot = arguments.next(),
@@ -47,8 +50,9 @@ fn options() -> Options {
     options
 }
 
-fn start(app: &adw::Application, options: &Options) -> Rc<Window> {
+fn start(desk: &Rc<Desk>, options: &Options) -> Rc<Window> {
     load_style();
+    let app = desk.app();
     if let Some(dark) = options.dark {
         let scheme = if dark {
             adw::ColorScheme::ForceDark
@@ -57,21 +61,10 @@ fn start(app: &adw::Application, options: &Options) -> Rc<Window> {
         };
         adw::StyleManager::default().set_color_scheme(scheme);
     }
-    let window = if options.measure {
-        let window = Window::new(app, Client::nowhere(), true);
-        window.use_cache();
-        window
-    } else if options.demo {
-        let window = Window::new(app, Client::nowhere(), true);
-        window.use_store(Arc::new(tern_ui::demo::store()), None);
-        window
-    } else {
-        let (client, news) = Client::start();
-        let window = Window::new(app, client, false);
-        window.use_cache();
-        window.follow(news);
-        window
-    };
+    if options.demo {
+        desk.use_store(Arc::new(tern_ui::demo::store()), 1);
+    }
+    let window = desk.main();
     if let Some((width, height)) = options.size {
         window.window.set_default_size(width, height);
     }
@@ -79,6 +72,9 @@ fn start(app: &adw::Application, options: &Options) -> Rc<Window> {
     if let Some(id) = &options.open {
         let (conversation, post) = id.split_once('/').unwrap_or((id, ""));
         window.open(conversation);
+        if options.own {
+            desk.pop_out(conversation);
+        }
         if !post.is_empty() {
             let (window, post) = (window.clone(), post.to_owned());
             glib::timeout_add_local_once(Duration::from_millis(500), move || {
@@ -90,7 +86,8 @@ fn start(app: &adw::Application, options: &Options) -> Rc<Window> {
         measure(app, &window);
     }
     if let Some(path) = options.screenshot.clone() {
-        let (shown, app) = (window.window.clone(), app.clone());
+        let own = options.open.as_deref().and_then(|id| desk.chat(id));
+        let (shown, app) = (own.unwrap_or(window.clone()).window.clone(), app.clone());
         glib::timeout_add_local_once(Duration::from_millis(1500), move || {
             if let Err(error) = save_picture(&shown, &path) {
                 eprintln!("tern: {error}");
@@ -176,23 +173,6 @@ fn measure(app: &adw::Application, window: &Rc<Window>) {
     });
 }
 
-type Shown = Rc<RefCell<Option<Rc<Window>>>>;
-
-/// The window, opened if it is not.
-fn window(app: &adw::Application, shown: &Shown, options: &Options) -> Rc<Window> {
-    let open = shown
-        .borrow()
-        .clone()
-        .filter(|window| window.window.is_visible());
-    let window = open.unwrap_or_else(|| {
-        let window = start(app, options);
-        shown.replace(Some(window.clone()));
-        window
-    });
-    window.window.present();
-    window
-}
-
 fn main() -> glib::ExitCode {
     let options = options();
     let flags = if options.demo || options.measure {
@@ -204,21 +184,37 @@ fn main() -> glib::ExitCode {
         .application_id(APP)
         .flags(flags)
         .build();
-    let shown: Shown = Rc::default();
+    let desk = Desk::new(&app, options.demo || options.measure);
+    let started = Rc::new(Cell::new(false));
+    // The options are for the first time only.
+    let begin = Rc::new({
+        let desk = desk.clone();
+        move || {
+            let first = !started.replace(true);
+            if first {
+                start(&desk, &options);
+            }
+            first
+        }
+    });
     app.connect_activate({
-        let (shown, options) = (shown.clone(), options.clone());
-        move |app| drop(window(app, &shown, &options))
+        let (begin, desk) = (begin.clone(), desk.clone());
+        move |_| {
+            if !begin() {
+                desk.main().window.present();
+            }
+        }
     });
     // Notifications and the tray open conversations through this.
     let open = gio::SimpleAction::new("open", Some(glib::VariantTy::STRING));
     open.connect_activate({
-        let (app, shown) = (app.downgrade(), shown.clone());
         move |_, id| {
             let id = id
                 .and_then(|id| id.get::<String>())
                 .filter(|id| !id.is_empty());
-            if let (Some(app), Some(id)) = (app.upgrade(), id) {
-                window(&app, &shown, &options).open(&id);
+            if let Some(id) = id {
+                begin();
+                desk.open(&id);
             }
         }
     });
