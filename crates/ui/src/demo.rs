@@ -33,29 +33,48 @@ pub fn store() -> Store {
         ("c3", "oneOnOne", "", "Bo Lindqvist", false, 70),
         ("c4", "group", "Lighthouse crew", "", false, 60 * 26),
         ("c5", "oneOnOne", "", "Dee Okafor", false, 60 * 24 * 4),
+        ("c6", "group", "Regatta planning", "", false, 60 * 24 * 5),
+        ("c7", "oneOnOne", "", "Cyrus Amadi", false, 60 * 24 * 6),
+        ("c8", "group", "Night watch", "", false, 60 * 24 * 9),
+    ];
+    let last = [
+        ("ada", "The pilot asked for the new berth numbers"),
+        ("cy", "Cake at the boathouse after 🎂"),
+        ("me", "Here is the plan"),
+        ("bo", "North buoy is off its place"),
+        ("dee", "See you on the early ferry"),
+        ("bo", "Twelve boats so far"),
+        ("cy", "Thanks, that did it!"),
+        ("dee", "All quiet, lamp is fine"),
     ];
     let records: Vec<ChatRecord> = chats
         .iter()
-        .map(|(id, kind, title, summary, unread, minutes)| ChatRecord {
-            id: (*id).into(),
-            kind: (*kind).into(),
-            title: (*title).into(),
-            member_summary: (*summary).into(),
-            unread: *unread,
-            last_message_at: Some(now - Duration::minutes(*minutes)),
-            last_message_preview: Some("The tide table is in the shared folder now".into()),
-            last_message_sender_id: Some("ada".into()),
-            last_message_sender_name: Some("Ada Quill".into()),
-            members: std::iter::once(("me", "Robin Vale"))
-                .chain(people)
-                .map(|(user, name)| MemberRecord {
-                    user_id: Some(user.into()),
-                    display_name: name.into(),
-                })
-                .take(if *kind == "group" { 5 } else { 2 })
-                .collect(),
-            ..Default::default()
-        })
+        .zip(last)
+        .map(
+            |((id, kind, title, summary, unread, minutes), (sender, text))| ChatRecord {
+                id: (*id).into(),
+                kind: (*kind).into(),
+                title: (*title).into(),
+                member_summary: (*summary).into(),
+                unread: *unread,
+                last_message_at: Some(now - Duration::minutes(*minutes)),
+                last_message_preview: Some(text.into()),
+                last_message_sender_id: Some(sender.into()),
+                last_message_sender_name: std::iter::once(("me", "Robin Vale"))
+                    .chain(people)
+                    .find(|(id, _)| *id == sender)
+                    .map(|(_, name)| name.into()),
+                members: std::iter::once(("me", "Robin Vale"))
+                    .chain(people)
+                    .map(|(user, name)| MemberRecord {
+                        user_id: Some(user.into()),
+                        display_name: name.into(),
+                    })
+                    .take(if *kind == "group" { 5 } else { 2 })
+                    .collect(),
+                ..Default::default()
+            },
+        )
         .collect();
     let _ = store.upsert_chats(&records);
     let bodies = [
@@ -71,6 +90,8 @@ pub fn store() -> Store {
     ];
     let mut messages = Vec::new();
     for (chat, ..) in &chats {
+        // The second one ends like a chat people have.
+        let older = if *chat == "c2" { 60 * 24 } else { 0 };
         for index in 0..60i64 {
             let sender = [
                 ("ada", "Ada Quill"),
@@ -83,7 +104,7 @@ pub fn store() -> Store {
                 message_id: format!("{chat}-{index}"),
                 sender_id: Some(sender.0.into()),
                 sender_name: Some(sender.1.into()),
-                created_at: now - Duration::minutes((60 - index) * 37),
+                created_at: now - Duration::minutes(older + (60 - index) * 37),
                 edited_at: (index % 13 == 0).then_some(now),
                 deleted: index % 29 == 7,
                 body_html: bodies[(index % bodies.len() as i64) as usize].into(),
@@ -95,6 +116,60 @@ pub fn store() -> Store {
                 ..Default::default()
             });
         }
+    }
+    let talk = [
+        (
+            "ada",
+            48,
+            "<p>Morning all! The harbour opens on <b>Friday</b>. Here is what is still open:</p><ul><li>paint the north buoy</li><li>berth numbers for the pilot</li><li>someone to ring the bell 🔔</li></ul>",
+            "[]",
+        ),
+        (
+            "bo",
+            41,
+            "<p>Buoy is done, second coat this afternoon.</p>",
+            r#"[{"reaction_type":"like","user_id":"ada","display_name":"Ada"},{"reaction_type":"like","user_id":"me","display_name":"Robin"},{"reaction_type":"heart","user_id":"cy","display_name":"Cyrus"}]"#,
+        ),
+        (
+            "bo",
+            40,
+            "<p>I can take the numbers to the pilot on the way back, too.</p>",
+            "[]",
+        ),
+        (
+            "me",
+            33,
+            "<p>I will ring the bell. This is what the tide gauge says for the day:</p><pre><code>06:12  low    0.4 m\n12:31  high   3.1 m\n18:47  low    0.5 m</code></pre>",
+            r#"[{"reaction_type":"like","user_id":"ada","display_name":"Ada"}]"#,
+        ),
+        (
+            "ada",
+            24,
+            "<blockquote>12:31  high   3.1 m</blockquote><p>Then we start at noon, so the big ones can come in.</p>",
+            "[]",
+        ),
+        ("cy", 10, "<p>Perfect.</p>", "[]"),
+        (
+            "cy",
+            9,
+            "<p>Cake at the boathouse after 🎂</p>",
+            r#"[{"reaction_type":"heart","user_id":"ada","display_name":"Ada"},{"reaction_type":"heart","user_id":"me","display_name":"Robin"}]"#,
+        ),
+    ];
+    for (index, (sender, minutes, html, reactions)) in talk.into_iter().enumerate() {
+        messages.push(MessageRecord {
+            conversation_id: "c2".into(),
+            message_id: format!("talk-{index}"),
+            sender_id: Some(sender.into()),
+            sender_name: std::iter::once(("me", "Robin Vale"))
+                .chain(people)
+                .find(|(id, _)| *id == sender)
+                .map(|(_, name)| name.into()),
+            created_at: now - Duration::minutes(minutes),
+            body_html: html.into(),
+            reactions_json: reactions.into(),
+            ..Default::default()
+        });
     }
     messages.push(MessageRecord {
         conversation_id: "c4".into(),

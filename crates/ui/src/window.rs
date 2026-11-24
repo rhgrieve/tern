@@ -1283,6 +1283,8 @@ impl Window {
 pub fn save_picture(window: &adw::ApplicationWindow, path: &str) -> Result<(), String> {
     let (width, height) = (window.width(), window.height());
     let snapshot = gtk::Snapshot::new();
+    // Sharp on dense screens, too.
+    snapshot.scale(2.0, 2.0);
     gtk::WidgetPaintable::new(Some(window)).snapshot(
         &snapshot,
         f64::from(width),
