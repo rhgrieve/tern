@@ -55,6 +55,10 @@ fn split_tone(glyph: &str) -> (String, Option<u32>) {
 
 /// Teams sends a toned reaction as `{diverse id}-tone{n}`, so 👍🏼 is `yes-tone2`, not `like`.
 pub fn reaction_key(glyph: &str) -> Option<String> {
+    // Tern patch: an org emoji is its own key.
+    if custom_emoji(glyph).is_some() {
+        return Some(glyph.to_owned());
+    }
     let (base, tone) = split_tone(glyph);
     let keys = emotion_keys(&base);
     match tone {
@@ -69,6 +73,9 @@ pub fn reaction_key(glyph: &str) -> Option<String> {
 
 /// Graph reads a toned reaction back without its tone, so removing one also clears the plain keys.
 pub fn reaction_keys(glyph: &str) -> Vec<String> {
+    if custom_emoji(glyph).is_some() {
+        return vec![glyph.to_owned()];
+    }
     let (base, tone) = split_tone(glyph);
     let plain = emotion_keys(&base).iter().map(|key| key.to_string());
     match tone {
@@ -180,6 +187,9 @@ mod tests {
             emoji.image_url(),
             "https://de-prod.asyncgw.teams.microsoft.com/v1/objects/0-wcde-d3-5f5e4f463d6bb959b08614fd1d9680b8/views/imgt2_anim"
         );
+        let key = "absolute-cinema;0-wcde-d3-5f5e4f463d6bb959b08614fd1d9680b8";
+        assert_eq!(reaction_key(key).as_deref(), Some(key));
+        assert_eq!(reaction_keys(key), [key]);
         assert_eq!(custom_emoji("like"), None);
         assert_eq!(custom_emoji("x;../evil"), None);
         assert_eq!(custom_emoji(";0-wcde-d3-1"), None);

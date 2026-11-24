@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 runtime=https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64
 sum=2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
 id=io.github.rhgrieve.Tern
-from=$(echo dist/tern-*-x86_64)
+from=$(ls -dt dist/tern-*-x86_64 | head -n 1)
 work=dist/appimage
 rm -rf "$work"
 mkdir -p "$work"

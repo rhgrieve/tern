@@ -68,6 +68,7 @@ fn item(number: i64) -> Item {
                 emoji: "👍".into(),
                 count: 3,
                 mine: false,
+                ..Default::default()
             }]
         } else {
             vec![]

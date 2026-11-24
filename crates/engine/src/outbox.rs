@@ -102,6 +102,15 @@ pub trait Post: Send + Sync + 'static {
         conversation: &str,
         since: DateTime<Utc>,
     ) -> impl Future<Output = Result<Vec<MessageRecord>, Failure>> + Send;
+    /// Adds what Teams knows of a linked page to a message that was sent. Nothing depends on it.
+    fn preview(
+        &self,
+        _conversation: &str,
+        _message: &str,
+        _draft: &Draft,
+    ) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -402,7 +411,11 @@ impl<P: Post> Outbox<P> {
             .post(&record.conversation_id, &stored.draft, &record.id)
             .await?;
         self.remember(&message);
-        self.done(record).map_err(disk)
+        self.done(record).map_err(disk)?;
+        let (post, conversation) = (self.post.clone(), record.conversation_id.clone());
+        let draft = stored.draft;
+        tokio::spawn(async move { post.preview(&conversation, &message, &draft).await });
+        Ok(())
     }
 
     fn done(&self, record: &OutboxRecord) -> Result<(), store::Error> {

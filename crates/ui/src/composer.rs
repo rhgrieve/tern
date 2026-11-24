@@ -10,8 +10,11 @@ use gtk4::prelude::*;
 use gtk4::{gdk, gio, glib};
 use serde::{Deserialize, Serialize};
 
+use crate::emoji;
 use crate::mention::{self, Person};
 use crate::row;
+use crate::spell;
+use crate::writing;
 
 /// What the text will be.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -61,6 +64,16 @@ pub type Drafts = Rc<RefCell<HashMap<String, Written>>>;
 
 type Search = Rc<dyn Fn(&str) -> Vec<Person>>;
 
+/// How many emoji are offered.
+const EMOJI: usize = 8;
+
+/// What can be put in place of what is being typed.
+#[derive(Debug, Clone)]
+enum Choice {
+    Person(Person),
+    Emoji(emoji::Found),
+}
+
 #[derive(Clone)]
 pub struct Composer {
     pub root: gtk::Box,
@@ -75,7 +88,7 @@ pub struct Composer {
     search: Rc<RefCell<Option<Search>>>,
     popover: gtk::Popover,
     choices: gtk::ListBox,
-    found: Rc<RefCell<Vec<Person>>>,
+    found: Rc<RefCell<Vec<Choice>>>,
     aim: Rc<RefCell<Aim>>,
     about: gtk::Box,
     about_text: gtk::Label,
@@ -93,15 +106,16 @@ impl Composer {
         sent: impl Fn(&str, &Written, &Aim) + 'static,
         last: impl Fn() + 'static,
     ) -> Composer {
-        let text = gtk::TextView::builder()
-            .wrap_mode(gtk::WrapMode::WordChar)
-            .accepts_tab(false)
-            .top_margin(10)
-            .bottom_margin(10)
-            .left_margin(12)
-            .right_margin(12)
-            .hexpand(true)
-            .build();
+        let text: gtk::TextView = glib::Object::builder::<writing::Writing>()
+            .property("wrap-mode", gtk::WrapMode::WordChar)
+            .property("accepts-tab", false)
+            .property("top-margin", 10)
+            .property("bottom-margin", 10)
+            .property("left-margin", 12)
+            .property("right-margin", 12)
+            .property("hexpand", true)
+            .build()
+            .upcast();
         text.update_property(&[gtk::accessible::Property::Label("Message")]);
         let scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
@@ -109,6 +123,10 @@ impl Composer {
             .max_content_height(220)
             .child(&text)
             .build();
+        scroll.vadjustment().connect_changed(writing::keep_within);
+        scroll
+            .vadjustment()
+            .connect_value_changed(writing::keep_within);
         let hint = gtk::Label::builder()
             .label("Write a message")
             .xalign(0.0)
@@ -261,6 +279,13 @@ impl Composer {
             }
         });
         text.add_controller(keys);
+        spell::attach(&text, {
+            let chosen = composer.chosen.clone();
+            move || {
+                let chosen = chosen.borrow();
+                chosen.iter().map(|(_, name)| name.clone()).collect()
+            }
+        });
         text.buffer().connect_changed({
             let composer = composer.clone();
             move |_| {
@@ -354,15 +379,38 @@ impl Composer {
     fn complete(&self) {
         let buffer = self.text.buffer();
         let before = buffer.text(&buffer.start_iter(), &self.cursor(), false);
+        if let Some((at, emoji)) = emoji::whole(&before).filter(|_| !self.filling.get()) {
+            // Not while the buffer is telling about the change that led here.
+            let composer = self.clone();
+            glib::idle_add_local_once(move || {
+                let now = composer.before();
+                if emoji::whole(&now) == Some((at, emoji)) {
+                    composer.replace(at, &format!("{emoji} "));
+                }
+            });
+        }
         let search = self.search.borrow().clone();
-        let found = match (mention::query(&before), search) {
-            (Some((_, typed)), Some(search)) => search(&typed),
+        let found: Vec<Choice> = match (mention::query(&before), search) {
+            (Some((_, typed)), Some(search)) => {
+                search(&typed).into_iter().map(Choice::Person).collect()
+            }
             _ => Vec::new(),
         };
+        let found = match emoji::query(&before) {
+            Some((_, typed)) if found.is_empty() => emoji::matching(&typed, EMOJI)
+                .into_iter()
+                .map(Choice::Emoji)
+                .collect(),
+            _ => found,
+        };
         self.choices.remove_all();
-        for (_, name) in &found {
+        for choice in &found {
+            let text = match choice {
+                Choice::Person((_, name)) => name.clone(),
+                Choice::Emoji(found) => format!("{}  :{}:", found.emoji, found.name),
+            };
             self.choices
-                .append(&gtk::Label::builder().label(name).xalign(0.0).build());
+                .append(&gtk::Label::builder().label(text).xalign(0.0).build());
         }
         self.choices
             .select_row(self.choices.row_at_index(0).as_ref());
@@ -408,24 +456,45 @@ impl Composer {
     }
 
     fn choose(&self, index: i32) {
-        let person = usize::try_from(index)
+        let choice = usize::try_from(index)
             .ok()
             .and_then(|index| self.found.borrow().get(index).cloned());
-        let Some(person) = person else { return };
+        let before = self.before();
+        match choice {
+            Some(Choice::Person(person)) => {
+                let Some((at, _)) = mention::query(&before) else {
+                    return;
+                };
+                self.replace(at, &format!("@{} ", person.1));
+                self.chosen.borrow_mut().push(person);
+            }
+            Some(Choice::Emoji(found)) => {
+                let Some((at, _)) = emoji::query(&before) else {
+                    return;
+                };
+                self.replace(at, &format!("{} ", found.emoji));
+            }
+            None => return,
+        }
+        self.popover.popdown();
+        self.text.grab_focus();
+    }
+
+    /// The text before the cursor.
+    fn before(&self) -> glib::GString {
+        let buffer = self.text.buffer();
+        buffer.text(&buffer.start_iter(), &self.cursor(), false)
+    }
+
+    /// Puts `text` in place of what is between a character and the cursor.
+    fn replace(&self, at: usize, text: &str) {
         let buffer = self.text.buffer();
         let mut end = self.cursor();
-        let before = buffer.text(&buffer.start_iter(), &end, false);
-        let Some((at, _)) = mention::query(&before) else {
-            return;
-        };
         let mut start = buffer.iter_at_offset(at as i32);
         buffer.begin_user_action();
         buffer.delete(&mut start, &mut end);
-        buffer.insert(&mut start, &format!("@{} ", person.1));
+        buffer.insert(&mut start, text);
         buffer.end_user_action();
-        self.chosen.borrow_mut().push(person);
-        self.popover.popdown();
-        self.text.grab_focus();
     }
 
     /// Adds files to go with the message.

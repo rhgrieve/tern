@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use tern_ipc::{Event, Request, Response};
+use tern_ipc::{Availability, Event, Request, Response};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
@@ -20,6 +20,19 @@ pub enum News {
         request: Box<Request>,
         reason: String,
     },
+    /// Whether people are there.
+    Presence(Vec<(String, Availability)>),
+    /// A picture that was asked for is here.
+    Picture {
+        url: String,
+    },
+    /// The service answered a reaction.
+    Reacted {
+        message: String,
+        emoji: String,
+        on: bool,
+        refused: Option<String>,
+    },
     /// A request was refused.
     Refused(String),
 }
@@ -29,6 +42,7 @@ pub struct Client {
     requests: mpsc::UnboundedSender<Request>,
 }
 
+const GONE: &str = "the background service is not running";
 const RETRY: Duration = Duration::from_secs(2);
 /// Some requests go to the service and back.
 const PATIENCE: Duration = Duration::from_secs(60);
@@ -70,10 +84,20 @@ async fn run(mut queue: mpsc::UnboundedReceiver<Request>, news: mpsc::UnboundedS
             tokio::time::sleep(RETRY).await;
         }
     };
+    // In the order they were clicked, but not held up by messages.
+    let (react, mut reactions) = mpsc::unbounded_channel();
+    let reacted = news.clone();
+    tokio::task::spawn_local(async move {
+        while let Some(request) = reactions.recv().await {
+            answer(request, reacted.clone()).await;
+        }
+    });
     let ask = async {
         while let Some(request) = queue.recv().await {
             let news = news.clone();
-            if matches!(request, Request::Send { .. }) {
+            if matches!(request, Request::React { .. }) {
+                let _ = react.send(request);
+            } else if matches!(request, Request::Send { .. }) {
                 // In the order they were written.
                 answer(request, news).await;
             } else {
@@ -94,6 +118,35 @@ async fn answer(request: Request, news: mpsc::UnboundedSender<News>) {
         let _ = news.send(News::Older { conversation, done });
         return;
     }
+    if let Request::Presence { .. } = request {
+        if let Ok(Response::Presence(people)) = outcome {
+            let _ = news.send(News::Presence(people));
+        }
+        return;
+    }
+    if let Request::Picture { url } = request {
+        if matches!(outcome, Ok(Response::Done)) {
+            let _ = news.send(News::Picture { url });
+        }
+        return;
+    }
+    if let Request::React {
+        message, emoji, on, ..
+    } = request
+    {
+        let refused = match outcome {
+            Ok(Response::Error(error)) => Some(error),
+            Ok(_) => None,
+            Err(_) => Some(GONE.to_owned()),
+        };
+        let _ = news.send(News::Reacted {
+            message,
+            emoji,
+            on,
+            refused,
+        });
+        return;
+    }
     let refusal = match outcome {
         Ok(Response::Error(error)) => error,
         Ok(_) => {
@@ -102,7 +155,7 @@ async fn answer(request: Request, news: mpsc::UnboundedSender<News>) {
             }
             return;
         }
-        Err(_) => "the background service is not running".to_owned(),
+        Err(_) => GONE.to_owned(),
     };
     if matches!(request, Request::Send { .. } | Request::Edit { .. }) {
         let _ = news.send(News::Unsent {
@@ -114,7 +167,12 @@ async fn answer(request: Request, news: mpsc::UnboundedSender<News>) {
     // Nobody asked for these in so many words.
     if !matches!(
         request,
-        Request::MarkRead { .. } | Request::Look { .. } | Request::Typing { .. }
+        Request::MarkRead { .. }
+            | Request::Look { .. }
+            | Request::Pictures { .. }
+            | Request::Receipts { .. }
+            | Request::Viewing { .. }
+            | Request::Typing { .. }
     ) {
         let _ = news.send(News::Refused(refusal));
     }

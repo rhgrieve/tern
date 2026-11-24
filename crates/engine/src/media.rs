@@ -37,20 +37,69 @@ pub fn may_prefetch(url: &str) -> bool {
     else {
         return false;
     };
-    let stored = path.starts_with("v1/objects/") && session::skype_token_allowed(url);
+    // Teams' gateway also serves its own copy of the picture of a linked page: the page's owner
+    // does not learn who looks at it.
+    let stored = (path.starts_with("v1/objects/") || path.starts_with("urlp/v1/url/image"))
+        && session::skype_token_allowed(url);
     let channel = host == "graph.microsoft.com" && path.contains("/hostedContents/");
     stored || channel
 }
 
-/// Pictures worth fetching ahead in a message.
+/// An emoji of the organization's own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Emoji {
+    pub name: String,
+    pub url: String,
+}
+
+/// The organization's emoji a reaction is, if it is one.
+pub fn custom_emoji(reaction: &str) -> Option<Emoji> {
+    let emoji = chatsvc::custom_emoji(reaction)?;
+    Some(Emoji {
+        name: emoji.name.to_owned(),
+        // Every gateway serves the objects of all regions; this is the one for old clients, which
+        // takes the same token as pictures in messages.
+        url: format!(
+            "https://us-api.asm.skype.com/v1/objects/{}/views/imgt2_anim",
+            emoji.object_id
+        ),
+    })
+}
+
+/// The address of a picture in full, where messages show a smaller one.
+pub fn full_size(url: &str) -> Option<String> {
+    let full = chatsvc::ams_full_size_url(url)?;
+    (full != url && may_prefetch(&full)).then_some(full)
+}
+
+/// Pictures worth fetching ahead in a message, and in the reactions to it.
 pub fn pictures(message: &MessageRecord) -> Vec<ImageRef> {
-    if !message.body_html.contains('<') {
-        return Vec::new();
+    let mut found = Vec::new();
+    if message.body_html.contains('<') {
+        found.extend(images(message));
     }
-    images(message)
-        .into_iter()
-        .filter(|image| may_prefetch(&image.url))
-        .collect()
+    if message.reactions_json.contains(';') && !message.deleted {
+        let reactions = teams_core::reactions(message);
+        for emoji in reactions
+            .iter()
+            .filter_map(|reaction| custom_emoji(&reaction.reaction_type))
+        {
+            if !found.iter().any(|image| image.url == emoji.url) {
+                found.push(ImageRef {
+                    id: emoji.url.clone(),
+                    url: emoji.url,
+                    width: None,
+                    height: None,
+                    alt: Some(emoji.name),
+                });
+            }
+        }
+    }
+    if message.links_json.len() > "[]".len() {
+        found.extend(teams_core::link_preview(message).and_then(|preview| preview.image()));
+    }
+    found.retain(|image| may_prefetch(&image.url));
+    found
 }
 
 pub trait Pictures: Send + Sync + 'static {
@@ -370,6 +419,30 @@ pub fn people<'a>(senders: impl Iterator<Item = &'a str>, limit: usize) -> Vec<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emoji_of_the_organization_are_fetched_once() {
+        let reaction = |kind: &str| format!(r#"{{"reaction_type":"{kind}","user_id":"a"}}"#);
+        let message = MessageRecord {
+            body_html: "<p>hi</p>".into(),
+            reactions_json: format!(
+                "[{},{},{},{}]",
+                reaction("like"),
+                reaction("party;0-eus-d12-abc"),
+                reaction("party;0-eus-d12-abc"),
+                reaction("x;../evil")
+            ),
+            ..Default::default()
+        };
+        let found = pictures(&message);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].url,
+            custom_emoji("party;0-eus-d12-abc").unwrap().url
+        );
+        assert!(may_prefetch(&found[0].url));
+        assert_eq!(custom_emoji("like"), None);
+    }
 
     fn image(url: &str) -> ImageRef {
         ImageRef {

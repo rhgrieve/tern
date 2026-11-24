@@ -64,6 +64,7 @@ fn start(desk: &Rc<Desk>, options: &Options) -> Rc<Window> {
     }
     if options.demo {
         desk.use_store(Arc::new(tern_ui::demo::store()), 1);
+        tern_ui::presence::update(&tern_ui::demo::presence());
     }
     let window = desk.main();
     if let Some((width, height)) = options.size {

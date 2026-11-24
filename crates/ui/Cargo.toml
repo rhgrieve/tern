@@ -14,9 +14,11 @@ path = "src/main.rs"
 
 [dependencies]
 chrono.workspace = true
+emojis = "0.9"
 gdk4-wayland = "0.11"
 gtk4 = { version = "0.11", features = ["v4_16"] }
 libadwaita = { version = "0.9", features = ["v1_8"] }
+libloading = "0.8"
 serde.workspace = true
 serde_json.workspace = true
 store.workspace = true

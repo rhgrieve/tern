@@ -3,6 +3,8 @@
 
 use teams_core::{Span, html_to_spans, markdown_to_html};
 
+use tern_engine::linked;
+
 use crate::rich;
 
 pub fn markdown(spans: &[Span]) -> Option<String> {
@@ -10,7 +12,7 @@ pub fn markdown(spans: &[Span]) -> Option<String> {
     write(&mut out, spans)?;
     let out = out.trim().to_owned();
     // The proof is that it reads the same when written again.
-    let again = rich::blocks(&html_to_spans(&markdown_to_html(&out)));
+    let again = rich::blocks(&html_to_spans(&linked(&markdown_to_html(&out))));
     (!out.is_empty() && again == rich::blocks(spans)).then_some(out)
 }
 

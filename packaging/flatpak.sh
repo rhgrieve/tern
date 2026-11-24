@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 id=io.github.rhgrieve.Tern
 runtime=org.gnome.Platform
 branch=51
-from=$(echo dist/tern-*-x86_64)
+from=$(ls -dt dist/tern-*-x86_64 | head -n 1)
 work=dist/flatpak
 rm -rf "$work"
 mkdir -p "$work"

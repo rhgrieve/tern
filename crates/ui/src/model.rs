@@ -1,17 +1,22 @@
 //! What the window shows, worked out from the cache. No widgets, so it can be tested.
 
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
-use store::{ChatRecord, MessageRecord, OutboxRecord, OutboxState, SidebarTeam, Store};
+use store::{
+    ChatRecord, MessageRecord, OutboxRecord, OutboxState, ReadHorizonRecord, SidebarTeam, Store,
+};
 use teams_core::{
     files, html_to_spans, linked_message_spans, markdown_to_html, reaction_summaries,
 };
 
 use crate::card;
+use crate::mark::Progress;
 use crate::rich::{self, Block};
 use crate::row::{Item, Reaction};
 
 /// Starts the id of a message that is not sent yet.
 pub const OUTGOING: &str = "outgoing-";
+/// The service's clock may be a little behind ours.
+const CLOCKS: chrono::Duration = chrono::Duration::seconds(2);
 /// Messages of one person this close together are shown as one.
 const JOIN: chrono::Duration = chrono::Duration::minutes(5);
 
@@ -186,6 +191,7 @@ pub fn items(
             reactions: reaction_summaries(message, me)
                 .into_iter()
                 .map(|reaction| Reaction {
+                    custom: tern_engine::custom_emoji(&reaction.emoji),
                     emoji: in_colour(&reaction.emoji),
                     count: reaction.count,
                     mine: reaction.mine,
@@ -208,18 +214,47 @@ pub fn items(
             .flatten(),
             sent: !message.deleted && !event,
             failed: false,
+            progress: None,
         });
         before = Some((message, event));
     }
+    // Shown exactly as they will be once they are sent, so that nothing moves then.
+    let mut last_own = before.map(|(last, event)| {
+        let own = !event && me.is_some() && last.sender_id.as_deref() == me;
+        (last.created_at, own)
+    });
     for waiting in outgoing {
         let Ok(draft) = serde_json::from_str::<tern_engine::Draft>(&waiting.payload) else {
             continue;
         };
-        let mut blocks = rich::blocks(&html_to_spans(&markdown_to_html(&draft.markdown)));
+        let mut blocks = rich::blocks(&html_to_spans(&tern_engine::linked(&markdown_to_html(
+            &draft.markdown,
+        ))));
         for file in &draft.files {
             blocks.push(Block::Text(format!("📎 {}", rich::escape(&file.name))));
         }
+        let sending = waiting.state == OutboxState::Sending;
+        // The service has it already, and the outbox is about to know.
+        let there = messages.last().is_some_and(|last| {
+            me.is_some()
+                && last.sender_id.as_deref() == me
+                && last.created_at >= waiting.created_at - CLOCKS
+                && draft.files.is_empty()
+                && content(last).first() == blocks.first()
+        });
+        if sending && there {
+            continue;
+        }
+        let new_day = last_own.is_none_or(|(at, _)| day(at) != day(waiting.created_at));
+        let joined = !new_day
+            && draft.reply_to.is_none()
+            && waiting.thread_root_id.is_none()
+            && last_own.is_some_and(|(at, own)| own && waiting.created_at - at < JOIN);
+        last_own = Some((waiting.created_at, true));
         items.push(Item {
+            joined,
+            divider: new_day.then(|| day_name(waiting.created_at, now)),
+            progress: sending.then_some(Progress::Sending),
             id: format!("{OUTGOING}{}", waiting.id),
             failed: waiting.state == OutboxState::Failed,
             sender: my_name.to_owned(),
@@ -231,12 +266,11 @@ pub fn items(
                 .to_string(),
             blocks,
             own: true,
-            note: Some(match waiting.state {
-                OutboxState::Sending => "Sending…".to_owned(),
-                OutboxState::Failed => format!(
+            note: (waiting.state == OutboxState::Failed).then(|| {
+                format!(
                     "Not sent: {}",
                     waiting.last_error.as_deref().unwrap_or("unknown error")
-                ),
+                )
             }),
             ..Default::default()
         });
@@ -244,8 +278,169 @@ pub fn items(
     items
 }
 
+/// What is known of who read a conversation, and of who is in it.
+#[derive(Default)]
+pub struct Readers<'a> {
+    pub horizons: &'a [ReadHorizonRecord],
+    /// Ids and names.
+    pub members: Vec<(&'a str, &'a str)>,
+}
+
+/// Says how far the newest own message got, on that message only.
+pub fn mark_newest(
+    items: &mut [Item],
+    messages: &[MessageRecord],
+    me: Option<&str>,
+    readers: &Readers,
+) {
+    let newest = items
+        .iter()
+        .rposition(|item| item.own && (item.sent || item.progress.is_some() || item.failed));
+    for (at, item) in items.iter_mut().enumerate() {
+        // A message on its way counts as the newest, and none but the newest is marked.
+        if Some(at) != newest {
+            item.progress = None;
+        }
+    }
+    let Some(item) = newest.map(|at| &mut items[at]).filter(|item| item.sent) else {
+        return;
+    };
+    let message = messages
+        .iter()
+        .rfind(|message| message.message_id == item.id);
+    item.progress = message.map(|message| progress(message, me, readers));
+}
+
+fn progress(message: &MessageRecord, me: Option<&str>, readers: &Readers) -> Progress {
+    // Ids come with a kind of account before them, or without.
+    let user = |id: &str| id.rsplit(':').next().unwrap_or(id).to_ascii_lowercase();
+    let me = me.map(user);
+    let other = |id: &str| me.as_deref() != Some(user(id).as_str());
+    let read: Vec<String> = readers
+        .horizons
+        .iter()
+        .filter(|horizon| other(&horizon.member_id))
+        .filter(|horizon| horizon.read_until >= message.created_at)
+        .map(|horizon| user(&horizon.member_id))
+        .collect();
+    if read.is_empty() {
+        return Progress::Delivered;
+    }
+    let others = readers.members.iter().filter(|(id, _)| other(id)).count();
+    let known = readers
+        .horizons
+        .iter()
+        .filter(|horizon| other(&horizon.member_id))
+        .count();
+    let mut names: Vec<String> = read
+        .iter()
+        .map(|id| {
+            readers
+                .members
+                .iter()
+                .find(|(member, _)| user(member) == *id)
+                .map_or_else(String::new, |(_, name)| one_line(name))
+        })
+        .collect();
+    names.sort();
+    Progress::Seen {
+        names,
+        others: others.max(known),
+    }
+}
+
+/// What the reactions will be when the service has heard of it.
+pub fn react(reactions: &mut Vec<Reaction>, emoji: &str, on: bool) {
+    let emoji = in_colour(emoji);
+    let at = reactions
+        .iter()
+        .position(|reaction| reaction.emoji == emoji);
+    match (at, on) {
+        (Some(at), _) if reactions[at].mine == on => {}
+        (Some(at), true) => {
+            reactions[at].mine = true;
+            reactions[at].count += 1;
+        }
+        (Some(at), false) => {
+            reactions[at].mine = false;
+            reactions[at].count = reactions[at].count.saturating_sub(1);
+            if reactions[at].count == 0 {
+                reactions.remove(at);
+            }
+        }
+        (None, true) => reactions.push(Reaction {
+            custom: tern_engine::custom_emoji(&emoji),
+            emoji,
+            count: 1,
+            mine: true,
+        }),
+        (None, false) => {}
+    }
+}
+
+/// A reaction of the user, shown before the service knows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reacting {
+    pub conversation: String,
+    pub message: String,
+    pub emoji: String,
+    pub on: bool,
+    /// When the service took it.
+    pub taken: Option<std::time::Instant>,
+}
+
+/// What the cache says counts again after this, even if it says otherwise.
+pub const BELIEVE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Puts reactions on the way into what the cache has, and forgets those that arrived there.
+pub fn apply_reacting(items: &mut [Item], conversation: &str, waiting: &mut Vec<Reacting>) {
+    waiting.retain(|reacting| {
+        let late = reacting.taken.is_some_and(|at| at.elapsed() > BELIEVE);
+        if late || reacting.conversation != conversation {
+            return !late;
+        }
+        let Some(item) = items.iter_mut().find(|item| item.id == reacting.message) else {
+            return true;
+        };
+        let emoji = in_colour(&reacting.emoji);
+        let mine = item
+            .reactions
+            .iter()
+            .any(|reaction| reaction.mine && reaction.emoji == emoji);
+        if mine == reacting.on {
+            return reacting.taken.is_none();
+        }
+        react(&mut item.reactions, &emoji, reacting.on);
+        true
+    });
+}
+
+/// The pictures messages show, of the messages and of reactions to them.
+pub fn pictures(items: &[Item]) -> Vec<&str> {
+    fn within<'a>(blocks: &'a [Block], out: &mut Vec<&'a str>) {
+        for block in blocks {
+            match block {
+                Block::Picture(url) => out.push(url),
+                Block::Quote(inner) => within(inner, out),
+                Block::Preview(preview) => out.extend(preview.picture.as_deref()),
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for item in items {
+        within(&item.blocks, &mut out);
+        out.extend(
+            item.reactions
+                .iter()
+                .filter_map(|reaction| Some(reaction.custom.as_ref()?.url.as_str())),
+        );
+    }
+    out
+}
+
 /// Old symbols like the heart are drawn in black unless asked for as emoji.
-fn in_colour(emoji: &str) -> String {
+pub fn in_colour(emoji: &str) -> String {
     let mut letters = emoji.chars();
     match (letters.next(), letters.next()) {
         (Some(letter), None) if ('\u{2000}'..'\u{1f000}').contains(&letter) => {
@@ -294,6 +489,22 @@ fn content(message: &MessageRecord) -> Vec<Block> {
         } else if let Some(text) = attachment.card_text() {
             blocks.push(Block::Quote(vec![Block::Text(rich::escape(text.trim()))]));
         }
+    }
+    if let Some(preview) = teams_core::link_preview(message).filter(|it| rich::may_open(&it.url)) {
+        let line = |text: Option<&String>| one_line(text.map_or("", String::as_str));
+        let site = preview.domain();
+        let title = line(preview.title.as_ref());
+        blocks.push(Block::Preview(Box::new(rich::Preview {
+            title: if title.is_empty() {
+                site.clone()
+            } else {
+                title
+            },
+            description: line(preview.description.as_ref()),
+            site,
+            picture: preview.image_url.clone(),
+            url: preview.url,
+        })));
     }
     for file in files(message) {
         let name = rich::escape(&one_line(&file.name));
@@ -366,7 +577,12 @@ pub fn posts(
         .filter(|record| record.thread_root_id.is_none())
         .cloned()
         .collect();
-    all.extend(items(&[], &waiting, me, my_name, now));
+    for mut item in items(&[], &waiting, me, my_name, now) {
+        item.joined = false;
+        item.divider = item.divider.filter(|_| last_day != Some(day(now)));
+        last_day = Some(day(now));
+        all.push(item);
+    }
     all
 }
 
@@ -446,25 +662,36 @@ pub fn conversation(
             },
         ),
     };
+    let mut items = match (channel, thread) {
+        (true, None) => posts(&messages, &outgoing, me.as_deref(), &my_name, now),
+        (_, Some(root)) => {
+            let here: Vec<OutboxRecord> = outgoing
+                .into_iter()
+                .filter(|record| record.thread_root_id.as_deref() == Some(root))
+                .collect();
+            let mut all = items(&messages, &here, me.as_deref(), &my_name, now);
+            // A reply to one's own post minutes later is still a reply.
+            if let Some(first) = all.get_mut(1) {
+                first.joined = false;
+            }
+            all
+        }
+        (false, None) => items(&messages, &outgoing, me.as_deref(), &my_name, now),
+    };
+    let horizons = store.read_horizons(id).unwrap_or_default();
+    let readers = Readers {
+        horizons: &horizons,
+        members: chat
+            .iter()
+            .flat_map(|chat| &chat.members)
+            .filter_map(|member| Some((member.user_id.as_deref()?, member.display_name.as_str())))
+            .collect(),
+    };
+    mark_newest(&mut items, &messages, me.as_deref(), &readers);
     Conversation {
         oldest: messages.first().map(|message| message.created_at),
         read: messages.len(),
-        items: match (channel, thread) {
-            (true, None) => posts(&messages, &outgoing, me.as_deref(), &my_name, now),
-            (_, Some(root)) => {
-                let here: Vec<OutboxRecord> = outgoing
-                    .into_iter()
-                    .filter(|record| record.thread_root_id.as_deref() == Some(root))
-                    .collect();
-                let mut all = items(&messages, &here, me.as_deref(), &my_name, now);
-                // A reply to one's own post minutes later is still a reply.
-                if let Some(first) = all.get_mut(1) {
-                    first.joined = false;
-                }
-                all
-            }
-            (false, None) => items(&messages, &outgoing, me.as_deref(), &my_name, now),
-        },
+        items,
         subtitle: if thread.is_some() {
             format!("Thread in {title}")
         } else {
@@ -577,6 +804,81 @@ pub fn now() -> DateTime<Utc> {
 mod tests {
     use super::*;
 
+    fn reacted(all: &[(&str, usize, bool)]) -> Vec<Reaction> {
+        all.iter()
+            .map(|(emoji, count, mine)| Reaction {
+                custom: tern_engine::custom_emoji(emoji),
+                emoji: (*emoji).into(),
+                count: *count,
+                mine: *mine,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_reaction_is_shown_before_the_service_knows() {
+        let mut now = reacted(&[("👍", 2, false)]);
+        react(&mut now, "👍", true);
+        react(&mut now, "👍", true);
+        assert_eq!(now, reacted(&[("👍", 3, true)]), "counted once");
+        react(&mut now, "❤", true);
+        assert_eq!(now, reacted(&[("👍", 3, true), ("❤\u{fe0f}", 1, true)]));
+        react(&mut now, "❤\u{fe0f}", false);
+        react(&mut now, "👍", false);
+        react(&mut now, "👍", false);
+        assert_eq!(now, reacted(&[("👍", 2, false)]));
+        react(&mut now, "party;0-eus-d1-abc", true);
+        assert_eq!(now[1].name(), "party");
+    }
+
+    #[test]
+    fn reactions_on_the_way_stay_until_the_cache_has_them() {
+        let items = |reactions: &[(&str, usize, bool)]| {
+            vec![Item {
+                id: "m".into(),
+                reactions: reacted(reactions),
+                ..Default::default()
+            }]
+        };
+        let reacting = |on, taken| Reacting {
+            conversation: "c".into(),
+            message: "m".into(),
+            emoji: "👍".into(),
+            on,
+            taken,
+        };
+        let just = std::time::Instant::now();
+        let long_ago = just.checked_sub(BELIEVE * 2);
+        // Not taken yet, whatever the cache says meanwhile.
+        let mut waiting = vec![reacting(true, None)];
+        for _ in 0..2 {
+            let mut shown = items(&[]);
+            apply_reacting(&mut shown, "c", &mut waiting);
+            assert_eq!(shown[0].reactions, reacted(&[("👍", 1, true)]));
+        }
+        let mut shown = items(&[("👍", 1, true)]);
+        apply_reacting(&mut shown, "c", &mut waiting);
+        assert_eq!(shown[0].reactions, reacted(&[("👍", 1, true)]));
+        assert_eq!(waiting.len(), 1);
+        // Taken: until the cache agrees, or had its time.
+        waiting = vec![reacting(false, Some(just))];
+        let mut shown = items(&[("👍", 2, true)]);
+        apply_reacting(&mut shown, "c", &mut waiting);
+        assert_eq!(shown[0].reactions, reacted(&[("👍", 1, false)]));
+        apply_reacting(&mut shown, "c", &mut waiting);
+        assert!(waiting.is_empty());
+        waiting = vec![reacting(false, long_ago)];
+        let mut shown = items(&[("👍", 2, true)]);
+        apply_reacting(&mut shown, "c", &mut waiting);
+        assert_eq!(shown[0].reactions, reacted(&[("👍", 2, true)]));
+        assert!(waiting.is_empty());
+        // Another conversation has nothing to do with it.
+        waiting = vec![reacting(true, Some(just))];
+        let mut shown = items(&[]);
+        apply_reacting(&mut shown, "other", &mut waiting);
+        assert!(shown[0].reactions.is_empty() && waiting.len() == 1);
+    }
+
     fn at(minutes: i64) -> DateTime<Utc> {
         // Noon local time, so a few minutes or hours never change the day.
         let noon = Local.with_ymd_and_hms(2026, 11, 24, 12, 0, 0).unwrap();
@@ -662,9 +964,149 @@ mod tests {
             record("2", OutboxState::Failed, Some("HTTP 403")),
         ];
         let items = items(&[], &outgoing, Some("me"), "Me", at(1));
-        assert_eq!(items[0].note.as_deref(), Some("Sending…"));
+        assert_eq!(items[0].progress, Some(Progress::Sending));
+        assert_eq!(items[0].note, None);
+        assert_eq!(items[1].progress, None);
         assert_eq!(items[1].note.as_deref(), Some("Not sent: HTTP 403"));
         assert!(matches!(&items[0].blocks[0], Block::Text(text) if text.starts_with("<b>hi</b>")));
+    }
+
+    #[test]
+    fn nothing_moves_when_a_message_is_sent() {
+        let waiting = OutboxRecord {
+            id: "1".into(),
+            conversation_id: "c".into(),
+            target: store::OutboxTarget::Flat,
+            thread_root_id: None,
+            payload: r#"{"markdown":"see https://a.example/x","tried":true}"#.into(),
+            images: vec![],
+            state: OutboxState::Sending,
+            last_error: None,
+            created_at: at(4),
+        };
+        let sent = MessageRecord {
+            body_html: tern_engine::linked("<p>see https://a.example/x</p>"),
+            ..message("9", "me", 4)
+        };
+        for earlier in [
+            vec![],
+            vec![message("1", "ann", 1)],
+            vec![message("1", "ann", 0), message("2", "me", 1)],
+            vec![message("1", "me", -60)],
+        ] {
+            let before = items(
+                &earlier,
+                std::slice::from_ref(&waiting),
+                Some("me"),
+                "ME",
+                at(5),
+            );
+            let all = [earlier.clone(), vec![sent.clone()]].concat();
+            let after = items(&all, &[], Some("me"), "ME", at(5));
+            let (old, new) = (before.last().unwrap(), after.last().unwrap());
+            let shown = |item: &Item| {
+                let item = item.clone();
+                (
+                    item.sender,
+                    item.time,
+                    item.blocks,
+                    item.joined,
+                    item.divider,
+                    item.note,
+                )
+            };
+            assert_eq!(shown(old), shown(new));
+            // For the moment in which both are there, it is shown once.
+            let both = items(
+                &all,
+                std::slice::from_ref(&waiting),
+                Some("me"),
+                "ME",
+                at(5),
+            );
+            assert_eq!(both.len(), after.len());
+        }
+        // The same words again are another message.
+        let again = [
+            message("1", "ann", 1),
+            MessageRecord {
+                created_at: at(3),
+                ..sent
+            },
+        ];
+        assert_eq!(items(&again, &[waiting], Some("me"), "ME", at(5)).len(), 3);
+    }
+
+    #[test]
+    fn only_the_newest_own_message_says_how_far_it_got() {
+        let horizon = |user: &str, minutes| ReadHorizonRecord {
+            member_id: format!("8:orgid:{user}"),
+            read_until: at(minutes),
+            read_at: None,
+        };
+        let messages = [
+            message("1", "me", 0),
+            message("2", "me", 1),
+            message("3", "ann", 2),
+        ];
+        let members = vec![("me", "Me"), ("ann", "Ann"), ("Bo", "Bo")];
+        let of = |horizons: &[ReadHorizonRecord]| {
+            let mut all = items(&messages, &[], Some("me"), "Me", at(5));
+            let readers = Readers {
+                horizons,
+                members: members.clone(),
+            };
+            mark_newest(&mut all, &messages, Some("me"), &readers);
+            assert!(all[0].progress.is_none() && all[2].progress.is_none());
+            all[1].progress.clone().unwrap()
+        };
+        assert_eq!(of(&[]), Progress::Delivered);
+        // One's own reading does not count, nor reading earlier messages.
+        assert_eq!(
+            of(&[horizon("me", 9), horizon("ann", 0)]),
+            Progress::Delivered
+        );
+        let seen = |names: &[&str]| Progress::Seen {
+            names: names.iter().map(|name| (*name).to_owned()).collect(),
+            others: 2,
+        };
+        assert_eq!(of(&[horizon("ann", 1), horizon("bo", 0)]), seen(&["Ann"]));
+        assert!(of(&[horizon("ann", 1), horizon("bo", 2)]).is_read());
+        // A message on its way is the newest.
+        let mut all = items(&messages, &[], Some("me"), "Me", at(5));
+        all.push(Item {
+            own: true,
+            progress: Some(Progress::Sending),
+            ..Default::default()
+        });
+        mark_newest(&mut all, &messages, Some("me"), &Readers::default());
+        let marked: Vec<bool> = all.iter().map(|item| item.progress.is_some()).collect();
+        assert_eq!(marked, [false, false, false, true]);
+    }
+
+    #[test]
+    fn links_show_what_is_behind_them() {
+        let mut linked = message("1", "ann", 0);
+        linked.body_html = "<p><a href=\"https://a.example/x\">this</a></p>".into();
+        linked.links_json = serde_json::json!([{
+            "url": "https://a.example/x", "previewenabled": true,
+            "preview": {
+                "title": "A <b>page</b>", "description": "About\nit",
+                "previewurl": "https://us-prod.asyncgw.teams.microsoft.com/urlp/v1/url/image?x=1"
+            }
+        }])
+        .to_string();
+        let Some(Block::Preview(preview)) = content(&linked).pop() else {
+            panic!()
+        };
+        assert_eq!(preview.title, "A <b>page</b>", "shown as text");
+        assert_eq!(preview.description, "About it");
+        assert_eq!(preview.site, "a.example");
+        let item = items(&[linked.clone()], &[], None, "", at(1));
+        assert_eq!(pictures(&item).len(), 1);
+        // Not for another page than the one that is linked, and only Teams' own pictures.
+        linked.body_html = linked.body_html.replace("/x", "/y");
+        assert!(!format!("{:?}", content(&linked)).contains("Preview"));
     }
 
     #[test]

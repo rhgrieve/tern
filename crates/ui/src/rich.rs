@@ -24,7 +24,18 @@ pub enum Block {
     },
     Picture(String),
     Card(Box<crate::card::Card>),
+    /// What is behind a link, as Teams saw it.
+    Preview(Box<Preview>),
     Rule,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Preview {
+    pub url: String,
+    pub title: String,
+    pub description: String,
+    pub site: String,
+    pub picture: Option<String>,
 }
 
 /// Where a long word may break; never part of the text itself.
@@ -216,10 +227,29 @@ fn wrap(out: &mut String, open: &str, children: &[Span], close: &str) {
     out.push_str(close);
 }
 
+/// Text, with addresses in it made links: not every client sends them as such.
+fn push_text(out: &mut String, text: &str) {
+    let mut at = 0;
+    for (range, url) in tern_engine::bare_links(text) {
+        out.push_str(&shown(&text[at..range.start]));
+        push_link(out, &url, &text[range.clone()]);
+        at = range.end;
+    }
+    out.push_str(&shown(&text[at..]));
+}
+
+fn push_link(out: &mut String, url: &str, text: &str) {
+    out.push_str("<a href=\"");
+    out.push_str(&escape(url));
+    out.push_str("\">");
+    out.push_str(&shown(text));
+    out.push_str("</a>");
+}
+
 /// Blocks inside inline content become their text.
 fn push_inline(out: &mut String, span: &Span) {
     match span {
-        Span::Text(text) => out.push_str(&shown(text)),
+        Span::Text(text) => push_text(out, text),
         Span::Bold(children) => wrap(out, "<b>", children, "</b>"),
         Span::Italic(children) => wrap(out, "<i>", children, "</i>"),
         Span::Strike(children) => wrap(out, "<s>", children, "</s>"),
@@ -232,16 +262,12 @@ fn push_inline(out: &mut String, span: &Span) {
             out.push_str("</tt>");
         }
         Span::Link { url, children } if may_open(url) => {
-            out.push_str("<a href=\"");
-            out.push_str(&escape(url));
-            out.push_str("\">");
             // Pango refuses a link inside a link.
             let mut text = String::new();
             for child in children {
                 push_plain(&mut text, child);
             }
-            out.push_str(&shown(if text.trim().is_empty() { url } else { &text }));
-            out.push_str("</a>");
+            push_link(out, url, if text.trim().is_empty() { url } else { &text });
         }
         Span::Link { children, .. } => wrap(out, "", children, ""),
         Span::Mention { name, .. } => {
@@ -348,11 +374,18 @@ mod tests {
     #[test]
     fn long_words_can_break_and_copy_as_written() {
         let url = "https://example.com/a/very/long/path/without/any/break";
-        let Block::Text(markup) = &of(&format!("<p>see {url} and short words</p>"))[0] else {
+        let word = "a/very/long/path/without/any/break/in/it/at/all";
+        let Block::Text(markup) = &of(&format!("<p>see {word} and short words</p>"))[0] else {
             panic!()
         };
         assert!(markup.contains(BREAK) && markup.ends_with(" and short words"));
-        assert_eq!(as_written(markup), format!("see {url} and short words"));
+        assert_eq!(as_written(markup), format!("see {word} and short words"));
+        // Addresses that came as text are links, too.
+        let Block::Text(markup) = &of(&format!("<p>see {url}, and</p>"))[0] else {
+            panic!()
+        };
+        assert!(markup.starts_with(&format!("see <a href=\"{url}\">")));
+        assert!(markup.ends_with("</a>, and"));
         // The address of a link is never touched.
         let Block::Text(markup) = &of(&format!("<a href=\"{url}\">{url}</a>"))[0] else {
             panic!()

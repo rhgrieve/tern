@@ -3,22 +3,31 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chatsvc::realtime::MessageEvent;
+use chatsvc::realtime::{EventKind, MessageEvent};
 use chrono::{DateTime, Utc};
 use session::Session;
 use store::{MessageRecord, Store};
 use teams_core::CoreEvent;
+use teams_core::Presence;
 use tern_engine::{
     Arrived, Draft, FILE_BYTES, Files, Job, Notice, Outbox, Queued, Rules, Sync, SyncState, Teams,
     Want, database_path, media_usage, open_store, people, pictures, prefetch,
 };
-use tern_ipc::Event;
+use tern_ipc::{Availability, Event};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 
 pub enum News {
     Arrived(Arrived),
-    Failed { reason: String },
+    /// Messages of the conversation are not as they were.
+    Changed {
+        conversation: String,
+    },
+    /// Somebody came or went.
+    Presence,
+    Failed {
+        reason: String,
+    },
 }
 
 pub struct Messages {
@@ -47,8 +56,39 @@ const RECENT_CHATS: usize = 50;
 /// Chats whose pictures are kept ready, and how many messages of each are looked at.
 const PICTURE_CHATS: usize = 20;
 const PICTURE_MESSAGES: usize = 60;
+/// Reactions to messages further back are not told.
+const REACTED: usize = 200;
+/// At most this many messages are looked at for a window.
+const LOOKED_FOR: usize = 2000;
 const PEOPLE: usize = 200;
 const MEDIA_EVERY: Duration = Duration::from_secs(30 * 60);
+
+pub fn presence<'a>(
+    teams: &Teams,
+    people: impl IntoIterator<Item = &'a String>,
+) -> Vec<(String, Availability)> {
+    people
+        .into_iter()
+        .filter_map(|person| {
+            let known = teams.engine().presence(person)?;
+            Some((person.clone(), availability(known)?))
+        })
+        .collect()
+}
+
+fn availability(presence: Presence) -> Option<Availability> {
+    use teams_core::{Activity, Availability as Known};
+    let out = presence.activity == Some(Activity::OutOfOffice);
+    Some(match presence.availability {
+        Known::Available => Availability::Available,
+        Known::Busy => Availability::Busy,
+        Known::DoNotDisturb => Availability::DoNotDisturb,
+        Known::Away | Known::Offline | Known::Unknown if out => Availability::OutOfOffice,
+        Known::Away => Availability::Away,
+        Known::Offline => Availability::Offline,
+        Known::Unknown => return None,
+    })
+}
 
 /// The files of a message that can be downloaded.
 pub fn downloadable(message: &MessageRecord) -> Vec<teams_core::FileCard> {
@@ -99,7 +139,11 @@ async fn want_recent(
 }
 
 /// Passes on what the engine changed in the cache.
-async fn tell(mut core: broadcast::Receiver<CoreEvent>, changes: broadcast::Sender<Event>) {
+async fn tell(
+    mut core: broadcast::Receiver<CoreEvent>,
+    changes: broadcast::Sender<Event>,
+    news: mpsc::UnboundedSender<News>,
+) {
     loop {
         let event = match core.recv().await {
             Ok(CoreEvent::SidebarChanged) => Event::Chats,
@@ -108,11 +152,23 @@ async fn tell(mut core: broadcast::Receiver<CoreEvent>, changes: broadcast::Send
                 | CoreEvent::MessagesStoredLate {
                     conversation_id, ..
                 },
-            ) => Event::Messages {
+            ) => {
+                let _ = news.send(News::Changed {
+                    conversation: conversation_id.clone(),
+                });
+                Event::Messages {
+                    conversation: conversation_id,
+                }
+            }
+            Ok(CoreEvent::ReceiptsChanged { conversation_id }) => Event::Messages {
                 conversation: conversation_id,
             },
             Ok(CoreEvent::ImagesChanged { .. }) => Event::Pictures,
             Ok(CoreEvent::AvatarsChanged { .. }) => Event::Faces,
+            Ok(CoreEvent::PresenceChanged) => {
+                let _ = news.send(News::Presence);
+                continue;
+            }
             Ok(_) => continue,
             // Some were missed; the list says which conversations moved.
             Err(broadcast::error::RecvError::Lagged(_)) => Event::Chats,
@@ -158,10 +214,10 @@ impl Messages {
             store.clone(),
             &path.with_file_name("outgoing"),
         );
-        let sent = news.clone();
+        let (sent, moved) = (news.clone(), changes.clone());
         let tasks = vec![
             tokio::spawn(prefetch(teams.clone(), wanted)),
-            tokio::spawn(tell(core, changes)),
+            tokio::spawn(tell(core, changes, news.clone())),
             tokio::spawn(want_recent(state.clone(), store.clone(), want.clone())),
             tokio::spawn(sync.run()),
             tokio::spawn(async move {
@@ -172,9 +228,18 @@ impl Messages {
                 }
             }),
             tokio::spawn(outbox.clone().run(move |queued| {
-                if let Queued::Failed { reason, .. } = queued {
-                    let _ = sent.send(News::Failed { reason });
-                }
+                let conversation = match queued {
+                    Queued::Failed {
+                        reason,
+                        conversation,
+                    } => {
+                        let _ = sent.send(News::Failed { reason });
+                        conversation
+                    }
+                    Queued::Sent { conversation } => conversation,
+                };
+                // It is no longer in the outbox.
+                let _ = moved.send(Event::Messages { conversation });
             })),
         ];
         Ok(Messages {
@@ -197,6 +262,10 @@ impl Messages {
     }
 
     pub fn event(&self, event: MessageEvent) {
+        if event.kind == EventKind::ReadReceipt {
+            let (teams, event) = (self.teams.clone(), event.clone());
+            tokio::spawn(async move { teams.engine().handle_receipt_event(&event).await });
+        }
         let _ = self.jobs.send(Job::Event(event));
     }
 
@@ -304,6 +373,54 @@ impl Messages {
                 None => Err("there is no such file".into()),
             }
         }
+    }
+
+    /// Pictures somebody is looking for, where fetching them tells nobody anything.
+    pub fn want_pictures(&self, conversation: &str, messages: usize) {
+        let messages = self
+            .store
+            .messages(conversation, None, messages.min(LOOKED_FOR))
+            .unwrap_or_default();
+        // Oldest first: the newest request is served first.
+        let images = messages.iter().flat_map(pictures).collect();
+        let _ = self.want.send(Want::Pictures(images));
+    }
+
+    /// Whether these people are there, as far as it is known.
+    pub fn presence<'a>(
+        &self,
+        people: impl IntoIterator<Item = &'a String>,
+    ) -> Vec<(String, Availability)> {
+        presence(&self.teams, people)
+    }
+
+    /// What others think of the user's messages in a conversation that changed.
+    pub fn reactions(&mut self, conversation: &str) -> Vec<Notice> {
+        let messages = self
+            .store
+            .messages(conversation, None, REACTED)
+            .unwrap_or_default();
+        let chat = self.store.chat(conversation).ok().flatten();
+        let store = self.store.clone();
+        let name = |id: &str| {
+            let member = chat.iter().flat_map(|chat| &chat.members).find(|member| {
+                member
+                    .user_id
+                    .as_deref()
+                    .is_some_and(|known| known.eq_ignore_ascii_case(id))
+            });
+            let name = member.map(|member| member.display_name.clone());
+            name.or_else(|| {
+                let people = store.conversation_people(conversation, PEOPLE).ok()?;
+                people
+                    .into_iter()
+                    .find(|(known, _)| known.eq_ignore_ascii_case(id))
+                    .map(|(_, name)| name)
+            })
+            .filter(|name| !name.trim().is_empty())
+        };
+        self.rules
+            .reactions(&messages, chat.as_ref(), &self.account, name, Utc::now())
     }
 
     pub fn notices(&mut self, arrived: &Arrived) -> Vec<Notice> {

@@ -1186,7 +1186,9 @@ impl Remote for Graph {
     async fn hosted_content(&self, url: &str) -> Result<Photo> {
         let ams_url = chatsvc::hosted_content_image_url(url);
         let url = ams_url.as_deref().unwrap_or(url);
-        let image = if chatsvc::is_ams_image_url(url) {
+        // Tern patch: without a page, the gateway's pictures of linked pages take the Skype token.
+        let native = self.session().is_native() && chatsvc::is_link_image_url(url);
+        let image = if chatsvc::is_ams_image_url(url) || native {
             chatsvc::ams::Ams::new(self.session())
                 .download_image(url)
                 .await?

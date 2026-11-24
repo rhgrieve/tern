@@ -1,6 +1,7 @@
 //! The main window.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,11 +20,12 @@ use crate::composer::{Aim, Composer, Written};
 use crate::desk::{self, Desk};
 use crate::history::{History, Need};
 use crate::list::MessageList;
-use crate::model::{self, Conversation, Filter, OUTGOING};
+use crate::model::{self, Conversation, Filter, OUTGOING, Reacting};
 use crate::row::{Item, say};
 use crate::sidebar::Sidebar;
 use crate::tools::{Tool, Tools};
-use crate::{art, mention, palette, service};
+use crate::viewer::Viewer;
+use crate::{art, mention, palette, presence, service};
 
 const CHATS: usize = 400;
 
@@ -41,6 +43,12 @@ struct State {
     /// When the others were last told that the user is writing.
     told: Option<Instant>,
     filter: Filter,
+    /// The conversation whose pictures were asked for, and for how many messages.
+    pictures: Option<(String, usize)>,
+    /// Pictures that are here or were asked for.
+    asked: HashSet<String>,
+    /// Reactions the service does not know yet.
+    reacting: Vec<Reacting>,
 }
 
 pub struct Window {
@@ -64,6 +72,13 @@ pub struct Window {
     /// Shown while older messages are fetched.
     loading: gtk::Box,
     tools: RefCell<Option<Rc<Tools>>>,
+    viewer: RefCell<Option<Rc<Viewer>>>,
+    /// Whose presence was asked for.
+    watched: RefCell<HashSet<String>>,
+    /// What the daemon was told is in front of the user.
+    viewing: RefCell<Option<String>>,
+    /// The daemon is in touch with Teams.
+    connected: Cell<bool>,
     client: Client,
     state: RefCell<State>,
     /// Counts reads, so that a slow one does not replace a newer.
@@ -75,6 +90,11 @@ pub struct Window {
 const TYPING: Duration = Duration::from_secs(12);
 /// How often the others are told.
 const TELL: Duration = Duration::from_secs(8);
+
+/// And as many until the presence of others is read again, in case it is not pushed.
+const PRESENCE: u32 = 60;
+/// Every so many ticks of two seconds it is asked who has read.
+const RECEIPTS: u32 = 10;
 
 /// What a key does.
 type Run = fn(&Rc<Window>);
@@ -380,6 +400,18 @@ impl Window {
                 }
             });
             window.add_action(&react);
+            let picture = gio::SimpleAction::new("picture", Some(glib::VariantTy::STRING));
+            picture.connect_activate({
+                let weak = weak.clone();
+                move |_, url| {
+                    if let (Some(window), Some(url)) =
+                        (weak.upgrade(), url.and_then(|url| url.get::<String>()))
+                    {
+                        window.view_picture(&url);
+                    }
+                }
+            });
+            window.add_action(&picture);
             window.connect_close_request({
                 let closed = later(Window::closed);
                 move |_| {
@@ -388,11 +420,19 @@ impl Window {
                 }
             });
             glib::timeout_add_local(Duration::from_secs(2), {
-                let weak = weak.clone();
+                let (weak, ticks) = (weak.clone(), Cell::new(0u32));
                 move || match weak.upgrade() {
                     Some(window) => {
                         window.save_drafts();
                         window.show_typing();
+                        ticks.set(ticks.get() + 1);
+                        if ticks.get().is_multiple_of(RECEIPTS) {
+                            window.ask_receipts();
+                            window.tell_viewing();
+                        }
+                        if ticks.get().is_multiple_of(PRESENCE) && window.window.is_active() {
+                            window.ask_presence(true);
+                        }
                         glib::ControlFlow::Continue
                     }
                     None => glib::ControlFlow::Break,
@@ -407,8 +447,11 @@ impl Window {
                 }
             });
             window.connect_is_active_notify({
-                let seen = later(Window::seen);
-                move |_| seen()
+                let (seen, viewing) = (later(Window::seen), later(Window::tell_viewing));
+                move |_| {
+                    seen();
+                    viewing();
+                }
             });
             list.root.vadjustment().connect_value_changed({
                 let moved = later(Window::moved);
@@ -433,6 +476,10 @@ impl Window {
                 out,
                 loading,
                 tools: RefCell::default(),
+                viewer: RefCell::default(),
+                watched: RefCell::default(),
+                viewing: RefCell::default(),
+                connected: Cell::new(false),
                 client,
                 state: RefCell::default(),
                 chats_turn: Cell::new(0),
@@ -458,10 +505,14 @@ impl Window {
     fn use_tool(self: &Rc<Self>, item: &Rc<Item>, tool: Tool) {
         match tool {
             Tool::React(emoji) => {
-                let mine = item
+                // As it is by now: the bar may still have it from before the last click.
+                let now = self.list.item(&item.id);
+                let mine = now
+                    .as_ref()
+                    .unwrap_or(item)
                     .reactions
                     .iter()
-                    .any(|reaction| reaction.mine && reaction.emoji == emoji);
+                    .any(|reaction| reaction.mine && reaction.emoji == model::in_colour(&emoji));
                 self.react(&item.id, &emoji, !mine);
             }
             // In a channel an answer belongs into the thread of its post.
@@ -695,12 +746,168 @@ impl Window {
         let Some(conversation) = self.state.borrow().open.clone() else {
             return;
         };
+        {
+            let mut state = self.state.borrow_mut();
+            state
+                .reacting
+                .retain(|other| other.message != message || other.emoji != emoji);
+            state.reacting.push(Reacting {
+                conversation: conversation.clone(),
+                message: message.to_owned(),
+                emoji: emoji.to_owned(),
+                on,
+                taken: None,
+            });
+        }
+        self.list
+            .change(message, |item| model::react(&mut item.reactions, emoji, on));
         self.client.ask(Request::React {
             conversation,
             message: message.to_owned(),
             emoji: emoji.to_owned(),
             on,
         });
+    }
+
+    fn reacted(self: &Rc<Self>, message: &str, emoji: &str, on: bool, refused: Option<String>) {
+        let same =
+            |other: &Reacting| other.message == message && other.emoji == emoji && other.on == on;
+        match refused {
+            Some(reason) => {
+                self.state
+                    .borrow_mut()
+                    .reacting
+                    .retain(|other| !same(other));
+                self.toasts
+                    .add_toast(adw::Toast::new(&glib::markup_escape_text(&reason)));
+            }
+            None => {
+                let mut state = self.state.borrow_mut();
+                if let Some(reacting) = state.reacting.iter_mut().find(|other| same(other)) {
+                    reacting.taken = Some(Instant::now());
+                }
+                drop(state);
+                // If the cache still disagrees by then, it is right.
+                let weak = Rc::downgrade(self);
+                glib::timeout_add_local_once(model::BELIEVE + Duration::from_secs(1), move || {
+                    if let Some(window) = weak.upgrade()
+                        && !window.state.borrow().reacting.is_empty()
+                    {
+                        window.read_open();
+                    }
+                });
+            }
+        }
+        self.read_open();
+    }
+
+    /// The daemon does not notify about what the user is looking at.
+    fn tell_viewing(self: &Rc<Self>) {
+        if self.desk.demo {
+            return;
+        }
+        let open = self.state.borrow().open.clone();
+        let now = open.filter(|_| self.window.is_active() && self.is_reading());
+        let before = self.viewing.replace(now.clone());
+        if let Some(conversation) = before.filter(|before| Some(before) != now.as_ref()) {
+            self.client.ask(Request::Viewing {
+                conversation,
+                on: false,
+            });
+        }
+        if let Some(conversation) = now {
+            self.client.ask(Request::Viewing {
+                conversation,
+                on: true,
+            });
+        }
+    }
+
+    /// Asks whether the people shown are there; `again` also for those that were asked for.
+    fn ask_presence(self: &Rc<Self>, again: bool) {
+        if self.desk.demo {
+            return;
+        }
+        let mut people = self.sidebar.people();
+        people.extend(self.list.people());
+        people.retain(|person| presence::is_person(person));
+        people.sort();
+        people.dedup();
+        let mut asked = self.watched.borrow_mut();
+        if !again {
+            people.retain(|person| !asked.contains(person));
+        }
+        if !people.is_empty() {
+            asked.extend(people.iter().cloned());
+            self.client.ask(Request::Presence { people });
+        }
+    }
+
+    fn forget_presence(&self) {
+        // Asked for again when there is a connection.
+        self.watched.borrow_mut().clear();
+        if presence::forget() {
+            self.show_presence();
+        }
+    }
+
+    fn show_presence(&self) {
+        presence::refresh(self.sidebar.root.upcast_ref());
+        presence::refresh(self.list.view.upcast_ref());
+    }
+
+    /// Mostly the service tells by itself that somebody read a message.
+    fn ask_receipts(self: &Rc<Self>) {
+        let open = {
+            let state = self.state.borrow();
+            let chat = !state.channel && state.thread.is_none();
+            state.open.clone().filter(|_| chat)
+        };
+        if let Some(conversation) = open
+            && !self.desk.demo
+            && self.window.is_active()
+            && self.list.waits_for_readers()
+        {
+            self.client.ask(Request::Receipts { conversation });
+        }
+    }
+
+    /// Shows a picture on its own, and asks for it in full.
+    pub fn view_picture(self: &Rc<Self>, url: &str) {
+        if !art::has_picture(url) {
+            return;
+        }
+        let viewer = Viewer::show(&self.window, url);
+        let full = tern_engine::full_size(url);
+        if let Some(full) = full {
+            if art::file(&full).is_some() {
+                viewer.load(&full);
+            } else if !self.desk.demo {
+                self.client.ask(Request::Picture { url: full });
+            }
+        }
+        self.viewer.replace(Some(viewer));
+    }
+
+    /// Asks for pictures of what is shown that nobody asked for yet.
+    fn want_pictures(self: &Rc<Self>, items: &[Item]) {
+        if self.desk.demo {
+            return;
+        }
+        let mut state = self.state.borrow_mut();
+        let mut missing = false;
+        for url in model::pictures(items) {
+            if !state.asked.contains(url) {
+                state.asked.insert(url.to_owned());
+                missing |= !art::has_picture(url);
+            }
+        }
+        if let (true, Some(conversation)) = (missing, state.open.clone()) {
+            self.client.ask(Request::Pictures {
+                conversation,
+                messages: state.history.limit,
+            });
+        }
     }
 
     fn delete(self: &Rc<Self>, item: &Rc<Item>) {
@@ -853,8 +1060,7 @@ impl Window {
                     self.read_open();
                 }
             }
-            // Pictures appear when their row is shown again; redrawing all would lose selections.
-            News::Event(Event::Pictures) => {}
+            News::Event(Event::Pictures) => self.list.show_pictures(),
             News::Event(Event::Faces) => {
                 art::forget_faces();
                 self.sidebar.reload_faces();
@@ -868,6 +1074,8 @@ impl Window {
             }
             News::Older { conversation, done } => self.older_came(&conversation, done),
             News::Gone => {
+                self.connected.set(false);
+                self.forget_presence();
                 self.tell("The background service is not running. You can read, but not send.")
             }
             News::Unsent { request, reason } => {
@@ -875,6 +1083,22 @@ impl Window {
                     .add_toast(adw::Toast::new(&glib::markup_escape_text(&reason)));
                 self.not_taken(*request);
             }
+            News::Event(Event::Presence { people }) | News::Presence(people) => {
+                if presence::update(&people) {
+                    self.show_presence();
+                }
+            }
+            News::Picture { url } => {
+                if let Some(viewer) = self.viewer.borrow().as_ref() {
+                    viewer.load(&url);
+                }
+            }
+            News::Reacted {
+                message,
+                emoji,
+                on,
+                refused,
+            } => self.reacted(&message, &emoji, on, refused),
             News::Refused(reason) => self
                 .toasts
                 .add_toast(adw::Toast::new(&glib::markup_escape_text(&reason))),
@@ -886,6 +1110,12 @@ impl Window {
             self.use_account(account.clone());
         }
         let signed_out = status.push == "signed out";
+        self.connected.set(status.push == "connected");
+        if self.connected.get() {
+            self.ask_presence(false);
+        } else {
+            self.forget_presence();
+        }
         self.sign_in.set_title(match status.account {
             Some(_) => "Signed out of Teams",
             None => "Nobody is signed in",
@@ -900,6 +1130,8 @@ impl Window {
             _ => "Offline. Messages are sent when the connection is back.".into(),
         };
         self.tell(&text);
+        // Some may have come while nobody told.
+        self.list.show_pictures();
         // An outgoing message may have gone out.
         self.read_open();
     }
@@ -935,6 +1167,9 @@ impl Window {
                 && window.chats_turn.get() == turn
             {
                 window.sidebar.set(rows);
+                if window.connected.get() {
+                    window.ask_presence(false);
+                }
             }
         });
     }
@@ -994,6 +1229,14 @@ impl Window {
         let (Some(store), Some(id)) = (store, id) else {
             return;
         };
+        let looked = (id.clone(), limit);
+        if !self.desk.demo && self.state.borrow().pictures.as_ref() != Some(&looked) {
+            self.client.ask(Request::Pictures {
+                conversation: id.clone(),
+                messages: limit,
+            });
+            self.state.borrow_mut().pictures = Some(looked);
+        }
         let turn = self.open_turn.get() + 1;
         self.open_turn.set(turn);
         let weak = Rc::downgrade(self);
@@ -1014,7 +1257,13 @@ impl Window {
         });
     }
 
-    fn show(self: &Rc<Self>, conversation: Conversation, fresh: bool) {
+    fn show(self: &Rc<Self>, mut conversation: Conversation, fresh: bool) {
+        {
+            let mut state = self.state.borrow_mut();
+            let open = state.open.clone().unwrap_or_default();
+            model::apply_reacting(&mut conversation.items, &open, &mut state.reacting);
+        }
+        self.want_pictures(&conversation.items);
         self.set_titles(&conversation.title, &conversation.subtitle);
         let people = conversation
             .items
@@ -1059,6 +1308,12 @@ impl Window {
         }
         self.pages.set_visible_child_name("talk");
         self.seen();
+        if fresh {
+            self.tell_viewing();
+        }
+        if self.connected.get() {
+            self.ask_presence(false);
+        }
         // Once the new rows have their place: more may be wanted still.
         let weak = Rc::downgrade(self);
         glib::timeout_add_local(Duration::from_millis(120), move || match weak.upgrade() {

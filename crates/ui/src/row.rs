@@ -36,13 +36,27 @@ pub struct Item {
     pub sent: bool,
     /// It could not be sent.
     pub failed: bool,
+    /// How far it got; for the newest own message only.
+    pub progress: Option<crate::mark::Progress>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Reaction {
+    /// What the service calls it.
     pub emoji: String,
+    /// Set for the organization's own.
+    pub custom: Option<tern_engine::Emoji>,
     pub count: usize,
     pub mine: bool,
+}
+
+impl Reaction {
+    pub fn name(&self) -> &str {
+        match &self.custom {
+            Some(emoji) => &emoji.name,
+            None => &self.emoji,
+        }
+    }
 }
 
 impl Item {
@@ -55,9 +69,10 @@ impl Item {
             } else {
                 ""
             };
-            out.push_str(&format!(". {} {}{who}", reaction.count, reaction.emoji));
+            out.push_str(&format!(". {} {}{who}", reaction.count, reaction.name()));
         }
-        for more in [&self.note, &self.thread, &self.divider]
+        let progress = self.progress.as_ref().map(crate::mark::Progress::words);
+        for more in [&self.note, &progress, &self.thread, &self.divider]
             .into_iter()
             .flatten()
         {
@@ -66,6 +81,41 @@ impl Item {
         }
         out
     }
+}
+
+/// Emoji are drawn as high as text.
+const EMOJI: i32 = 18;
+
+/// What a chip shows for an emoji of the organization's own: its name until the picture is here.
+fn custom(emoji: &tern_engine::Emoji, count: usize) -> gtk::Box {
+    let picture = gtk::Image::builder()
+        .pixel_size(EMOJI)
+        .valign(gtk::Align::Center)
+        .visible(false)
+        .build();
+    picture.add_css_class("missing");
+    picture.set_widget_name(&emoji.url);
+    let holder = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    holder.append(&picture);
+    holder.append(&gtk::Label::new(Some(&format!(":{}:", emoji.name))));
+    holder.append(&gtk::Label::new(Some(&count.to_string())));
+    show_emoji(&picture);
+    holder
+}
+
+/// Shows the picture instead of the name, once it is here.
+fn show_emoji(picture: &gtk::Image) {
+    let shown = picture.clone();
+    crate::art::picture(&picture.widget_name(), move |texture| {
+        if let Some(texture) = texture {
+            shown.set_paintable(Some(texture));
+            shown.set_visible(true);
+            shown.remove_css_class("missing");
+            if let Some(name) = shown.next_sibling() {
+                name.set_visible(false);
+            }
+        }
+    });
 }
 
 /// Says what a button with only a picture does.
@@ -80,6 +130,7 @@ mod imp {
     pub struct MessageRow {
         pub divider: gtk::Label,
         pub avatar: adw::Avatar,
+        pub there: std::cell::OnceCell<gtk::DrawingArea>,
         pub person: RefCell<Option<String>>,
         pub gutter: gtk::Box,
         pub header: gtk::Box,
@@ -92,6 +143,7 @@ mod imp {
         pub note: gtk::Label,
         pub reactions: gtk::Box,
         pub thread: gtk::Button,
+        pub mark: crate::mark::Mark,
         pub item: RefCell<Option<std::rc::Rc<Item>>>,
     }
 
@@ -118,7 +170,10 @@ mod imp {
             self.avatar.set_show_initials(true);
             self.avatar.set_valign(gtk::Align::Start);
             self.gutter.set_size_request(36, -1);
-            self.gutter.append(&self.avatar);
+            let there = crate::presence::dot();
+            self.gutter
+                .append(&crate::presence::with_dot(&self.avatar, &there));
+            let _ = self.there.set(there);
             line.append(&self.gutter);
 
             let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -128,13 +183,20 @@ mod imp {
             self.name.set_ellipsize(gtk::pango::EllipsizeMode::End);
             self.time.add_css_class("caption");
             self.time.add_css_class("dim-label");
+            // Smaller, but on the same line.
+            self.name.set_valign(gtk::Align::BaselineFill);
+            self.time.set_valign(gtk::Align::BaselineFill);
             self.header.append(&self.name);
             self.header.append(&self.time);
             content.append(&self.header);
 
             self.body.set_orientation(gtk::Orientation::Vertical);
             self.body.set_spacing(8);
-            content.append(&self.body);
+            self.body.set_hexpand(true);
+            let said = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+            said.append(&self.body);
+            said.append(&self.mark.area);
+            content.append(&said);
 
             self.note.add_css_class("caption");
             self.note.add_css_class("dim-label");
@@ -234,6 +296,7 @@ enum Kind {
     Table,
     Picture,
     Card,
+    Preview,
     Rule,
 }
 
@@ -269,6 +332,7 @@ fn kind(block: &Block) -> Kind {
         Block::Table { .. } => Kind::Table,
         Block::Picture(_) => Kind::Picture,
         Block::Card(_) => Kind::Card,
+        Block::Preview(_) => Kind::Preview,
         Block::Rule => Kind::Rule,
     }
 }
@@ -328,18 +392,25 @@ impl Part {
                 scroll.upcast()
             }
             Kind::Picture => {
-                let frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                let frame = gtk::Button::builder()
+                    .child(&holder)
+                    .halign(gtk::Align::Start)
+                    .overflow(gtk::Overflow::Hidden)
+                    .action_target(&"".to_variant())
+                    .action_name("win.picture")
+                    .build();
                 frame.add_css_class("picture");
-                frame.set_halign(gtk::Align::Start);
-                frame.set_overflow(gtk::Overflow::Hidden);
+                frame.set_cursor_from_name(Some("zoom-in"));
+                say(&frame, "Show the picture");
                 let picture = gtk::Picture::builder()
                     .content_fit(gtk::ContentFit::Contain)
                     .can_shrink(true)
                     .build();
                 let missing = gtk::Label::new(Some("Picture not on this computer"));
                 missing.add_css_class("dim-label");
-                frame.append(&picture);
-                frame.append(&missing);
+                holder.append(&picture);
+                holder.append(&missing);
                 labels.push(missing);
                 frame.upcast()
             }
@@ -347,6 +418,11 @@ impl Part {
                 let frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
                 frame.add_css_class("card");
                 frame.add_css_class("adaptive");
+                frame.upcast()
+            }
+            Kind::Preview => {
+                let frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                frame.set_halign(gtk::Align::Start);
                 frame.upcast()
             }
             Kind::Rule => gtk::Separator::new(gtk::Orientation::Horizontal).upcast(),
@@ -409,23 +485,84 @@ impl Part {
                     frame.append(&shown);
                 }
             }
+            Block::Preview(preview) => {
+                if let Some(frame) = self.root.downcast_ref::<gtk::Box>() {
+                    clear(frame);
+                    frame.append(&crate::cardview::preview(preview));
+                }
+            }
             Block::Rule => {}
         }
     }
 }
 
 impl Part {
+    fn picture(&self) -> Option<(gtk::Button, gtk::Picture)> {
+        let frame = self.root.clone().downcast::<gtk::Button>().ok()?;
+        let picture = frame.child()?.first_child().and_downcast()?;
+        Some((frame, picture))
+    }
+
     fn set_picture(&self, url: &str) {
-        let Some(picture) = self.root.first_child().and_downcast::<gtk::Picture>() else {
+        let Some((frame, picture)) = self.picture() else {
             return;
         };
-        let (frame, missing) = (self.root.clone(), self.labels[0].clone());
+        let missing = &self.labels[0];
+        frame.set_action_target_value(Some(&url.to_variant()));
         // The row may show another message by the time the picture is decoded.
         frame.set_widget_name(url);
         picture.set_paintable(gtk::gdk::Paintable::NONE);
         picture.set_visible(false);
         missing.set_visible(false);
+        frame.remove_css_class("missing");
         frame.set_size_request(240, 160);
+        self.load_picture(url);
+    }
+
+    /// How far the baseline of its last line of text is above its bottom.
+    fn below_baseline(&self) -> Option<i32> {
+        match self.kind {
+            Kind::Text | Kind::Heading | Kind::Item => {
+                let layout = self.labels.first()?.layout();
+                let (_, all) = layout.extents();
+                let mut lines = layout.iter();
+                while lines.next_line() {}
+                let below = all.y() + all.height() - lines.baseline();
+                Some((f64::from(below) / f64::from(gtk::pango::SCALE)).round() as i32)
+            }
+            Kind::Quote => {
+                let parts = &self.inner.as_ref()?.parts;
+                parts
+                    .iter()
+                    .rfind(|part| part.root.is_visible())?
+                    .below_baseline()
+            }
+            _ => None,
+        }
+    }
+
+    fn look_again(&self) {
+        match self.kind {
+            Kind::Picture if self.root.has_css_class("missing") => {
+                self.load_picture(&self.root.widget_name());
+            }
+            Kind::Card => crate::cardview::look_again(&self.root),
+            Kind::Preview => {
+                crate::cardview::for_missing(&self.root, &crate::cardview::load_cover);
+            }
+            _ => {}
+        }
+        for part in self.inner.iter().flat_map(|inner| &inner.parts) {
+            part.look_again();
+        }
+    }
+
+    /// Leaves everything as it is until it knows.
+    fn load_picture(&self, url: &str) {
+        let Some((frame, picture)) = self.picture() else {
+            return;
+        };
+        let missing = self.labels[0].clone();
         let wanted = url.to_owned();
         crate::art::picture(url, move |texture| {
             if frame.widget_name() != wanted {
@@ -511,6 +648,10 @@ impl MessageRow {
             .filter(|_| !item.joined)
             .and_then(crate::art::face);
         imp.avatar.set_custom_image(face.as_ref());
+        if let Some(there) = imp.there.get() {
+            let person = item.sender_id.as_deref().filter(|_| !item.joined);
+            crate::presence::set(there, person);
+        }
         imp.person
             .replace(item.sender_id.clone().filter(|_| !item.joined));
         imp.name.set_text(&item.sender);
@@ -526,30 +667,51 @@ impl MessageRow {
             self.remove_css_class("own");
         }
         self.bind_body(&item.blocks);
+        imp.mark.set(item.progress.as_ref());
+        self.align_mark();
         imp.note.set_visible(item.note.is_some());
         imp.note.set_text(item.note.as_deref().unwrap_or(""));
         clear(&imp.reactions);
         imp.reactions.set_visible(!item.reactions.is_empty());
         for reaction in &item.reactions {
             let chip = gtk::Button::builder()
-                .label(format!("{} {}", reaction.emoji, reaction.count))
                 .action_name("win.react")
                 .action_target(
                     &(item.id.as_str(), reaction.emoji.as_str(), !reaction.mine).to_variant(),
                 )
                 .sensitive(item.sent)
                 .build();
+            match &reaction.custom {
+                Some(emoji) => chip.set_child(Some(&custom(emoji, reaction.count))),
+                None => chip.set_label(&format!("{} {}", reaction.emoji, reaction.count)),
+            }
             chip.add_css_class("chip");
             let verb = if reaction.mine { "Take back" } else { "Add" };
             say(
                 &chip,
-                &format!("{verb} {}, {} so far", reaction.emoji, reaction.count),
+                &format!("{verb} {}, {} so far", reaction.name(), reaction.count),
             );
             if reaction.mine {
                 chip.add_css_class("mine");
             }
             imp.reactions.append(&chip);
         }
+    }
+
+    /// The mark stands on the last line of the text, if the message ends with text.
+    fn align_mark(&self) {
+        let imp = self.imp();
+        let parts = imp.parts.borrow();
+        let last = parts.iter().rfind(|part| part.root.is_visible());
+        let below = last.and_then(Part::below_baseline);
+        imp.mark.stand(below);
+    }
+
+    /// Shows how far the message got; nothing else of it may have changed.
+    pub fn mark(&self, item: &std::rc::Rc<Item>) {
+        let imp = self.imp();
+        imp.item.replace(Some(item.clone()));
+        imp.mark.set(item.progress.as_ref());
     }
 
     /// Shows the face if it is one of `people`.
@@ -564,6 +726,14 @@ impl MessageRow {
             imp.avatar
                 .set_custom_image(crate::art::face(person).as_ref());
         }
+    }
+
+    /// Shows pictures that came after the row was bound. Nothing else changes, so a selection stays.
+    pub fn show_pictures(&self) {
+        for part in self.imp().parts.borrow().iter() {
+            part.look_again();
+        }
+        crate::cardview::for_missing::<gtk::Image>(self.imp().reactions.upcast_ref(), &show_emoji);
     }
 
     fn bind_body(&self, blocks: &[Block]) {

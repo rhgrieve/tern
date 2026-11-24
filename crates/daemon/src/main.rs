@@ -6,6 +6,7 @@ mod messages;
 mod notify;
 mod tray;
 
+use std::collections::HashSet;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,6 +36,10 @@ const READ_AFTER_CHANGE: Duration = Duration::from_secs(20);
 const BEFORE_SLEEP: Duration = Duration::from_secs(4);
 /// Sleep may have to wait this long for a running request, so it stays below logind's limit.
 const STEP: Duration = Duration::from_secs(3);
+/// People asked for at once.
+const WATCHED: usize = 600;
+/// What a window says it shows counts for this long.
+const VIEWED: Duration = Duration::from_secs(60);
 const PAUSE: Duration = Duration::from_secs(60 * 60);
 const RECONNECT_FIRST: Duration = Duration::from_secs(2);
 const RECONNECT_MAX: Duration = Duration::from_secs(60);
@@ -152,7 +157,22 @@ fn beside(teams: Arc<Teams>, request: &Request) -> Option<Work> {
         Request::Look { conversation, post } => {
             let (conversation, post, teams) = (conversation.clone(), post.clone(), teams.clone());
             Some(Box::pin(async move {
-                teams.look(&conversation, post.as_deref()).await
+                let outcome = teams.look(&conversation, post.as_deref()).await;
+                if post.is_none() {
+                    teams.receipts(&conversation).await;
+                }
+                outcome
+            }))
+        }
+        Request::Picture { url } => {
+            let (url, teams) = (url.clone(), teams.clone());
+            Some(Box::pin(async move { teams.picture(&url).await }))
+        }
+        Request::Receipts { conversation } => {
+            let (conversation, teams) = (conversation.clone(), teams.clone());
+            Some(Box::pin(async move {
+                teams.receipts(&conversation).await;
+                Ok(())
             }))
         }
         Request::Older { conversation } => {
@@ -190,6 +210,10 @@ struct Daemon {
     notifier: Notifier,
     tray: TrayIcon,
     paused_until: Option<Instant>,
+    /// Whose presence the windows show.
+    watched: HashSet<String>,
+    /// What the user has in front of them, and when a window last said so.
+    viewing: Option<(String, Instant)>,
 }
 
 impl Daemon {
@@ -225,6 +249,8 @@ impl Daemon {
             notifier,
             tray,
             paused_until: None,
+            viewing: None,
+            watched: HashSet::new(),
         }
     }
 
@@ -330,7 +356,20 @@ impl Daemon {
     async fn pushed(&mut self, event: Option<RealtimeEvent>) {
         match event {
             None => self.reconnect(self.backoff),
+            Some(RealtimeEvent::Presence(updates)) => {
+                if let Some(messages) = &self.messages {
+                    messages.teams().engine().apply_presence(&updates);
+                }
+            }
             Some(RealtimeEvent::Endpoint(endpoint)) => {
+                if let Some(messages) = &self.messages {
+                    let (teams, endpoint) = (messages.teams(), endpoint.clone());
+                    tokio::spawn(async move {
+                        if let Err(error) = teams.engine().presence_endpoint(endpoint).await {
+                            tracing::debug!(%error, "presence of others is not pushed");
+                        }
+                    });
+                }
                 self.link.endpoint(endpoint.endpoint_id);
                 self.reconcile().await;
             }
@@ -376,7 +415,6 @@ impl Daemon {
                     }
                 }
             },
-            Some(_) => {}
         }
     }
 
@@ -455,20 +493,37 @@ impl Daemon {
         let Some(messages) = &mut self.messages else {
             return;
         };
+        let viewed = match &news {
+            News::Changed { conversation } => self
+                .viewing
+                .as_ref()
+                .is_some_and(|(at, since)| at == conversation && since.elapsed() < VIEWED),
+            _ => false,
+        };
         match news {
-            News::Arrived(arrived) => {
+            News::Arrived(_) | News::Changed { .. } => {
                 let quiet = paused
                     || self
                         .shown
                         .as_ref()
                         .is_some_and(|(_, status)| status.availability == "DoNotDisturb");
-                for notice in messages.notices(&arrived) {
-                    if !quiet {
+                let notices = match &news {
+                    News::Arrived(arrived) => messages.notices(arrived),
+                    News::Changed { conversation } => messages.reactions(conversation),
+                    News::Failed { .. } | News::Presence => Vec::new(),
+                };
+                for notice in notices {
+                    // Decided either way, so that nothing is told later.
+                    if !quiet && !viewed {
                         self.notifier.show(&notice).await;
                     }
                 }
             }
             News::Failed { reason, .. } => self.notifier.failed(&reason).await,
+            News::Presence => {
+                let people = messages.presence(&self.watched);
+                let _ = self.changes.send(Change::Presence { people });
+            }
         }
     }
 
@@ -746,7 +801,31 @@ impl Daemon {
             | Request::Edit { .. }
             | Request::Delete { .. }
             | Request::Look { .. }
+            | Request::Receipts { .. }
+            | Request::Picture { .. }
+            | Request::Presence { .. }
             | Request::Older { .. } => Response::Error("not connected yet".into()),
+            Request::Viewing { conversation, on } => {
+                if on {
+                    self.viewing = Some((conversation, Instant::now()));
+                } else if self
+                    .viewing
+                    .as_ref()
+                    .is_some_and(|(viewed, _)| *viewed == conversation)
+                {
+                    self.viewing = None;
+                }
+                Response::Done
+            }
+            Request::Pictures {
+                conversation,
+                messages,
+            } => {
+                if let Some(cache) = &self.messages {
+                    cache.want_pictures(&conversation, messages);
+                }
+                Response::Done
+            }
             Request::Reload => {
                 self.leave().await;
                 self.messages = None;
@@ -831,6 +910,21 @@ impl Daemon {
                             let _ = reply.send(match file.await {
                                 Ok(path) => Response::Path(path),
                                 Err(error) => Response::Error(error),
+                            });
+                        });
+                        continue;
+                    }
+                    if let (Request::Presence { people }, Some(messages)) =
+                        (&request, &self.messages)
+                    {
+                        let people: Vec<String> =
+                            people.iter().take(WATCHED).map(|id| id.to_ascii_lowercase()).collect();
+                        self.watched.extend(people.iter().cloned());
+                        let teams = messages.teams();
+                        tokio::spawn(async move {
+                            let _ = reply.send(match teams.watch_presence(&people).await {
+                                Ok(()) => Response::Presence(messages::presence(&teams, &people)),
+                                Err(failure) => Response::Error(failure.text().to_owned()),
                             });
                         });
                         continue;

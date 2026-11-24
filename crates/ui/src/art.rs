@@ -200,6 +200,34 @@ pub fn picture(url: &str, show: impl FnOnce(Option<&gdk::Texture>) + 'static) {
     });
 }
 
+/// The file of a picture that is on this computer.
+pub fn file(url: &str) -> Option<PathBuf> {
+    ART.with_borrow(|art| store::find_image_file(art.folder.as_ref()?, url))
+}
+
+/// Decodes a picture in full, off the main thread.
+pub fn whole(file: PathBuf, show: impl FnOnce(Option<gdk::Texture>) + 'static) {
+    glib::spawn_future_local(async move {
+        // At no scale is it made smaller.
+        let decoded = gio::spawn_blocking(move || decode(&file, i32::MAX / WIDTH.max(HEIGHT)))
+            .await
+            .ok()
+            .flatten();
+        show(decoded.map(Decoded::texture));
+    });
+}
+
+/// The picture is on this computer.
+pub fn has_picture(url: &str) -> bool {
+    ART.with_borrow(|art| {
+        art.pictures.contains_key(url)
+            || art
+                .folder
+                .as_ref()
+                .is_some_and(|folder| store::find_image_file(folder, url).is_some())
+    })
+}
+
 /// How large a picture of `width` by `height` pixels is shown.
 pub fn shown_size(width: i32, height: i32, scale: i32) -> (i32, i32) {
     let (width, height) = (

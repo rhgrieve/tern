@@ -59,6 +59,108 @@ fn open_on_click(button: &gtk::Button, url: &str) {
     });
 }
 
+/// Shows the picture a widget is named after, if it is there.
+fn load(picture: &gtk::Picture) {
+    let shown = picture.clone();
+    crate::art::picture(&picture.widget_name(), move |texture| {
+        if let Some(texture) = texture {
+            let (width, height) =
+                crate::art::shown_size(texture.width(), texture.height(), crate::art::scale());
+            shown.set_size_request(width.min(240), height.min(180));
+            shown.set_paintable(Some(texture));
+            shown.set_visible(true);
+            shown.remove_css_class("missing");
+        }
+    });
+}
+
+/// The size of a preview's picture. Its room is kept, so that nothing moves when it comes.
+const COVER: (i32, i32) = (104, 78);
+
+/// What is behind a link, in a card that opens it.
+pub fn preview(preview: &crate::rich::Preview) -> gtk::Button {
+    let label = |text: &str, lines: i32| {
+        gtk::Label::builder()
+            .label(text)
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .lines(lines)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .max_width_chars(44)
+            .visible(!text.is_empty())
+            .build()
+    };
+    let title = label(&preview.title, 2);
+    title.add_css_class("heading");
+    let description = label(&preview.description, 2);
+    description.add_css_class("caption");
+    let site = label(&preview.site, 1);
+    site.add_css_class("caption");
+    site.add_css_class("dim-label");
+    let text = column(2);
+    text.set_valign(gtk::Align::Center);
+    text.add_css_class("preview-text");
+    text.append(&title);
+    text.append(&description);
+    text.append(&site);
+    let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    if let Some(url) = &preview.picture {
+        let picture = gtk::Picture::builder()
+            .content_fit(gtk::ContentFit::Cover)
+            .can_shrink(true)
+            .width_request(COVER.0)
+            .height_request(COVER.1)
+            .build();
+        picture.add_css_class("cover");
+        picture.add_css_class("missing");
+        picture.set_widget_name(url);
+        load_cover(&picture);
+        line.append(&picture);
+    }
+    line.append(&text);
+    let button = gtk::Button::builder()
+        .child(&line)
+        .tooltip_text(&preview.url)
+        .overflow(gtk::Overflow::Hidden)
+        .build();
+    button.add_css_class("preview");
+    row::say(
+        &button,
+        &format!("Open {}, {}", preview.title, preview.site),
+    );
+    open_on_click(&button, &preview.url);
+    button
+}
+
+pub fn load_cover(picture: &gtk::Picture) {
+    let shown = picture.clone();
+    crate::art::picture(&picture.widget_name(), move |texture| {
+        if let Some(texture) = texture {
+            shown.set_paintable(Some(texture));
+            shown.remove_css_class("missing");
+        }
+    });
+}
+
+/// Looks again for pictures that were not there.
+pub fn look_again(within: &gtk::Widget) {
+    for_missing(within, &load);
+}
+
+pub fn for_missing<W: IsA<gtk::Widget>>(within: &gtk::Widget, load: &dyn Fn(&W)) {
+    if let Some(picture) = within.downcast_ref::<W>()
+        && picture.has_css_class("missing")
+    {
+        return load(picture);
+    }
+    let mut child = within.first_child();
+    while let Some(widget) = child {
+        for_missing(&widget, load);
+        child = widget.next_sibling();
+    }
+}
+
 fn fill(holder: &gtk::Box, pieces: &[Piece]) {
     for piece in pieces {
         holder.append(&widget(piece));
@@ -105,19 +207,9 @@ fn widget(piece: &Piece) -> gtk::Widget {
                 .visible(false)
                 .build();
             picture.set_alternative_text(Some(about));
-            let shown = picture.clone();
-            crate::art::picture(url, move |texture| {
-                if let Some(texture) = texture {
-                    let (width, height) = crate::art::shown_size(
-                        texture.width(),
-                        texture.height(),
-                        crate::art::scale(),
-                    );
-                    shown.set_size_request(width.min(240), height.min(180));
-                    shown.set_paintable(Some(texture));
-                    shown.set_visible(true);
-                }
-            });
+            picture.add_css_class("missing");
+            picture.set_widget_name(url);
+            load(&picture);
             picture.upcast()
         }
         Piece::Facts(facts) => {
@@ -277,7 +369,7 @@ mod tests {
             }))];
             row.bind(&std::rc::Rc::new(item));
             let line = row.last_child().unwrap();
-            let content = line.last_child().unwrap();
+            let content = line.first_child().unwrap().next_sibling().unwrap();
             let height =
                 |widget: &gtk::Widget, width| widget.measure(gtk::Orientation::Vertical, width).0;
             // The face is 36 high.

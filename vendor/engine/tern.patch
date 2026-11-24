@@ -1,4 +1,4 @@
-diff -ruN a/session/src/error.rs b/session/src/error.rs
+diff --color -ruN -x examples a/session/src/error.rs b/session/src/error.rs
 --- a/session/src/error.rs
 +++ b/session/src/error.rs
 @@ -21,6 +21,12 @@
@@ -14,7 +14,7 @@ diff -ruN a/session/src/error.rs b/session/src/error.rs
      #[error("tab connection lost during a write ({0}); check whether it was sent before retrying")]
      WriteInterrupted(String),
  }
-diff -ruN a/session/src/lib.rs b/session/src/lib.rs
+diff --color -ruN -x examples a/session/src/lib.rs b/session/src/lib.rs
 --- a/session/src/lib.rs
 +++ b/session/src/lib.rs
 @@ -4,9 +4,11 @@
@@ -41,7 +41,7 @@ diff -ruN a/session/src/lib.rs b/session/src/lib.rs
  pub use session::{DEFAULT_ENDPOINT, Session, SessionConfig, TabHold};
 +pub use skype::skype_token_allowed;
  pub use transport::{BoxFuture, CdpTransport, Diagnosis, OpenedTab, Transport};
-diff -ruN a/session/src/native.rs b/session/src/native.rs
+diff --color -ruN -x examples a/session/src/native.rs b/session/src/native.rs
 --- a/session/src/native.rs
 +++ b/session/src/native.rs
 @@ -8,6 +8,7 @@
@@ -125,7 +125,7 @@ diff -ruN a/session/src/native.rs b/session/src/native.rs
      fn a_token_is_used_until_the_margin_before_it_expires() {
          let now = SystemTime::now()
              .duration_since(UNIX_EPOCH)
-diff -ruN a/session/src/page_script.rs b/session/src/page_script.rs
+diff --color -ruN -x examples a/session/src/page_script.rs b/session/src/page_script.rs
 --- a/session/src/page_script.rs
 +++ b/session/src/page_script.rs
 @@ -25,6 +25,9 @@
@@ -150,7 +150,7 @@ diff -ruN a/session/src/page_script.rs b/session/src/page_script.rs
          let marker_at = FETCH_SCRIPT
              .find(TOKEN_MARKER)
              .expect("fetch.js contains the token marker");
-diff -ruN a/session/src/provider.rs b/session/src/provider.rs
+diff --color -ruN -x examples a/session/src/provider.rs b/session/src/provider.rs
 --- a/session/src/provider.rs
 +++ b/session/src/provider.rs
 @@ -0,0 +1,258 @@
@@ -412,7 +412,7 @@ diff -ruN a/session/src/provider.rs b/session/src/provider.rs
 +        }
 +    }
 +}
-diff -ruN a/session/src/session.rs b/session/src/session.rs
+diff --color -ruN -x examples a/session/src/session.rs b/session/src/session.rs
 --- a/session/src/session.rs
 +++ b/session/src/session.rs
 @@ -11,6 +11,7 @@
@@ -606,7 +606,7 @@ diff -ruN a/session/src/session.rs b/session/src/session.rs
  pub struct TabHold {
      transport: Arc<dyn Transport>,
      app: App,
-diff -ruN a/session/src/skype.rs b/session/src/skype.rs
+diff --color -ruN -x examples a/session/src/skype.rs b/session/src/skype.rs
 --- a/session/src/skype.rs
 +++ b/session/src/skype.rs
 @@ -0,0 +1,277 @@
@@ -887,7 +887,7 @@ diff -ruN a/session/src/skype.rs b/session/src/skype.rs
 +        assert_eq!(region("https://evil.example"), None, "the token stays home");
 +    }
 +}
-diff -ruN a/chatsvc/src/ams.rs b/chatsvc/src/ams.rs
+diff --color -ruN -x examples a/chatsvc/src/ams.rs b/chatsvc/src/ams.rs
 --- a/chatsvc/src/ams.rs
 +++ b/chatsvc/src/ams.rs
 @@ -26,10 +26,18 @@
@@ -945,7 +945,7 @@ diff -ruN a/chatsvc/src/ams.rs b/chatsvc/src/ams.rs
          let answer = self
              .session
              .run_with_token(
-diff -ruN a/chatsvc/src/chat_listing.rs b/chatsvc/src/chat_listing.rs
+diff --color -ruN -x examples a/chatsvc/src/chat_listing.rs b/chatsvc/src/chat_listing.rs
 --- a/chatsvc/src/chat_listing.rs
 +++ b/chatsvc/src/chat_listing.rs
 @@ -15,6 +15,9 @@
@@ -1055,7 +1055,7 @@ diff -ruN a/chatsvc/src/chat_listing.rs b/chatsvc/src/chat_listing.rs
      async fn older_messages_end_before_the_anchor() {
          let transport = canned(vec![json!({
              "messages": [{"id": "1000"}, {"id": "900"}],
-diff -ruN a/chatsvc/src/conversations.rs b/chatsvc/src/conversations.rs
+diff --color -ruN -x examples a/chatsvc/src/conversations.rs b/chatsvc/src/conversations.rs
 --- a/chatsvc/src/conversations.rs
 +++ b/chatsvc/src/conversations.rs
 @@ -12,6 +12,7 @@
@@ -1107,7 +1107,7 @@ diff -ruN a/chatsvc/src/conversations.rs b/chatsvc/src/conversations.rs
      }
  
      pub async fn set_alerts(&self, conversation_id: &str, enabled: bool) -> Result<()> {
-diff -ruN a/chatsvc/src/lib.rs b/chatsvc/src/lib.rs
+diff --color -ruN -x examples a/chatsvc/src/lib.rs b/chatsvc/src/lib.rs
 --- a/chatsvc/src/lib.rs
 +++ b/chatsvc/src/lib.rs
 @@ -111,7 +111,7 @@
@@ -1119,7 +1119,7 @@ diff -ruN a/chatsvc/src/lib.rs b/chatsvc/src/lib.rs
  pub use pins::{
      ChannelLayout, ChannelTab, Folder, FolderKind, Folders, PinnedChannels, PinnedChats,
      PinnedMessage, Pins, TeamLayout, TeamRights,
-diff -ruN a/chatsvc/src/messages.rs b/chatsvc/src/messages.rs
+diff --color -ruN -x examples a/chatsvc/src/messages.rs b/chatsvc/src/messages.rs
 --- a/chatsvc/src/messages.rs
 +++ b/chatsvc/src/messages.rs
 @@ -336,9 +336,19 @@
@@ -1169,7 +1169,7 @@ diff -ruN a/chatsvc/src/messages.rs b/chatsvc/src/messages.rs
 +        assert_ne!(body(), body());
 +    }
 +}
-diff -ruN a/chatsvc/src/presence.rs b/chatsvc/src/presence.rs
+diff --color -ruN -x examples a/chatsvc/src/presence.rs b/chatsvc/src/presence.rs
 --- a/chatsvc/src/presence.rs
 +++ b/chatsvc/src/presence.rs
 @@ -126,6 +126,7 @@
@@ -1257,7 +1257,41 @@ diff -ruN a/chatsvc/src/presence.rs b/chatsvc/src/presence.rs
          let mri = format!("{ORGID_PREFIX}{user_id}");
          let body = json!([{ "mri": mri }]);
          let answer = self
-diff -ruN a/chatsvc/src/realtime/native.rs b/chatsvc/src/realtime/native.rs
+diff --color -ruN -x examples a/chatsvc/src/reactions.rs b/chatsvc/src/reactions.rs
+--- a/chatsvc/src/reactions.rs
++++ b/chatsvc/src/reactions.rs
+@@ -55,6 +55,10 @@
+ 
+ /// Teams sends a toned reaction as `{diverse id}-tone{n}`, so 👍🏼 is `yes-tone2`, not `like`.
+ pub fn reaction_key(glyph: &str) -> Option<String> {
++    // Tern patch: an org emoji is its own key.
++    if custom_emoji(glyph).is_some() {
++        return Some(glyph.to_owned());
++    }
+     let (base, tone) = split_tone(glyph);
+     let keys = emotion_keys(&base);
+     match tone {
+@@ -69,6 +73,9 @@
+ 
+ /// Graph reads a toned reaction back without its tone, so removing one also clears the plain keys.
+ pub fn reaction_keys(glyph: &str) -> Vec<String> {
++    if custom_emoji(glyph).is_some() {
++        return vec![glyph.to_owned()];
++    }
+     let (base, tone) = split_tone(glyph);
+     let plain = emotion_keys(&base).iter().map(|key| key.to_string());
+     match tone {
+@@ -180,6 +187,9 @@
+             emoji.image_url(),
+             "https://de-prod.asyncgw.teams.microsoft.com/v1/objects/0-wcde-d3-5f5e4f463d6bb959b08614fd1d9680b8/views/imgt2_anim"
+         );
++        let key = "absolute-cinema;0-wcde-d3-5f5e4f463d6bb959b08614fd1d9680b8";
++        assert_eq!(reaction_key(key).as_deref(), Some(key));
++        assert_eq!(reaction_keys(key), [key]);
+         assert_eq!(custom_emoji("like"), None);
+         assert_eq!(custom_emoji("x;../evil"), None);
+         assert_eq!(custom_emoji(";0-wcde-d3-1"), None);
+diff --color -ruN -x examples a/chatsvc/src/realtime/native.rs b/chatsvc/src/realtime/native.rs
 --- a/chatsvc/src/realtime/native.rs
 +++ b/chatsvc/src/realtime/native.rs
 @@ -5,7 +5,7 @@
@@ -1302,7 +1336,7 @@ diff -ruN a/chatsvc/src/realtime/native.rs b/chatsvc/src/realtime/native.rs
      }
  
      pub(super) async fn run(mut self, mut stop: oneshot::Receiver<oneshot::Sender<()>>) {
-diff -ruN a/core/src/engine.rs b/core/src/engine.rs
+diff --color -ruN -x examples a/core/src/engine.rs b/core/src/engine.rs
 --- a/core/src/engine.rs
 +++ b/core/src/engine.rs
 @@ -104,6 +104,12 @@
@@ -1335,7 +1369,7 @@ diff -ruN a/core/src/engine.rs b/core/src/engine.rs
              app_channel_horizon_ms: Mutex::new(0),
              activity: Mutex::new(crate::activity_sync::ActivityState::default()),
              chat_paging,
-diff -ruN a/core/src/remote.rs b/core/src/remote.rs
+diff --color -ruN -x examples a/core/src/remote.rs b/core/src/remote.rs
 --- a/core/src/remote.rs
 +++ b/core/src/remote.rs
 @@ -150,6 +150,10 @@
@@ -1362,7 +1396,18 @@ diff -ruN a/core/src/remote.rs b/core/src/remote.rs
      async fn chat_states(&self) -> Result<Vec<ConversationState>> {
          Ok(Conversations::new(self.session())
              .conversation_states()
-diff -ruN a/core/src/sidebar_sync.rs b/core/src/sidebar_sync.rs
+@@ -1176,7 +1186,9 @@
+     async fn hosted_content(&self, url: &str) -> Result<Photo> {
+         let ams_url = chatsvc::hosted_content_image_url(url);
+         let url = ams_url.as_deref().unwrap_or(url);
+-        let image = if chatsvc::is_ams_image_url(url) {
++        // Tern patch: without a page, the gateway's pictures of linked pages take the Skype token.
++        let native = self.session().is_native() && chatsvc::is_link_image_url(url);
++        let image = if chatsvc::is_ams_image_url(url) || native {
+             chatsvc::ams::Ams::new(self.session())
+                 .download_image(url)
+                 .await?
+diff --color -ruN -x examples a/core/src/sidebar_sync.rs b/core/src/sidebar_sync.rs
 --- a/core/src/sidebar_sync.rs
 +++ b/core/src/sidebar_sync.rs
 @@ -119,14 +119,29 @@
@@ -1413,7 +1458,7 @@ diff -ruN a/core/src/sidebar_sync.rs b/core/src/sidebar_sync.rs
          let (Some(states), Ok(mentions)) = (
              states,
              mentions.inspect_err(|error| {
-diff -ruN a/store/src/image_files.rs b/store/src/image_files.rs
+diff --color -ruN -x examples a/store/src/image_files.rs b/store/src/image_files.rs
 --- a/store/src/image_files.rs
 +++ b/store/src/image_files.rs
 @@ -16,6 +16,15 @@
@@ -1432,7 +1477,7 @@ diff -ruN a/store/src/image_files.rs b/store/src/image_files.rs
  /// Image files in one directory, evicted least recently used first once the total exceeds the cap.
  pub struct ImageFileCache {
      directory: PathBuf,
-diff -ruN a/store/src/lib.rs b/store/src/lib.rs
+diff --color -ruN -x examples a/store/src/lib.rs b/store/src/lib.rs
 --- a/store/src/lib.rs
 +++ b/store/src/lib.rs
 @@ -32,7 +32,7 @@
@@ -1444,7 +1489,7 @@ diff -ruN a/store/src/lib.rs b/store/src/lib.rs
  pub use migrations::latest_version;
  pub use models::{
      ActivityRecord, AgentMeetingRecord, AgentProposalMention, AgentProposalRecord,
-diff -ruN a/store/src/store.rs b/store/src/store.rs
+diff --color -ruN -x examples a/store/src/store.rs b/store/src/store.rs
 --- a/store/src/store.rs
 +++ b/store/src/store.rs
 @@ -56,6 +56,24 @@

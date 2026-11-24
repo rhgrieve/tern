@@ -2,6 +2,7 @@
 
 use chrono::{Duration, Utc};
 use store::{ChatRecord, MemberRecord, MessageRecord, Store};
+use tern_ipc::Availability;
 
 const CARD: &str = r#"{"type":"AdaptiveCard","version":"1.5","body":[
 {"type":"TextBlock","text":"North buoy is off its place","size":"Large","weight":"Bolder","wrap":true},
@@ -15,6 +16,19 @@ const CARD: &str = r#"{"type":"AdaptiveCard","version":"1.5","body":[
 "actions":[{"type":"Action.OpenUrl","title":"Open chart","url":"https://example.com/chart"},
 {"type":"Action.ShowCard","title":"History","card":{"type":"AdaptiveCard","body":[{"type":"TextBlock","text":"Also in March"}]}},
 {"type":"Action.Submit","title":"Send a boat"},{"type":"Action.Submit","title":"Wait"}]}"#;
+
+/// Who is there.
+pub fn presence() -> Vec<(String, Availability)> {
+    [
+        ("me", Availability::Available),
+        ("ada", Availability::Available),
+        ("bo", Availability::DoNotDisturb),
+        ("cy", Availability::Away),
+        ("dee", Availability::Offline),
+    ]
+    .map(|(person, availability)| (person.to_owned(), availability))
+    .into()
+}
 
 pub fn store() -> Store {
     let store = Store::open_in_memory().expect("in memory");
@@ -66,11 +80,11 @@ pub fn store() -> Store {
                     .map(|(_, name)| name.into()),
                 members: std::iter::once(("me", "Robin Vale"))
                     .chain(people)
+                    .filter(|(user, name)| *kind == "group" || *user == "me" || name == summary)
                     .map(|(user, name)| MemberRecord {
                         user_id: Some(user.into()),
                         display_name: name.into(),
                     })
-                    .take(if *kind == "group" { 5 } else { 2 })
                     .collect(),
                 ..Default::default()
             },
@@ -171,6 +185,35 @@ pub fn store() -> Store {
             ..Default::default()
         });
     }
+    let page = "https://example.com/harbour/berths";
+    messages.push(MessageRecord {
+        conversation_id: "c1".into(),
+        message_id: "link".into(),
+        sender_id: Some("ada".into()),
+        sender_name: Some("Ada Quill".into()),
+        created_at: now - Duration::minutes(8),
+        body_html: format!("<p>The new numbers are here: <a href=\"{page}\">{page}</a></p>"),
+        links_json: serde_json::json!([{
+            "url": page,
+            "previewenabled": true,
+            "preview": {
+                "title": "Berths of the new harbour",
+                "description": "Which boat goes where, from Friday on. With depths, so that the big ones do not touch ground at low water.",
+                "previewurl": "https://us-prod.asyncgw.teams.microsoft.com/urlp/v1/url/image?demo"
+            }
+        }])
+        .to_string(),
+        ..Default::default()
+    });
+    messages.push(MessageRecord {
+        conversation_id: "c1".into(),
+        message_id: "thanks".into(),
+        sender_id: Some("me".into()),
+        sender_name: Some("Robin Vale".into()),
+        created_at: now - Duration::minutes(2),
+        body_html: "<p>Thanks! Also on www.example.com now.</p>".into(),
+        ..Default::default()
+    });
     messages.push(MessageRecord {
         conversation_id: "c4".into(),
         message_id: "card".into(),
@@ -186,6 +229,16 @@ pub fn store() -> Store {
         ..Default::default()
     });
     let _ = store.upsert_messages(&messages);
+    let read: Vec<store::ReadHorizonRecord> = people
+        .iter()
+        .map(|(id, _)| store::ReadHorizonRecord {
+            member_id: format!("8:orgid:{id}"),
+            read_until: now,
+            read_at: None,
+        })
+        .collect();
+    let _ = store.set_read_horizons("c2", &read);
+    let _ = store.set_read_horizons("c1", &read[..1]);
     channel(&store);
     let unsent = |id: &str, state, payload: &str, error: Option<&str>| store::OutboxRecord {
         id: id.into(),

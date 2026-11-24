@@ -43,10 +43,12 @@ for nothing else.
 | **Presence that is true** | Input in any app keeps you Available. Away after 5 minutes without it, at once when you lock, and before sleep. A status you set yourself always wins. It reports what you do; it does not pretend |
 | **Offline** | Chats and channels are kept on your computer. Read and search them without a network |
 | **Sending** | Messages queue until they can be sent, and are sent once. What fails comes back to you |
-| **Conversations** | Chats, channels and threads; replies, edits, reactions, mentions, `@Everyone`, pictures, files, drafts, who is writing |
+| **Conversations** | Chats, channels and threads; replies, edits, reactions, mentions, `@Everyone`, pictures, files, link previews, `:emoji:`, spell checking, drafts, who is writing |
+| **Who is there** | Other people's status on their faces, as it changes |
+| **Receipts** | One check while your newest message is on its way, two when it arrived, blue when it was read. Point at it to see by whom |
 | **Windows** | Any chat can have its own (Ctrl+Shift+O, or a double click). One pane when narrow. Made for tiling, too |
 | **Cards** | Adaptive Cards are shown. Answering one opens Teams |
-| **Notifications** | With actions and replies, where your desktop offers them. A tray icon with your status and unread chats |
+| **Notifications** | For messages, mentions and reactions to yours. With actions and replies, where your desktop offers them. A tray icon with your status and unread chats |
 | **Keyboard and screen readers** | Everything is reachable; Ctrl+K searches, Ctrl+? lists the keys |
 
 <div align="center">
@@ -111,6 +113,9 @@ The AppImage and the archive use your system's GTK, libadwaita 1.8 and WebKitGTK
 bring their own: the page you type your password into should get its security updates, and keep its
 sandbox. The Flatpak gets them from the GNOME runtime.
 
+Spell checking needs a dictionary for your language, e.g. `hunspell-en-ca` on Ubuntu,
+`hunspell-en-CA` on Fedora, or `hunspell hunspell-en_ca` on Arch. The Flatpak has its own.
+
 Passkeys may not work for signing in. Automatic presence needs a Wayland desktop with
 `ext-idle-notify-v1`, or GNOME. When you report a problem, please do not paste `tern-cli tail`,
 `read` or `chats`: they show messages.
@@ -122,7 +127,8 @@ Passkeys may not work for signing in. Automatic presence needs a Wayland desktop
 - The cache holds message text, in `~/.local/share/tern`, readable only by you. It is not encrypted
   by itself, and signing out keeps it. Pictures and files take at most 1 GB each.
 - Only pictures Teams itself stores are fetched ahead. Anything else would tell its owner when you
-  received a message. The same goes for pictures in cards.
+  received a message. The same goes for pictures in cards. Link previews come from Teams, which
+  looks at the page itself; sending a link asks Teams for one.
 - Windows and service talk over a private socket, not D-Bus, so that other apps cannot send
   messages as you by asking for it on the bus.
 - The sign-in window takes the redirect before the page loads. Pasting that address from a browser

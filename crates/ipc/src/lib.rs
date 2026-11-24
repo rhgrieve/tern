@@ -80,6 +80,28 @@ pub enum Request {
         conversation: String,
         post: Option<String>,
     },
+    /// Fetch the pictures of the newest messages of a conversation that are not here yet.
+    Pictures {
+        conversation: String,
+        messages: usize,
+    },
+    /// Whether these people are there, now and from now on.
+    Presence {
+        people: Vec<String>,
+    },
+    /// Fetch one picture.
+    Picture {
+        url: String,
+    },
+    /// A conversation is in front of the user, or no longer. Forgotten after a minute.
+    Viewing {
+        conversation: String,
+        on: bool,
+    },
+    /// Read how far the others have read.
+    Receipts {
+        conversation: String,
+    },
     /// Read older messages than the cache has.
     Older {
         conversation: String,
@@ -100,6 +122,10 @@ pub enum Event {
     },
     Pictures,
     Faces,
+    /// Whether people are there, of those that were asked for.
+    Presence {
+        people: Vec<(String, Availability)>,
+    },
     /// Someone started or stopped writing.
     Typing {
         conversation: String,
@@ -141,7 +167,20 @@ pub enum Response {
     Status(Box<Status>),
     Done,
     Path(std::path::PathBuf),
+    Presence(Vec<(String, Availability)>),
     Error(String),
+}
+
+/// What Teams says of a person.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Availability {
+    Available,
+    Busy,
+    DoNotDisturb,
+    Away,
+    Offline,
+    OutOfOffice,
 }
 
 /// How these programs came here.

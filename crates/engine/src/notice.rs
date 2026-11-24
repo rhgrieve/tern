@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 
 use chrono::{DateTime, Utc};
 use store::{ChatRecord, MessageRecord};
-use teams_core::{mentions, mentions_whole_chat, readable_text};
+use teams_core::{mentions, mentions_whole_chat, reactions, readable_text};
 
 const REMEMBERED: usize = 500;
 const MAX_TEXT: usize = 300;
@@ -19,6 +19,8 @@ pub struct Notice {
     pub text: String,
     /// The user can answer from the notification.
     pub can_reply: bool,
+    /// About a reaction to the message, not the message.
+    pub reaction: bool,
 }
 
 pub struct Rules {
@@ -64,10 +66,7 @@ impl Rules {
         if !wanted || self.shown.contains(&message.message_id) {
             return None;
         }
-        self.shown.push_back(message.message_id.clone());
-        if self.shown.len() > REMEMBERED {
-            self.shown.pop_front();
-        }
+        self.remember(message.message_id.clone());
         let name = message.sender_name.as_deref().unwrap_or("Someone");
         let title = match chat {
             Some(chat) if chat.kind.eq_ignore_ascii_case("oneOnOne") => name.to_owned(),
@@ -75,13 +74,7 @@ impl Rules {
             None => format!("{name} mentioned you"),
         };
         let everyone = chat.is_some() && mentions_whole_chat(message);
-        let mut text: String = readable_text(message)
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(MAX_TEXT)
-            .collect();
+        let mut text = excerpt(message);
         if text.is_empty() {
             text = "Sent an attachment".into();
         }
@@ -95,8 +88,118 @@ impl Rules {
             },
             text,
             can_reply: chat.is_some(),
+            reaction: false,
         })
     }
+
+    /// Reactions of others to the user's messages that nobody was told about, one notice for each
+    /// message. `name` knows people by their ids.
+    pub fn reactions(
+        &mut self,
+        messages: &[MessageRecord],
+        chat: Option<&ChatRecord>,
+        me: &str,
+        name: impl Fn(&str) -> Option<String>,
+        now: DateTime<Utc>,
+    ) -> Vec<Notice> {
+        if chat.is_some_and(|chat| chat.muted) {
+            return Vec::new();
+        }
+        let is_me = |id: Option<&str>| id.is_some_and(|id| id.eq_ignore_ascii_case(me));
+        let mut notices = Vec::new();
+        for message in messages {
+            if message.deleted || !is_me(message.sender_id.as_deref()) {
+                continue;
+            }
+            let mut names: Vec<String> = Vec::new();
+            let mut emoji: Vec<String> = Vec::new();
+            for reaction in reactions(message) {
+                let recent = reaction
+                    .created_at
+                    .is_some_and(|at| at >= self.started && now - at <= NEWS);
+                let Some(user) = reaction.user_id.as_deref() else {
+                    continue;
+                };
+                // Taken back and given again, it is no news.
+                let key = format!("{}|{user}|{}", message.message_id, reaction.reaction_type);
+                if !recent || is_me(Some(user)) || self.shown.contains(&key) {
+                    continue;
+                }
+                self.remember(key);
+                let who = name(user)
+                    .or(reaction.user_name)
+                    .unwrap_or_else(|| "Someone".into());
+                if !names.contains(&who) {
+                    names.push(who);
+                }
+                let shown = shown(&reaction.reaction_type);
+                if !emoji.contains(&shown) {
+                    emoji.push(shown);
+                }
+            }
+            if names.is_empty() {
+                continue;
+            }
+            let who = match names.as_slice() {
+                [one] => one.clone(),
+                [one, two] => format!("{one} and {two}"),
+                [one, rest @ ..] => format!("{one} and {} others", rest.len()),
+                [] => continue,
+            };
+            let place = chat
+                .filter(|chat| !chat.kind.eq_ignore_ascii_case("oneOnOne"))
+                .map(|chat| format!(" in {}", chat.display_title()))
+                .unwrap_or_default();
+            let text = excerpt(message);
+            notices.push(Notice {
+                conversation: message.conversation_id.clone(),
+                message: message.message_id.clone(),
+                title: format!("{who} reacted {}{place}", emoji.join(" ")),
+                text: if text.is_empty() {
+                    "To your message".into()
+                } else {
+                    text
+                },
+                can_reply: false,
+                reaction: true,
+            });
+        }
+        notices
+    }
+
+    fn remember(&mut self, key: String) {
+        self.shown.push_back(key);
+        if self.shown.len() > REMEMBERED {
+            self.shown.pop_front();
+        }
+    }
+}
+
+/// A reaction in text: an emoji of the organization's own has only a name there.
+fn shown(reaction: &str) -> String {
+    match crate::media::custom_emoji(reaction) {
+        Some(emoji) => format!(":{}:", emoji.name),
+        None => match reaction {
+            "like" => "👍",
+            "heart" => "❤️",
+            "laugh" => "😆",
+            "surprised" => "😮",
+            "sad" => "🙁",
+            "angry" => "😠",
+            other => other,
+        }
+        .to_owned(),
+    }
+}
+
+fn excerpt(message: &MessageRecord) -> String {
+    readable_text(message)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(MAX_TEXT)
+        .collect()
 }
 
 #[cfg(test)]
@@ -184,6 +287,74 @@ mod tests {
             Rules::new(at(0)).decide(&message("1"), Some(&chat()), None, at(6)),
             None
         );
+    }
+
+    fn reacted(id: &str, all: &[(&str, &str, i64)]) -> MessageRecord {
+        let all: Vec<_> = all
+            .iter()
+            .map(|(user, kind, minute)| {
+                serde_json::json!({
+                    "reaction_type": kind, "user_id": user, "user_name": null,
+                    "created_at": at(*minute)
+                })
+            })
+            .collect();
+        MessageRecord {
+            sender_id: Some("me".into()),
+            reactions_json: serde_json::Value::from(all).to_string(),
+            ..message(id)
+        }
+    }
+
+    #[test]
+    fn reactions_to_own_messages_notify_once() {
+        let mut rules = Rules::new(at(0));
+        let name = |id: &str| (id != "xx").then(|| id.to_uppercase());
+        let mut told = |messages: &[MessageRecord], chat: Option<&ChatRecord>, minute| {
+            rules.reactions(messages, chat, "ME", name, at(minute))
+        };
+        let first = reacted("1", &[("ann", "👍", 5), ("me", "❤", 5)]);
+        let notices = told(std::slice::from_ref(&first), Some(&chat()), 6);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].title, "ANN reacted 👍");
+        assert_eq!(notices[0].text, "Hi there");
+        assert!(notices[0].reaction && !notices[0].can_reply);
+        assert!(told(&[first], Some(&chat()), 6).is_empty(), "once");
+        // Others join, in a group.
+        let more = reacted(
+            "1",
+            &[
+                ("ann", "👍", 5),
+                ("bo", "👍", 7),
+                ("cy", "party;0-eus-d1-ab", 7),
+                ("xx", "like", 7),
+            ],
+        );
+        let group = ChatRecord {
+            kind: "group".into(),
+            title: "Crew".into(),
+            ..chat()
+        };
+        let notices = told(&[more], Some(&group), 8);
+        assert_eq!(
+            notices[0].title,
+            "BO and 2 others reacted 👍 :party: in Crew"
+        );
+        // Given again, or from before the start, or long ago.
+        assert!(told(&[reacted("1", &[("ann", "👍", 9)])], Some(&chat()), 9).is_empty());
+        assert!(told(&[reacted("2", &[("ann", "👍", -1)])], Some(&chat()), 9).is_empty());
+        assert!(told(&[reacted("3", &[("ann", "👍", 5)])], Some(&chat()), 24 * 60).is_empty());
+        // To somebody else's message, or in a muted chat.
+        let other = MessageRecord {
+            sender_id: Some("bo".into()),
+            ..reacted("4", &[("ann", "👍", 5)])
+        };
+        assert!(told(&[other], Some(&chat()), 6).is_empty());
+        let muted = ChatRecord {
+            muted: true,
+            ..chat()
+        };
+        assert!(told(&[reacted("5", &[("ann", "👍", 5)])], Some(&muted), 6).is_empty());
     }
 
     #[test]

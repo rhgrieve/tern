@@ -103,6 +103,9 @@ const ARRIVAL: [Duration; 4] = [
 /// Chats kept complete.
 const RECENT: usize = 50;
 
+/// A preview that takes longer is not worth it.
+const PREVIEW: std::time::Duration = std::time::Duration::from_secs(20);
+
 pub struct Teams {
     engine: SyncEngine<Graph>,
 }
@@ -267,7 +270,7 @@ impl crate::outbox::Post for Teams {
                 });
             }
         }
-        let html = teams_core::markdown_to_html(&draft.markdown);
+        let html = crate::links::linked(&teams_core::markdown_to_html(&draft.markdown));
         let engine = &self.engine;
         let send = async {
             match (&draft.reply_to, &draft.thread, draft.post) {
@@ -312,6 +315,26 @@ impl crate::outbox::Post for Teams {
         Ok(with_client_message_id(client_id.to_owned(), send)
             .await?
             .message_id)
+    }
+
+    async fn preview(&self, conversation: &str, message: &str, draft: &crate::outbox::Draft) {
+        let html = crate::links::linked(&teams_core::markdown_to_html(&draft.markdown));
+        let Some(url) = teams_core::first_public_link(&html) else {
+            return;
+        };
+        let added = async {
+            if let Some(preview) = self.engine.link_preview_for(&url).await? {
+                self.engine
+                    .attach_link_preview(conversation, message, &preview)
+                    .await?;
+            }
+            Ok::<_, teams_core::Error>(())
+        };
+        match tokio::time::timeout(PREVIEW, added).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::debug!(%error, "no link preview"),
+            Err(_) => tracing::debug!("no link preview in time"),
+        }
     }
 
     async fn upload(
@@ -377,7 +400,12 @@ impl Teams {
             Act::React { emoji, on: false } => {
                 engine.unset_reaction(conversation, message, emoji).await?
             }
-            Act::Edit { markdown } => engine.edit_message(conversation, message, markdown).await?,
+            Act::Edit { markdown } => {
+                let html = crate::links::linked(&teams_core::markdown_to_html(markdown));
+                engine
+                    .edit_message_html(conversation, message, &html, &[])
+                    .await?
+            }
             Act::Delete => engine.soft_delete_message(conversation, message).await?,
         }
         Ok(())
@@ -390,6 +418,38 @@ impl Teams {
             None => drop(self.engine.fetch_newer(conversation).await?),
         }
         Ok(())
+    }
+
+    /// Looks up whether people are there, and asks to be told from then on.
+    pub async fn watch_presence(&self, people: &[String]) -> Result<(), Failure> {
+        if let Err(error) = self.engine.watch_presence(people).await {
+            tracing::debug!(%error, "presence of others is not pushed");
+        }
+        self.engine.refresh_presence(people).await?;
+        Ok(())
+    }
+
+    /// Fetches one picture, if that tells nobody anything.
+    pub async fn picture(&self, url: &str) -> Result<(), Failure> {
+        if !crate::media::may_prefetch(url) {
+            return Err(Failure::Permanent("not a picture Teams stores".into()));
+        }
+        let image = teams_core::ImageRef {
+            id: url.to_owned(),
+            url: url.to_owned(),
+            width: None,
+            height: None,
+            alt: None,
+        };
+        self.engine.fetch_image(&image).await?;
+        Ok(())
+    }
+
+    /// Reads how far the others have read; nothing depends on it.
+    pub async fn receipts(&self, conversation: &str) {
+        if let Err(error) = self.engine.refresh_receipts(conversation).await {
+            tracing::debug!(%error, "receipts");
+        }
     }
 
     /// Reads older messages; answers whether any came.

@@ -114,8 +114,16 @@ struct Shown {
     count: usize,
 }
 
-/// One notification per conversation.
-type Open = Arc<Mutex<HashMap<String, Shown>>>;
+/// The conversation, and the message if it is about reactions to that.
+type Key = (String, Option<String>);
+
+/// One notification per conversation, and one for the reactions to a message.
+type Open = Arc<Mutex<HashMap<Key, Shown>>>;
+
+fn key(notice: &Notice) -> Key {
+    let message = notice.reaction.then(|| notice.message.clone());
+    (notice.conversation.clone(), message)
+}
 
 #[derive(Clone, Copy, Default)]
 struct Can {
@@ -158,10 +166,11 @@ impl Notifier {
         };
         let (replaces, count) = {
             let open = self.open.lock().expect("notifications");
-            open.get(&notice.conversation)
+            open.get(&key(notice))
                 .map_or((0, 1), |shown| (shown.id, shown.count + 1))
         };
         let title = match count {
+            _ if notice.reaction => notice.title.clone(),
             1 => notice.title.clone(),
             count => format!("{} ({count} new)", notice.title),
         };
@@ -202,7 +211,7 @@ impl Notifier {
                     count,
                 };
                 let mut open = self.open.lock().expect("notifications");
-                open.insert(notice.conversation.clone(), shown);
+                open.insert(key(notice), shown);
             }
             Err(error) => {
                 tracing::warn!(%error, "notification");
@@ -241,10 +250,10 @@ impl Notifier {
         };
         let done: Vec<u32> = {
             let mut open = self.open.lock().expect("notifications");
-            let ids: Vec<String> = open
+            let ids: Vec<Key> = open
                 .iter()
-                .filter(|(conversation, shown)| read(conversation, shown.at))
-                .map(|(conversation, _)| conversation.clone())
+                .filter(|((conversation, _), shown)| read(conversation, shown.at))
+                .map(|(key, _)| key.clone())
                 .collect();
             ids.iter()
                 .filter_map(|id| open.remove(id))
@@ -325,13 +334,13 @@ async fn connect(
 
 fn take(open: &Open, id: u32) -> Option<Target> {
     let mut open = open.lock().expect("notifications");
-    let conversation = open
+    let key = open
         .iter()
         .find(|(_, shown)| shown.id == id)
-        .map(|(conversation, _)| conversation.clone())?;
-    let shown = open.remove(&conversation)?;
+        .map(|(key, _)| key.clone())?;
+    let shown = open.remove(&key)?;
     Some(Target {
-        conversation,
+        conversation: key.0,
         message: shown.message,
     })
 }
@@ -473,14 +482,18 @@ mod tests {
             title: "Tern test".into(),
             text: "This closes by itself".into(),
             can_reply: true,
+            reaction: false,
         };
         notifier.show(&notice).await;
-        let first = notifier.open.lock().unwrap()["c"].id;
+        let first = notifier.open.lock().unwrap()[&("c".to_owned(), None)].id;
         notice.message = "2".into();
         notifier.show(&notice).await;
         let (second, count) = {
             let open = notifier.open.lock().unwrap();
-            (open["c"].id, open["c"].count)
+            (
+                open[&("c".to_owned(), None)].id,
+                open[&("c".to_owned(), None)].count,
+            )
         };
         assert!(first > 0);
         assert_eq!((first, count), (second, 2), "replaced, not stacked");
@@ -509,7 +522,7 @@ mod tests {
     fn only_our_own_notifications_lead_somewhere() {
         let open = Open::default();
         open.lock().unwrap().insert(
-            "c".into(),
+            ("c".into(), Some("m".into())),
             Shown {
                 id: 7,
                 message: "m".into(),

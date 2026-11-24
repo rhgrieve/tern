@@ -12,6 +12,7 @@ use libadwaita as adw;
 
 use crate::art;
 use crate::model::{ChatRow, Step, steps};
+use crate::presence;
 
 /// Scrolling has ended when nothing moved for this long.
 const CALM: Duration = Duration::from_millis(250);
@@ -19,6 +20,7 @@ const CALM: Duration = Duration::from_millis(250);
 struct RowWidgets {
     root: gtk::Box,
     face: adw::Avatar,
+    there: gtk::DrawingArea,
     title: gtk::Label,
     when: gtk::Label,
     preview: gtk::Label,
@@ -57,11 +59,13 @@ fn build() -> RowWidgets {
     text.set_valign(gtk::Align::Center);
     text.append(&top);
     text.append(&bottom);
-    root.append(&face);
+    let there = presence::dot();
+    root.append(&presence::with_dot(&face, &there));
     root.append(&text);
     RowWidgets {
         root,
         face,
+        there,
         title,
         when,
         preview,
@@ -77,6 +81,7 @@ fn bind(widgets: &RowWidgets, row: &ChatRow) {
     widgets.face.set_show_initials(row.team.is_none());
     let face = row.person.as_deref().and_then(art::face);
     widgets.face.set_custom_image(face.as_ref());
+    presence::set(&widgets.there, row.person.as_deref());
     widgets.title.set_text(&row.title);
     widgets.when.set_text(&row.when);
     widgets.preview.set_text(&row.preview);
@@ -97,8 +102,14 @@ fn spoken(row: &ChatRow) -> String {
     let unread = if row.unread { ", unread" } else { "" };
     let mentions = if row.mentions { ", mentions you" } else { "" };
     let muted = if row.muted { ", muted" } else { "" };
+    let there = row
+        .person
+        .as_deref()
+        .and_then(presence::of)
+        .map(|availability| format!(", {}", presence::words(availability).to_lowercase()))
+        .unwrap_or_default();
     format!(
-        "{}{unread}{mentions}{muted}. {} {}",
+        "{}{there}{unread}{mentions}{muted}. {} {}",
         row.title, row.preview, row.when
     )
 }
@@ -383,6 +394,12 @@ impl Sidebar {
             .ok()
             .and_then(|next| rows.get(next))
             .map(|row| row.id.clone())
+    }
+
+    /// The people of 1:1 chats.
+    pub fn people(&self) -> Vec<String> {
+        let rows = self.rows.borrow();
+        rows.iter().filter_map(|row| row.person.clone()).collect()
     }
 
     /// Looks for faces that were not there before.

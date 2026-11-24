@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "chatsvc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -662,6 +662,15 @@ name = "ego-tree"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2972feb8dffe7bc8c5463b1dacda1b0dfbed3710e50f977d965429692d74cd8"
+
+[[package]]
+name = "emojis"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "589871e639330783bc20ad89d32ac1b049e02c273d96c907ca27478c8bc674a2"
+dependencies = [
+ "phf 0.13.1",
+]
 
 [[package]]
 name = "endi"
@@ -1107,7 +1116,7 @@ dependencies = [
 
 [[package]]
 name = "graph"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1714,6 +1723,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2108,6 +2127,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "phf"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1562dc717473dbaa4c1f85a36410e03c047b2e7df7f45ee938fbef64ae7fadf"
+dependencies = [
+ "phf_shared 0.13.1",
+]
+
+[[package]]
 name = "phf_codegen"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2154,6 +2182,15 @@ name = "phf_shared"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06005508882fb681fd97892ecff4b7fd0fee13ef1aa569f8695dae7ab9099981"
+dependencies = [
+ "siphasher",
+]
+
+[[package]]
+name = "phf_shared"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e57fef6bc5981e38c2ce2d63bfa546861309f875b8a75f092d1d54ae2d64f266"
 dependencies = [
  "siphasher",
 ]
@@ -2804,7 +2841,7 @@ dependencies = [
 
 [[package]]
 name = "session"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
@@ -2954,7 +2991,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "directories",
@@ -3079,7 +3116,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "teams-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "chatsvc",
@@ -3127,12 +3164,14 @@ dependencies = [
 
 [[package]]
 name = "tern"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
+ "emojis",
  "gdk4-wayland",
  "gtk4",
  "libadwaita",
+ "libloading",
  "serde",
  "serde_json",
  "store",
@@ -3145,7 +3184,7 @@ dependencies = [
 
 [[package]]
 name = "tern-auth"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "oo7",
@@ -3163,7 +3202,7 @@ dependencies = [
 
 [[package]]
 name = "tern-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chatsvc",
  "chrono",
@@ -3181,7 +3220,7 @@ dependencies = [
 
 [[package]]
 name = "tern-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chatsvc",
  "chrono",
@@ -3200,7 +3239,7 @@ dependencies = [
 
 [[package]]
 name = "tern-ipc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3209,7 +3248,7 @@ dependencies = [
 
 [[package]]
 name = "tern-login"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gtk4",
  "libadwaita",
@@ -3220,7 +3259,7 @@ dependencies = [
 
 [[package]]
 name = "tern-presence"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "futures-util",
  "thiserror",
@@ -3233,7 +3272,7 @@ dependencies = [
 
 [[package]]
 name = "ternd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chatsvc",
  "chrono",
