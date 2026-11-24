@@ -1,0 +1,40 @@
+name: Release
+
+# A tag like v0.1.0 becomes a release with the build attached.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tern-x86_64
+      - name: The tag has to name the version that was built
+        env:
+          TAG: ${{ github.ref_name }}
+        run: test -f "tern-${TAG#v}-x86_64.tar.gz"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: "*.tar.gz"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" ./*.tar.gz ./*.sha256 --verify-tag --prerelease --generate-notes --title "Tern ${TAG#v}"

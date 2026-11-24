@@ -18,7 +18,7 @@ use crate::{art, drafts};
 
 /// Windows with one conversation tell themselves apart from the main one, for the rules of window
 /// managers.
-pub const CHAT_APP: &str = "io.github.tern.Tern.Chat";
+pub const CHAT_APP: &str = "io.github.rhgrieve.Tern.Chat";
 
 pub struct Desk {
     app: adw::Application,
@@ -248,7 +248,7 @@ mod tests {
     fn the_composer_is_not_lost_with_a_closed_window() {
         adw::init().unwrap();
         let app = adw::Application::builder()
-            .application_id("io.github.tern.Test")
+            .application_id("io.github.rhgrieve.Tern.Test")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(gio::Cancellable::NONE).unwrap();

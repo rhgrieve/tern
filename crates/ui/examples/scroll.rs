@@ -192,7 +192,7 @@ fn report(name: &str, mut gaps: Vec<f64>, jumps: usize) {
 
 fn main() {
     let app = adw::Application::builder()
-        .application_id("io.github.tern.Scroll")
+        .application_id("io.github.rhgrieve.Tern.Scroll")
         .build();
     app.connect_activate(|app| {
         let list = MessageList::default();

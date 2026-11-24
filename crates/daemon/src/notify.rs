@@ -57,12 +57,12 @@ trait Portal {
 }
 
 /// Tern's window. D-Bus starts it when it is not running, outside this service.
-const WINDOW: &str = "io.github.tern.Tern";
+const WINDOW: &str = "io.github.rhgrieve.Tern";
 
 #[zbus::proxy(
     interface = "org.freedesktop.Application",
-    default_service = "io.github.tern.Tern",
-    default_path = "/io/github/tern/Tern"
+    default_service = "io.github.rhgrieve.Tern",
+    default_path = "/io/github/rhgrieve/Tern"
 )]
 trait Application {
     fn activate(&self, platform_data: HashMap<&str, Variant<'_>>) -> zbus::Result<()>;
@@ -165,7 +165,7 @@ impl Notifier {
         }
         let hints = HashMap::from([
             ("category", Variant::from("im.received")),
-            ("desktop-entry", Variant::from("tern")),
+            ("desktop-entry", Variant::from(WINDOW)),
         ]);
         match proxy
             .notify(

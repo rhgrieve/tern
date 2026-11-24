@@ -11,7 +11,7 @@ use libadwaita as adw;
 use tern_auth::SignInRequest;
 use webkit6::prelude::*;
 
-const APP_ID: &str = "io.github.tern.Login";
+const APP_ID: &str = "io.github.rhgrieve.Tern.Login";
 /// Closed without signing in.
 const CANCELLED: u8 = 2;
 

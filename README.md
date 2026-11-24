@@ -12,8 +12,31 @@ a tray icon shows your status and unread chats. The window shows chats and
 channels with threads, sends, answers, edits and reacts, mentions people,
 attaches pictures and files, and searches.
 Conversations can have windows of their own (Ctrl+Shift+O, or a double click), known to window
-managers as `io.github.tern.Tern.Chat`. Adaptive Cards are shown; answering one opens Teams.
+managers as `io.github.rhgrieve.Tern.Chat`. Adaptive Cards are shown; answering one opens Teams.
 Everything works with the keyboard (Ctrl+? lists the keys) and says what it is to screen readers.
+
+## Try it
+
+Download the newest `tern-…-x86_64.tar.gz` from [Releases](https://github.com/rhgrieve/tern/releases).
+It runs on Ubuntu 26.04, Fedora 43 and 44, and Arch (GTK 4.16, libadwaita 1.8, WebKitGTK 6.0) on
+64-bit Intel and AMD computers, and needs a keyring such as GNOME Keyring or KWallet.
+
+```sh
+sha256sum -c tern-*-x86_64.tar.gz.sha256
+tar xzf tern-*-x86_64.tar.gz
+cd tern-*-x86_64
+./install.sh          # for you only, in ~/.local; run a newer one to update
+~/.local/bin/tern-cli login
+```
+
+Then open Tern from your applications. `tern-cli status` says whether the service is well, and
+`journalctl --user -u ternd` what it did. `./uninstall.sh` signs out and removes it.
+Ask whoever looks after your Teams first: see the top of this page. Passkeys may not work for
+signing in. Calls and the calendar are not there yet.
+
+When you report a problem, do not paste `tern-cli tail`, `read` or `chats`: they show messages.
+
+## What is in it
 
 | Program | What it does |
 |---|---|
@@ -33,6 +56,8 @@ Everything works with the keyboard (Ctrl+? lists the keys) and says what it is t
 - Only pictures Teams itself stores are fetched ahead. Anything else would tell its owner when you
   received a message. The same goes for pictures in cards.
 
+To install what you built: `cargo build --release --workspace && packaging/install.sh`.
+GitHub builds and tests every change; a tag like `v0.1.0` publishes a release.
 To run a build beside the installed service: `TERN_INSTANCE=dev TERN_NO_PRESENCE=1 ternd`.
 
 ```sh

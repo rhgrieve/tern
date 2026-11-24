@@ -9,7 +9,7 @@ use libadwaita as adw;
 use tern_ui::desk::Desk;
 use tern_ui::window::{Window, load_style, save_picture};
 
-const APP: &str = "io.github.tern.Tern";
+const APP: &str = "io.github.rhgrieve.Tern";
 
 /// Options for trying things out: `--demo`, and with it `--open ID`, `--own`, `--size WxH`, `--dark`,
 /// `--light`, `--screenshot FILE`. `--measure` times the real cache without showing that

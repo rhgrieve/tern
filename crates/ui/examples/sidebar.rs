@@ -70,7 +70,7 @@ async fn wait(milliseconds: u64) {
 
 fn main() {
     let app = adw::Application::builder()
-        .application_id("io.github.tern.SidebarTest")
+        .application_id("io.github.rhgrieve.Tern.SidebarTest")
         .build();
     app.connect_activate(|app| {
         load_style();
