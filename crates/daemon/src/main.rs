@@ -1,7 +1,9 @@
-//! Tern's background service. For now it does one thing: it keeps the user's Teams presence true
-//! to what they do at this computer.
+//! Tern's background service: keeps the user's Teams presence true to what they do at this
+//! computer, keeps the message cache complete, sends queued messages and shows notifications.
 
 mod link;
+mod messages;
+mod notify;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -20,6 +22,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, interval, sleep_until, timeout};
 
 use link::{Link, contradicts};
+use messages::{Messages, News};
+use notify::{Action, Notifier};
 
 const TICK: Duration = Duration::from_secs(15);
 const READ_BACK: Duration = Duration::from_secs(5 * 60);
@@ -37,6 +41,8 @@ struct Online {
     realtime: Realtime,
     service: PresenceService,
     object_id: String,
+    session: Session,
+    region: String,
 }
 
 enum Connect {
@@ -73,7 +79,8 @@ async fn connect(broker: Arc<Broker>, active: bool) -> Connect {
             error => Connect::Failed(error.to_string()),
         };
     }
-    let session = Session::with_provider(broker, SessionConfig::default());
+    let session =
+        Session::with_provider(broker, SessionConfig::default()).with_region(&regions.region);
     let mut service = PresenceService::new(&session);
     if let Some(base) = &regions.presence {
         service = service.at(base);
@@ -86,11 +93,14 @@ async fn connect(broker: Arc<Broker>, active: bool) -> Connect {
         native: true,
         ..RealtimeConfig::default()
     };
+    let region = regions.region;
     match Realtime::start_with(&session, config).await {
         Ok(realtime) => Connect::Up(Box::new(Online {
             realtime,
             service,
             object_id: identity.object_id,
+            session,
+            region,
         })),
         Err(error) => Connect::Failed(error.to_string()),
     }
@@ -112,10 +122,15 @@ struct Daemon {
     shown: Option<(Instant, PresenceStatus)>,
     read_at: Instant,
     mismatches: u32,
+    /// A development instance leaves presence to the installed one.
+    presence: bool,
+    messages: Option<Messages>,
+    news: mpsc::UnboundedSender<News>,
+    notifier: Notifier,
 }
 
 impl Daemon {
-    fn new(broker: Arc<Broker>) -> Self {
+    fn new(broker: Arc<Broker>, news: mpsc::UnboundedSender<News>, notifier: Notifier) -> Self {
         let now = Instant::now();
         Daemon {
             broker,
@@ -133,6 +148,10 @@ impl Daemon {
             shown: None,
             read_at: now + READ_BACK,
             mismatches: 0,
+            presence: std::env::var_os("TERN_NO_PRESENCE").is_none(),
+            messages: None,
+            news,
+            notifier,
         }
     }
 
@@ -141,7 +160,7 @@ impl Daemon {
     }
 
     async fn reconcile(&mut self) {
-        if let Some(online) = &self.online {
+        if let Some(online) = self.online.as_ref().filter(|_| self.presence) {
             let desired = self.machine.desired();
             online.realtime.set_activity(desired.active);
             // Bounded, so a hanging request cannot hold up the next sensor event (sleep above all).
@@ -243,6 +262,11 @@ impl Daemon {
                 self.link.endpoint(endpoint.endpoint_id);
                 self.reconcile().await;
             }
+            Some(RealtimeEvent::Message(message)) => {
+                if let Some(messages) = &self.messages {
+                    messages.event(message);
+                }
+            }
             Some(RealtimeEvent::Status(status)) => match status.kind {
                 StatusKind::Connected => {
                     tracing::info!("push connected");
@@ -250,6 +274,9 @@ impl Daemon {
                     self.problem = None;
                     self.backoff = RECONNECT_FIRST;
                     self.link.connected();
+                    if let Some(messages) = &self.messages {
+                        messages.catch_up();
+                    }
                     self.read_at = Instant::now() + READ_AFTER_CHANGE;
                     self.reconcile().await;
                 }
@@ -258,15 +285,22 @@ impl Daemon {
                     self.push = "reconnecting".into();
                     self.link.disconnected(Instant::now());
                 }
-                StatusKind::MessageLoss => {}
+                StatusKind::MessageLoss => {
+                    if let Some(messages) = &self.messages {
+                        messages.catch_up();
+                    }
+                }
             },
             Some(_) => {}
         }
     }
 
-    fn connected(&mut self, outcome: Connect) {
+    async fn connected(&mut self, outcome: Connect) {
         match outcome {
-            Connect::Up(online) => self.online = Some(online),
+            Connect::Up(online) => {
+                self.start_messages(&online);
+                self.online = Some(online);
+            }
             Connect::NeedsUser(reason) => {
                 tracing::warn!(reason, "waiting for a sign-in");
                 self.push = "signed out".into();
@@ -275,15 +309,105 @@ impl Daemon {
             Connect::Failed(reason) => {
                 tracing::warn!(reason, "could not connect");
                 self.problem = Some(reason);
+                self.start_messages_offline().await;
                 self.connect_at = Some(Instant::now() + self.backoff);
                 self.backoff = (self.backoff * 2).min(RECONNECT_MAX);
             }
         }
     }
 
+    /// Message sync outlives a connection: what is queued and cached stays through sleep and
+    /// network changes.
+    fn start_messages(&mut self, online: &Online) {
+        if self
+            .messages
+            .as_ref()
+            .is_some_and(|messages| messages.account() == online.object_id)
+        {
+            return;
+        }
+        match Messages::start(&online.object_id, online.session.clone(), self.news.clone()) {
+            Ok(messages) => {
+                messages.remember_region(&online.region);
+                self.messages = Some(messages);
+            }
+            Err(error) => {
+                tracing::error!(error, "no message cache");
+                self.problem = Some(error);
+            }
+        }
+    }
+
+    /// Without a connection, so messages can be queued and read already.
+    async fn start_messages_offline(&mut self) {
+        if self.messages.is_some() {
+            return;
+        }
+        let Some(identity) = self.broker.identity().await else {
+            return;
+        };
+        let Some(region) = messages::stored_region(&identity.object_id) else {
+            return;
+        };
+        let session = Session::with_provider(self.broker.clone(), SessionConfig::default())
+            .with_region(&region);
+        self.messages = Messages::start(&identity.object_id, session, self.news.clone()).ok();
+    }
+
+    async fn news(&mut self, news: News) {
+        let Some(messages) = &mut self.messages else {
+            return;
+        };
+        match news {
+            News::Arrived(arrived) => {
+                let quiet = self
+                    .shown
+                    .as_ref()
+                    .is_some_and(|(_, status)| status.availability == "DoNotDisturb");
+                for notice in messages.notices(&arrived) {
+                    if !quiet {
+                        self.notifier.show(&notice).await;
+                    }
+                }
+            }
+            News::Failed { reason, .. } => self.notifier.failed(&reason).await,
+        }
+    }
+
+    async fn acted(&mut self, action: Action) {
+        match action {
+            // Not waited for: the portal may ask the user something.
+            Action::Open(target) => drop(tokio::spawn(async move { notify::open(&target).await })),
+            Action::Reply { conversation, text } => {
+                let queued = match &self.messages {
+                    Some(messages) => messages.send(&conversation, &text),
+                    None => Err("not signed in".into()),
+                };
+                if let Err(error) = queued {
+                    self.notifier.failed(&error).await;
+                }
+            }
+        }
+    }
+
+    /// Takes down notifications for what was read elsewhere.
+    async fn sweep(&mut self) {
+        if let Some(messages) = &self.messages {
+            self.notifier
+                .close_read(|conversation, at| {
+                    messages
+                        .read_until(conversation)
+                        .is_some_and(|read| read >= at)
+                })
+                .await;
+        }
+    }
+
     async fn read_back(&mut self) {
         self.read_at = Instant::now() + READ_BACK;
-        let Some(online) = &self.online else { return };
+        let Some(online) = self.online.as_ref().filter(|_| self.presence) else {
+            return;
+        };
         match timeout(STEP, online.service.status(&online.object_id)).await {
             Ok(Ok(status)) => {
                 if contradicts(&status, self.active()) {
@@ -311,6 +435,11 @@ impl Daemon {
     }
 
     async fn status(&self) -> Status {
+        let sync = self
+            .messages
+            .as_ref()
+            .map(Messages::state)
+            .unwrap_or_default();
         Status {
             account: self.broker.identity().await.map(|identity| identity.name),
             state: match self.machine.state() {
@@ -339,14 +468,26 @@ impl Daemon {
                 .map(|(_, status)| status.availability.clone()),
             teams_read_secs_ago: self.shown.as_ref().map(|(at, _)| at.elapsed().as_secs()),
             problem: self.problem.clone().or_else(|| self.link.problem.clone()),
+            synced: sync.refreshed,
+            reading: sync.pending,
+            unsent: self.messages.as_ref().map_or(0, Messages::unsent),
+            sync_problem: sync.problem,
         }
     }
 
     async fn answer(&mut self, request: Request) -> Response {
         match request {
             Request::Status => Response::Status(Box::new(self.status().await)),
+            Request::Send { conversation, text } => match &self.messages {
+                Some(messages) => match messages.send(&conversation, &text) {
+                    Ok(()) => Response::Done,
+                    Err(error) => Response::Error(error),
+                },
+                None => Response::Error("not connected yet".into()),
+            },
             Request::Reload => {
                 self.leave().await;
+                self.messages = None;
                 self.shown = None;
                 match self.broker.load().await {
                     Ok(_) => {
@@ -363,7 +504,12 @@ impl Daemon {
         }
     }
 
-    async fn run(mut self, mut asked: mpsc::Receiver<Asked>) -> std::io::Result<()> {
+    async fn run(
+        mut self,
+        mut asked: mpsc::Receiver<Asked>,
+        mut news: mpsc::UnboundedReceiver<News>,
+        mut actions: mpsc::UnboundedReceiver<Action>,
+    ) -> std::io::Result<()> {
         let mut sensors = Sensors::start(Config::default());
         let mut tick = interval(TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -386,7 +532,7 @@ impl Daemon {
                     }
                 } => {
                     self.connecting = None;
-                    self.connected(outcome.unwrap_or_else(|error| Connect::Failed(error.to_string())));
+                    self.connected(outcome.unwrap_or_else(|error| Connect::Failed(error.to_string()))).await;
                 }
                 () = async {
                     match connect_at {
@@ -399,7 +545,12 @@ impl Daemon {
                     self.connecting = Some(tokio::spawn(connect(self.broker.clone(), self.active())));
                 }
                 () = sleep_until(self.read_at) => self.read_back().await,
-                _ = tick.tick() => self.reconcile().await,
+                _ = tick.tick() => {
+                    self.reconcile().await;
+                    self.sweep().await;
+                }
+                Some(item) = news.recv() => self.news(item).await,
+                Some(action) = actions.recv() => self.acted(action).await,
                 Some((request, reply)) = asked.recv() => {
                     let response = self.answer(request).await;
                     let _ = reply.send(response);
@@ -446,8 +597,10 @@ async fn start() -> Result<(), String> {
             tokio::spawn(serve(stream, ask.clone()));
         }
     });
-    let outcome = Daemon::new(broker)
-        .run(asked)
+    let (news, news_queue) = mpsc::unbounded_channel();
+    let (notifier, actions) = Notifier::start();
+    let outcome = Daemon::new(broker, news, notifier)
+        .run(asked, news_queue, actions)
         .await
         .map_err(|error| error.to_string());
     if let Ok(path) = tern_ipc::socket_path() {
@@ -459,8 +612,8 @@ async fn start() -> Result<(), String> {
 fn main() -> ExitCode {
     // Dependencies stay at warnings whatever is asked: their debug output can hold request headers.
     let level = match std::env::var("TERN_LOG").as_deref() {
-        Ok("debug") => "warn,ternd=debug,tern_auth=debug,tern_presence=debug",
-        _ => "warn,ternd=info,tern_auth=info,tern_presence=info",
+        Ok("debug") => "warn,ternd=debug,tern_auth=debug,tern_presence=debug,tern_engine=debug",
+        _ => "warn,ternd=info,tern_auth=info,tern_presence=info,tern_engine=info",
     };
     tracing_subscriber::fmt()
         .with_env_filter(level)

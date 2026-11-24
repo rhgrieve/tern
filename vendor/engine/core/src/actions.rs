@@ -1,0 +1,954 @@
+use chatsvc::{ConversationRef, read_horizon};
+use chrono::{DateTime, Duration, Utc};
+use graph::{
+    FileReference, MessageExtras, MessageTarget, OutgoingMention, UploadDestination, UploadedFile,
+    hosted_image_order,
+};
+use store::MessageRecord;
+
+use crate::engine::{Conversation, META_USER_ID, SyncEngine};
+use crate::error::{Error, Result};
+use crate::external_image::external_image_url;
+use crate::hidden_chats::cleared_until_ms;
+use crate::links::LinkPreview;
+use crate::mapping::message_record;
+use crate::markdown::markdown_to_html;
+use crate::mentions::{MentionInput, apply_mentions, ensure_allowed_in_chat};
+use crate::notes_chat::is_notes_chat;
+use crate::remote::Remote;
+use crate::scheduled::NOTES_CHAT_ID;
+use crate::teams_quote::{mention_entries, teams_quote};
+
+impl<R: Remote> SyncEngine<R> {
+    pub async fn send_message(
+        &self,
+        conversation_id: &str,
+        markdown: &str,
+        thread_root_id: Option<&str>,
+    ) -> Result<MessageRecord> {
+        self.send_message_with_mentions(conversation_id, markdown, thread_root_id, &[])
+            .await
+    }
+
+    pub async fn send_message_with_mentions(
+        &self,
+        conversation_id: &str,
+        markdown: &str,
+        thread_root_id: Option<&str>,
+        mentions: &[MentionInput],
+    ) -> Result<MessageRecord> {
+        self.send_message_with_extras(
+            conversation_id,
+            &markdown_to_html(markdown),
+            thread_root_id,
+            mentions,
+            &MessageExtras::default(),
+        )
+        .await
+    }
+
+    /// `html` is the message body; mentions are matched as `@name` in it.
+    pub async fn send_message_with_extras(
+        &self,
+        conversation_id: &str,
+        html: &str,
+        thread_root_id: Option<&str>,
+        mentions: &[MentionInput],
+        extras: &MessageExtras,
+    ) -> Result<MessageRecord> {
+        let conversation = self.resolve(conversation_id).await?;
+        let (html, mentions) = outgoing(&conversation, html, mentions)?;
+        let sent = match (conversation, thread_root_id) {
+            (Conversation::Chat, None) => {
+                let sent = self
+                    .send_via_chatsvc(
+                        &ConversationRef::chat(conversation_id),
+                        None,
+                        &html,
+                        &mentions,
+                        extras,
+                        None,
+                    )
+                    .await?;
+                return self.cache_sent(conversation_id, &sent.message, &html, extras);
+            }
+            (Conversation::Channel { team_id }, Some(root_id)) => {
+                self.remote
+                    .reply_to_channel_message(
+                        &team_id,
+                        conversation_id,
+                        root_id,
+                        &html,
+                        &mentions,
+                        extras,
+                    )
+                    .await?
+            }
+            (Conversation::Chat, Some(_)) => {
+                return Err(Error::Unsupported("a thread reply in a chat"));
+            }
+            (Conversation::Channel { .. }, None) => {
+                return Err(Error::Unsupported(
+                    "a channel send without a thread root; use post_to_channel",
+                ));
+            }
+        };
+        self.cache_sent(conversation_id, &sent, &html, extras)
+    }
+
+    /// Quoted reply in Teams' chatsvc shape; channels answer in the thread of `message_id`.
+    pub async fn reply_to(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        markdown: &str,
+    ) -> Result<MessageRecord> {
+        self.reply_to_with_mentions(conversation_id, message_id, markdown, &[])
+            .await
+    }
+
+    pub async fn reply_to_with_mentions(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        markdown: &str,
+        mentions: &[MentionInput],
+    ) -> Result<MessageRecord> {
+        self.reply_to_with_extras(
+            conversation_id,
+            message_id,
+            &markdown_to_html(markdown),
+            mentions,
+            &MessageExtras::default(),
+        )
+        .await
+    }
+
+    pub async fn reply_to_with_extras(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        html: &str,
+        mentions: &[MentionInput],
+        extras: &MessageExtras,
+    ) -> Result<MessageRecord> {
+        let conversation = self.resolve(conversation_id).await?;
+        let (html, mentions) = outgoing(&conversation, html, mentions)?;
+        let quoted = self
+            .store
+            .messages_by_id(conversation_id, &[message_id.to_owned()])?
+            .remove(message_id);
+        let (chatsvc_conversation, root_id) = match &conversation {
+            Conversation::Chat => (ConversationRef::chat(conversation_id), None),
+            Conversation::Channel { .. } => {
+                let root_id = quoted
+                    .as_ref()
+                    .and_then(|record| record.reply_to_id.clone())
+                    .unwrap_or_else(|| message_id.to_owned());
+                (
+                    ConversationRef::channel_reply(conversation_id, &root_id),
+                    Some(root_id),
+                )
+            }
+        };
+        if let Some(quoted) = &quoted
+            && let Some((sent, html)) = self
+                .quote_reply_via_chatsvc(
+                    &chatsvc_conversation,
+                    root_id.as_deref(),
+                    quoted,
+                    &html,
+                    &mentions,
+                    extras,
+                )
+                .await?
+        {
+            return self.cache_sent(conversation_id, &sent, &html, extras);
+        }
+        let sent = match (&conversation, &root_id) {
+            (Conversation::Channel { team_id }, Some(root_id)) => {
+                self.remote
+                    .reply_to_channel_message(
+                        team_id,
+                        conversation_id,
+                        root_id,
+                        &html,
+                        &mentions,
+                        extras,
+                    )
+                    .await?
+            }
+            _ => {
+                self.send_via_chatsvc(&chatsvc_conversation, None, &html, &mentions, extras, None)
+                    .await?
+                    .message
+            }
+        };
+        self.cache_sent(conversation_id, &sent, &html, extras)
+    }
+
+    /// Own and not deleted. Chat messages, channel posts and channel replies alike.
+    pub fn can_edit(&self, record: &MessageRecord) -> bool {
+        self.is_own(record)
+    }
+
+    pub fn can_delete(&self, record: &MessageRecord) -> bool {
+        self.is_own(record)
+    }
+
+    fn is_own(&self, record: &MessageRecord) -> bool {
+        let my_user_id = self
+            .store
+            .meta(META_USER_ID)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        crate::stored::can_edit(record, &my_user_id)
+    }
+
+    pub async fn post_to_channel(
+        &self,
+        channel_id: &str,
+        markdown: &str,
+        subject: Option<&str>,
+    ) -> Result<MessageRecord> {
+        self.post_to_channel_with_mentions(channel_id, markdown, subject, &[])
+            .await
+    }
+
+    pub async fn post_to_channel_with_mentions(
+        &self,
+        channel_id: &str,
+        markdown: &str,
+        subject: Option<&str>,
+        mentions: &[MentionInput],
+    ) -> Result<MessageRecord> {
+        self.post_to_channel_with_extras(
+            channel_id,
+            &markdown_to_html(markdown),
+            subject,
+            mentions,
+            &MessageExtras::default(),
+        )
+        .await
+    }
+
+    pub async fn post_to_channel_with_extras(
+        &self,
+        channel_id: &str,
+        html: &str,
+        subject: Option<&str>,
+        mentions: &[MentionInput],
+        extras: &MessageExtras,
+    ) -> Result<MessageRecord> {
+        let conversation = self.resolve(channel_id).await?;
+        let Conversation::Channel { team_id } = &conversation else {
+            return Err(Error::Unsupported("posting a root message to a chat"));
+        };
+        let (html, mentions) = outgoing(&conversation, html, mentions)?;
+        let sent = self
+            .remote
+            .send_channel_message(team_id, channel_id, &html, subject, &mentions, extras)
+            .await?;
+        self.cache_sent(channel_id, &sent, &html, extras)
+    }
+
+    /// Upload then share; the app uses the two steps apart so a failed share does not upload again.
+    pub async fn upload_attachment(
+        &self,
+        conversation_id: &str,
+        file_name: &str,
+        bytes: &[u8],
+        progress: impl Fn(u8) + Send + Sync,
+    ) -> Result<FileReference> {
+        let uploaded = self
+            .upload_attachment_file(conversation_id, file_name, bytes, progress)
+            .await?;
+        self.share_attachment(conversation_id, &uploaded).await?;
+        uploaded.reference().ok_or_else(missing_attachment_id)
+    }
+
+    /// Chat files go to the sender's "Microsoft Teams Chat Files", channel files to the channel's folder.
+    pub async fn upload_attachment_file(
+        &self,
+        conversation_id: &str,
+        file_name: &str,
+        bytes: &[u8],
+        progress: impl Fn(u8) + Send + Sync,
+    ) -> Result<UploadedFile> {
+        let destination = match self.resolve(conversation_id).await? {
+            Conversation::Chat => UploadDestination::ChatFiles,
+            Conversation::Channel { team_id } => {
+                UploadDestination::Folder(self.channel_folder(&team_id, conversation_id).await?)
+            }
+        };
+        let uploaded = self
+            .remote
+            .upload_file(&destination, file_name, bytes, &progress)
+            .await?;
+        if uploaded.reference().is_none() {
+            let _ = self.remote.delete_file(&uploaded).await;
+            return Err(missing_attachment_id());
+        }
+        Ok(uploaded)
+    }
+
+    /// Read-only for the other chat members; channels need nothing.
+    pub async fn share_attachment(
+        &self,
+        conversation_id: &str,
+        uploaded: &UploadedFile,
+    ) -> Result<()> {
+        if !matches!(self.resolve(conversation_id).await?, Conversation::Chat) {
+            return Ok(());
+        }
+        let other_members = self.other_member_ids(conversation_id).await?;
+        self.remote.share_file(uploaded, &other_members).await
+    }
+
+    pub async fn discard_attachment(&self, uploaded: &UploadedFile) -> Result<()> {
+        self.remote.delete_file(uploaded).await
+    }
+
+    async fn channel_folder(&self, team_id: &str, channel_id: &str) -> Result<graph::DriveFolder> {
+        let cached = self
+            .channel_folders
+            .lock()
+            .expect("channel folder cache poisoned")
+            .get(channel_id)
+            .cloned();
+        if let Some(folder) = cached {
+            return Ok(folder);
+        }
+        let folder = self
+            .remote
+            .channel_files_folder(team_id, channel_id)
+            .await?;
+        self.channel_folders
+            .lock()
+            .expect("channel folder cache poisoned")
+            .insert(channel_id.to_owned(), folder.clone());
+        Ok(folder)
+    }
+
+    async fn other_member_ids(&self, chat_id: &str) -> Result<Vec<String>> {
+        if chat_id == NOTES_CHAT_ID {
+            return Ok(Vec::new());
+        }
+        let my_user_id = self.my_user_id().await?;
+        let members = self
+            .store
+            .chat(chat_id)?
+            .map(|chat| chat.members)
+            .filter(|members| !members.is_empty())
+            .ok_or_else(|| graph::Error::Upload("Chat members not loaded yet.".into()))?;
+        Ok(members
+            .into_iter()
+            .filter_map(|member| member.user_id)
+            .filter(|user_id| *user_id != my_user_id)
+            .collect())
+    }
+
+    pub async fn refresh_message(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<Option<MessageRecord>> {
+        let fetched = match self.resolve(conversation_id).await? {
+            Conversation::Chat => self.remote.chat_message(conversation_id, message_id).await,
+            Conversation::Channel { team_id } => {
+                self.fetch_channel_message(&team_id, conversation_id, message_id)
+                    .await
+            }
+        };
+        let message = match fetched {
+            Ok(message) => message,
+            Err(error) => {
+                self.report(format!("cannot refresh a message: {error}"));
+                return Err(error);
+            }
+        };
+        let Some(record) = message_record(conversation_id, &message) else {
+            return Ok(None);
+        };
+        let mut record = record;
+        self.apply_chat_emotions(conversation_id, std::slice::from_mut(&mut record))
+            .await;
+        let delta = self.ingest(conversation_id, vec![record.clone()])?;
+        self.announce_stored_late(conversation_id, &delta);
+        let links_changed = self.attach_links(conversation_id, &mut [&mut record]).await;
+        self.announce(conversation_id, !delta.is_empty() || links_changed);
+        Ok(Some(record))
+    }
+
+    pub async fn open_post(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<Option<OpenedPost>> {
+        let Conversation::Channel { team_id } = self.resolve(conversation_id).await? else {
+            return Err(Error::Unsupported("opening a post of a chat"));
+        };
+        let root_ids = [message_id.to_owned()];
+        let (fetched, replies) = tokio::join!(
+            self.fetch_channel_message(&team_id, conversation_id, message_id),
+            self.remote
+                .channel_replies(&team_id, conversation_id, &root_ids)
+        );
+        let message = match fetched {
+            Ok(message) => message,
+            Err(error) => {
+                self.report(format!("cannot open a post: {error}"));
+                return Err(error);
+            }
+        };
+        let Some(record) = message_record(conversation_id, &message) else {
+            return Ok(None);
+        };
+        let replies_loaded = record.reply_to_id.is_none()
+            && replies
+                .as_ref()
+                .is_ok_and(|listings| listings.iter().all(Result::is_ok));
+        let mut records = vec![record];
+        if replies_loaded {
+            records.extend(
+                replies
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .flatten()
+                    .filter_map(|reply| message_record(conversation_id, &reply)),
+            );
+        }
+        self.apply_chat_emotions(conversation_id, &mut records)
+            .await;
+        let mut record = records[0].clone();
+        let delta = self.ingest(conversation_id, records)?;
+        self.announce_stored_late(conversation_id, &delta);
+        let links_changed = self.attach_links(conversation_id, &mut [&mut record]).await;
+        self.announce(conversation_id, !delta.is_empty() || links_changed);
+        Ok(Some(OpenedPost {
+            record,
+            replies_loaded,
+        }))
+    }
+
+    pub async fn attach_link_preview(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        preview: &LinkPreview,
+    ) -> Result<()> {
+        let target = self.message_target(conversation_id, message_id)?;
+        let links_json = preview.links_json();
+        if self
+            .store
+            .set_message_links(conversation_id, message_id, &links_json)?
+        {
+            self.announce(conversation_id, true);
+        }
+        self.remote.set_message_links(&target, &links_json).await
+    }
+
+    pub async fn mark_read(&self, conversation_id: &str) -> Result<()> {
+        if let Conversation::Channel { .. } = self.resolve(conversation_id).await? {
+            return self.mark_channel_read(conversation_id).await;
+        }
+        let now = Utc::now();
+        let last_message_at = self
+            .store
+            .chat(conversation_id)?
+            .and_then(|chat| chat.last_message_at)
+            .unwrap_or(now);
+        self.remote
+            .set_read_horizon(
+                conversation_id,
+                &read_horizon::read_up_to(last_message_at, now),
+            )
+            .await?;
+        if is_notes_chat(conversation_id) || self.has_unread_bookmark(conversation_id) {
+            self.remote
+                .set_read_bookmark(conversation_id, &read_horizon::cleared_bookmark(now))
+                .await?;
+        }
+        self.store.mark_chat_read(conversation_id, now)?;
+        let _ = self.events.send(crate::events::CoreEvent::SidebarChanged);
+        Ok(())
+    }
+
+    async fn mark_channel_read(&self, channel_id: &str) -> Result<()> {
+        let now = Utc::now();
+        let last_message_at = self
+            .store
+            .channel(channel_id)?
+            .and_then(|channel| channel.last_message_at)
+            .unwrap_or(now);
+        self.remote
+            .set_read_horizon(
+                channel_id,
+                &chatsvc::read_horizon::read_up_to(last_message_at, now),
+            )
+            .await?;
+        self.store.mark_channel_read(channel_id)?;
+        self.store.clear_channel_mentions(channel_id)?;
+        let _ = self.events.send(crate::events::CoreEvent::SidebarChanged);
+        Ok(())
+    }
+
+    pub async fn mark_all_channels_read(&self) -> Result<()> {
+        let horizon = self
+            .remote
+            .mark_all_channels_read(Utc::now().timestamp_millis())
+            .await?;
+        *self.app_channel_horizon_ms.lock().unwrap() = horizon.channel_ms;
+        self.store.mark_all_channels_read()?;
+        let _ = self.events.send(crate::events::CoreEvent::SidebarChanged);
+        Ok(())
+    }
+
+    pub async fn mark_unread(&self, chat_id: &str) -> Result<()> {
+        let last_message_at = self
+            .store
+            .chat(chat_id)?
+            .and_then(|chat| chat.last_message_at)
+            .ok_or(Error::Unsupported(
+                "marking a chat without messages as unread",
+            ))?;
+        self.mark_unread_from(chat_id, last_message_at).await
+    }
+
+    pub async fn mark_unread_from(
+        &self,
+        chat_id: &str,
+        message_created_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let last_read_at = message_created_at - Duration::milliseconds(1);
+        let bookmark = read_horizon::bookmark_at(
+            message_created_at,
+            &self.message_id_at(chat_id, message_created_at)?,
+            Utc::now(),
+        );
+        self.remote.set_read_bookmark(chat_id, &bookmark).await?;
+        self.store.mark_chat_unread(chat_id, last_read_at)?;
+        let _ = self.events.send(crate::events::CoreEvent::SidebarChanged);
+        Ok(())
+    }
+
+    fn has_unread_bookmark(&self, chat_id: &str) -> bool {
+        self.chat_states
+            .lock()
+            .unwrap()
+            .get(chat_id)
+            .is_some_and(|state| state.read.bookmark_message_set)
+    }
+
+    fn message_id_at(&self, chat_id: &str, created_at: DateTime<Utc>) -> Result<String> {
+        Ok(self
+            .store
+            .messages_between(chat_id, created_at, created_at)?
+            .into_iter()
+            .next()
+            .map(|message| message.message_id)
+            .unwrap_or_else(|| created_at.timestamp_millis().to_string()))
+    }
+
+    pub async fn set_chat_muted(&self, chat_id: &str, muted: bool) -> Result<()> {
+        self.remote.set_chat_muted(chat_id, muted).await?;
+        self.store.set_chat_muted(chat_id, muted)?;
+        let _ = self.events.send(crate::events::CoreEvent::SidebarChanged);
+        Ok(())
+    }
+
+    pub async fn set_channel_notifications(
+        &self,
+        channel_id: &str,
+        notifications: store::ChannelNotifications,
+    ) -> Result<()> {
+        self.remote
+            .set_channel_notifications(channel_id, notifications)
+            .await?;
+        self.store
+            .set_channel_notifications(channel_id, notifications)?;
+        let _ = self.events.send(crate::events::CoreEvent::SidebarChanged);
+        Ok(())
+    }
+
+    pub async fn hide_chat(&self, chat_id: &str) -> Result<()> {
+        if is_notes_chat(chat_id) {
+            self.remote
+                .set_chat_hidden_at(chat_id, Some(Utc::now().timestamp_millis()))
+                .await?;
+            self.store.remove_chats(&[chat_id.to_owned()])?;
+            let _ = self.events.send(crate::events::CoreEvent::SidebarChanged);
+            return Ok(());
+        }
+        self.remote
+            .set_chat_hidden_at(chat_id, Some(Utc::now().timestamp_millis()))
+            .await?;
+        let hidden_after = self
+            .store
+            .chat(chat_id)?
+            .and_then(|chat| chat.last_message_at)
+            .unwrap_or_else(Utc::now);
+        self.with_locally_hidden(|locally| locally.hide(chat_id, hidden_after))?;
+        self.store.remove_chats(&[chat_id.to_owned()])?;
+        let _ = self.events.send(crate::events::CoreEvent::SidebarChanged);
+        Ok(())
+    }
+
+    pub async fn unhide_chat(&self, chat_id: &str) -> Result<()> {
+        if is_notes_chat(chat_id) {
+            self.remote.set_chat_hidden_at(chat_id, None).await?;
+            self.refresh_sidebar_full().await?;
+            return Ok(());
+        }
+        self.remote.set_chat_hidden_at(chat_id, None).await?;
+        let now = Utc::now();
+        self.with_locally_hidden(|locally| locally.unhide(chat_id, now))?;
+        self.refresh_sidebar_full().await?;
+        Ok(())
+    }
+
+    /// Teams' "Remove chat history": the chat stays hidden until a message newer than the last one.
+    pub async fn remove_chat_history(&self, chat_id: &str) -> Result<()> {
+        let last_message_at = self
+            .store
+            .chat(chat_id)?
+            .and_then(|chat| chat.last_message_at);
+        let cleared_until_ms = cleared_until_ms(last_message_at, Utc::now());
+        self.remote
+            .clear_chat_history(chat_id, cleared_until_ms)
+            .await?;
+        self.with_locally_hidden(|locally| {
+            locally.hide(chat_id, last_message_at.unwrap_or_else(Utc::now))
+        })?;
+        self.store.remove_chats(&[chat_id.to_owned()])?;
+        let _ = self.events.send(crate::events::CoreEvent::SidebarChanged);
+        Ok(())
+    }
+
+    pub async fn rename_chat(&self, chat_id: &str, topic: &str) -> Result<()> {
+        self.remote.set_chat_topic(chat_id, topic).await?;
+        if let Some(mut chat) = self.store.chat(chat_id)? {
+            chat.title = topic.to_owned();
+            self.store.upsert_chats(std::slice::from_ref(&chat))?;
+        }
+        let _ = self.events.send(crate::events::CoreEvent::SidebarChanged);
+        Ok(())
+    }
+
+    pub async fn leave_chat(&self, chat_id: &str) -> Result<()> {
+        let user_id = self.my_user_id().await?;
+        self.remote.remove_chat_member(chat_id, &user_id).await?;
+        self.store.remove_chats(&[chat_id.to_owned()])?;
+        let _ = self.events.send(crate::events::CoreEvent::SidebarChanged);
+        Ok(())
+    }
+
+    pub async fn remove_chat_member(&self, chat_id: &str, user_id: &str) -> Result<()> {
+        self.remote.remove_chat_member(chat_id, user_id).await?;
+        if let Some(mut chat) = self.store.chat(chat_id)? {
+            chat.members
+                .retain(|member| member.user_id.as_deref() != Some(user_id));
+            self.store.upsert_chats(std::slice::from_ref(&chat))?;
+        }
+        let _ = self.events.send(crate::events::CoreEvent::SidebarChanged);
+        Ok(())
+    }
+
+    pub async fn add_chat_members(
+        &self,
+        chat_id: &str,
+        people: &[store::MemberRecord],
+        share: chatsvc::HistoryShare,
+    ) -> Result<()> {
+        let user_ids: Vec<String> = people
+            .iter()
+            .filter_map(|person| person.user_id.clone())
+            .collect();
+        self.remote
+            .add_chat_members(chat_id, &user_ids, share)
+            .await?;
+        if let Some(mut chat) = self.store.chat(chat_id)? {
+            crate::roster_event::merge_members(&mut chat.members, people);
+            self.store.upsert_chats(std::slice::from_ref(&chat))?;
+        }
+        let _ = self.events.send(crate::events::CoreEvent::SidebarChanged);
+        Ok(())
+    }
+
+    pub async fn send_typing(
+        &self,
+        conversation_id: &str,
+        thread_root_id: Option<&str>,
+        active: bool,
+    ) -> Result<()> {
+        let conversation = match (self.resolve(conversation_id).await?, thread_root_id) {
+            (Conversation::Chat, _) => ConversationRef::chat(conversation_id),
+            (Conversation::Channel { .. }, None) => ConversationRef::channel_root(conversation_id),
+            (Conversation::Channel { .. }, Some(root_id)) => {
+                ConversationRef::channel_reply(conversation_id, root_id)
+            }
+        };
+        self.remote.send_typing(&conversation, active).await
+    }
+
+    pub async fn ack_urgent_message(&self, chat_id: &str, message_id: &str) -> Result<()> {
+        self.remote.ack_urgent_message(chat_id, message_id).await
+    }
+
+    pub async fn set_reaction(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        reaction_type: &str,
+    ) -> Result<()> {
+        let target = self.message_target(conversation_id, message_id)?;
+        self.remote.set_reaction(&target, reaction_type).await?;
+        self.refresh_message(conversation_id, message_id).await?;
+        Ok(())
+    }
+
+    pub async fn unset_reaction(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        reaction_type: &str,
+    ) -> Result<()> {
+        let target = self.message_target(conversation_id, message_id)?;
+        self.remote.unset_reaction(&target, reaction_type).await?;
+        self.refresh_message(conversation_id, message_id).await?;
+        Ok(())
+    }
+
+    pub async fn edit_message(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        markdown: &str,
+    ) -> Result<()> {
+        self.edit_message_with_mentions(conversation_id, message_id, markdown, &[])
+            .await
+    }
+
+    pub async fn edit_message_with_mentions(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        markdown: &str,
+        mentions: &[MentionInput],
+    ) -> Result<()> {
+        self.edit_message_html(
+            conversation_id,
+            message_id,
+            &markdown_to_html(markdown),
+            mentions,
+        )
+        .await
+    }
+
+    pub async fn edit_message_html(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        html: &str,
+        mentions: &[MentionInput],
+    ) -> Result<()> {
+        let conversation = self.resolve(conversation_id).await?;
+        let (mut html, mentions) = outgoing(&conversation, html, mentions)?;
+        let target = self.message_target(conversation_id, message_id)?;
+        let mut extras = MessageExtras::default();
+        if let Some(record) = self
+            .store
+            .messages_by_id(conversation_id, &[message_id.to_owned()])?
+            .remove(message_id)
+        {
+            let preserved = crate::stored::edit_preserved(&record);
+            html.push_str(&preserved.images_html);
+            extras.files = preserved.files;
+            extras.kept = preserved.kept;
+        }
+        self.remote
+            .edit_message(&target, &html, &mentions, &extras)
+            .await?;
+        self.refresh_message(conversation_id, message_id).await?;
+        Ok(())
+    }
+
+    pub async fn soft_delete_message(&self, conversation_id: &str, message_id: &str) -> Result<()> {
+        let target = self.message_target(conversation_id, message_id)?;
+        let user_id = self.my_user_id().await?;
+        self.remote.soft_delete_message(&user_id, &target).await?;
+        self.refresh_message(conversation_id, message_id).await?;
+        Ok(())
+    }
+
+    pub async fn undo_soft_delete_message(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<()> {
+        let target = self.message_target(conversation_id, message_id)?;
+        let user_id = self.my_user_id().await?;
+        self.remote
+            .undo_soft_delete_message(&user_id, &target)
+            .await?;
+        self.refresh_message(conversation_id, message_id).await?;
+        Ok(())
+    }
+
+    fn message_target(&self, conversation_id: &str, message_id: &str) -> Result<MessageTarget> {
+        Ok(match self.resolve_stored(conversation_id)? {
+            Conversation::Chat => MessageTarget::chat(conversation_id, message_id),
+            Conversation::Channel { team_id } => {
+                let root_id = self
+                    .store
+                    .messages_by_id(conversation_id, &[message_id.to_owned()])?
+                    .remove(message_id)
+                    .and_then(|record| record.reply_to_id);
+                MessageTarget::channel(&team_id, conversation_id, message_id, root_id.as_deref())
+            }
+        })
+    }
+
+    pub async fn create_one_on_one(&self, user_id: &str) -> Result<String> {
+        let my_user_id = self.my_user_id().await?;
+        let chat = self.remote.create_one_on_one(&my_user_id, user_id).await?;
+        self.store_new_chat(&chat, &my_user_id)
+    }
+
+    pub async fn create_group(&self, user_ids: &[String], topic: Option<&str>) -> Result<String> {
+        let my_user_id = self.my_user_id().await?;
+        let chat = self
+            .remote
+            .create_group(&my_user_id, user_ids, topic)
+            .await?;
+        self.store_new_chat(&chat, &my_user_id)
+    }
+
+    fn store_new_chat(&self, chat: &graph::Chat, my_user_id: &str) -> Result<String> {
+        self.store
+            .upsert_chats(&[self.partner_chat_record(chat, my_user_id)])?;
+        let _ = self.events.send(crate::events::CoreEvent::SidebarChanged);
+        Ok(chat.id.clone())
+    }
+
+    fn seed_sent_images(
+        &self,
+        record: &MessageRecord,
+        html: &str,
+        extras: &MessageExtras,
+    ) -> Result<()> {
+        let uploaded: Vec<_> = crate::stored::images(record)
+            .into_iter()
+            .filter(|image| external_image_url(&image.url).is_none())
+            .collect();
+        let order = hosted_image_order(html, extras);
+        if uploaded.len() != order.len() {
+            return Ok(());
+        }
+        let seeds: Vec<_> = uploaded
+            .iter()
+            .zip(order)
+            .map(|(image, index)| (image.key(), &extras.images[index]))
+            .collect();
+        self.seed_images(&seeds)
+    }
+
+    /// `None` when Teams' shape cannot be written here (channel images or files, team mentions, no quote).
+    async fn quote_reply_via_chatsvc(
+        &self,
+        conversation: &ConversationRef,
+        root_id: Option<&str>,
+        quoted: &MessageRecord,
+        html: &str,
+        mentions: &[OutgoingMention],
+        extras: &MessageExtras,
+    ) -> Result<Option<(graph::Message, String)>> {
+        let in_chat = matches!(conversation, ConversationRef::Chat { .. });
+        if !in_chat && (!extras.images.is_empty() || !extras.files.is_empty()) {
+            return Ok(None);
+        }
+        let Some(quote) = teams_quote(quoted) else {
+            return Ok(None);
+        };
+        if mention_entries(mentions).is_none() {
+            return Ok(None);
+        }
+        let sent = self
+            .send_via_chatsvc(conversation, root_id, html, mentions, extras, Some(&quote))
+            .await?;
+        Ok(Some((sent.message, sent.html)))
+    }
+
+    pub(crate) fn cache_sent(
+        &self,
+        conversation_id: &str,
+        sent: &graph::Message,
+        html: &str,
+        extras: &MessageExtras,
+    ) -> Result<MessageRecord> {
+        let record = message_record(conversation_id, sent)
+            .ok_or(Error::Unsupported("a send answer without a creation time"))?;
+        let _ = self.seed_sent_images(&record, html, extras);
+        self.store.upsert_messages(std::slice::from_ref(&record))?;
+        self.update_chat_preview(std::slice::from_ref(&record))?;
+        let mut state = self.store.sync_state(conversation_id)?.unwrap_or_default();
+        if state
+            .newest_seen
+            .is_some_and(|newest| newest < record.created_at)
+        {
+            state.newest_seen = Some(record.created_at);
+            self.store.set_sync_state(conversation_id, &state)?;
+        }
+        self.announce(conversation_id, true);
+        Ok(record)
+    }
+
+    async fn fetch_channel_message(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        message_id: &str,
+    ) -> Result<graph::Message> {
+        let known = self
+            .store
+            .messages_by_id(channel_id, &[message_id.to_owned()])?;
+        match known
+            .get(message_id)
+            .and_then(|record| record.reply_to_id.clone())
+        {
+            Some(root_id) => {
+                self.remote
+                    .channel_reply(team_id, channel_id, &root_id, message_id)
+                    .await
+            }
+            None => {
+                self.remote
+                    .channel_message(team_id, channel_id, message_id)
+                    .await
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenedPost {
+    pub record: MessageRecord,
+    pub replies_loaded: bool,
+}
+
+pub(crate) fn outgoing(
+    conversation: &Conversation,
+    html: &str,
+    mentions: &[MentionInput],
+) -> Result<(String, Vec<OutgoingMention>)> {
+    if matches!(conversation, Conversation::Chat) {
+        ensure_allowed_in_chat(mentions)?;
+    }
+    Ok(apply_mentions(html, mentions))
+}
+
+fn missing_attachment_id() -> Error {
+    graph::Error::Upload("the uploaded file has no attachment id".into()).into()
+}

@@ -15,7 +15,7 @@ pub use error::{Error, Result};
 pub use events::{TabChannel, TabCommand, TabControl, TabEvent, TabEvents};
 pub use native::ensure_crypto_provider;
 pub use page_script::token_acquirer_script;
-pub use provider::{TokenProvider, token_allowed};
+pub use provider::{Guard, TokenProvider, token_allowed};
 pub use request::{
     ApiResponse, AugloopExchange, AugloopStage, BodyToken, Method, Request, SignalrExchange,
 };

@@ -1,0 +1,471 @@
+use std::collections::HashMap;
+
+use chrono::{DateTime, Utc};
+use rusqlite::{OptionalExtension, Row, params, params_from_iter};
+
+use crate::error::Result;
+use crate::models::{MessageImportance, MessageRecord, RecentScope, UNKNOWN_USER_NAME};
+use crate::search::index_message;
+use crate::store::Store;
+use crate::time::{from_millis, optional_from_millis, optional_to_millis, to_millis};
+
+const MESSAGE_COLUMNS: &str = "conversation_id, message_id, reply_to_id, sender_id, sender_name, created_at, \
+     edited_at, deleted, body_html, attachments_json, reactions_json, mentions_json, sender_application_id, links_json, subject, call_event_json, importance";
+
+impl Store {
+    pub fn upsert_messages(&self, messages: &[MessageRecord]) -> Result<()> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        {
+            let mut upsert = transaction.prepare_cached(&format!(
+                "INSERT INTO messages ({MESSAGE_COLUMNS})
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                 ON CONFLICT (conversation_id, message_id) DO UPDATE SET
+                    reply_to_id = excluded.reply_to_id, sender_id = excluded.sender_id,
+                    sender_name = excluded.sender_name, created_at = excluded.created_at,
+                    edited_at = excluded.edited_at, deleted = excluded.deleted, body_html = excluded.body_html,
+                    attachments_json = excluded.attachments_json, reactions_json = excluded.reactions_json,
+                    mentions_json = excluded.mentions_json,
+                    sender_application_id = excluded.sender_application_id,
+                    subject = COALESCE(excluded.subject, messages.subject),
+                    importance = COALESCE(excluded.importance, messages.importance),
+                    call_event_json = excluded.call_event_json,
+                    links_json = CASE WHEN excluded.links_json IN ('', '[]')
+                        THEN messages.links_json ELSE excluded.links_json END"
+            ))?;
+            for message in messages {
+                upsert.execute(params![
+                    message.conversation_id,
+                    message.message_id,
+                    message.reply_to_id,
+                    message.sender_id,
+                    message.sender_name,
+                    to_millis(message.created_at),
+                    optional_to_millis(message.edited_at),
+                    message.deleted,
+                    message.body_html,
+                    message.attachments_json,
+                    message.reactions_json,
+                    message.mentions_json,
+                    message.sender_application_id,
+                    message.links_json,
+                    message.subject,
+                    message.call_event_json,
+                    message.importance.stored(),
+                ])?;
+                index_message(&transaction, message)?;
+            }
+        }
+        Ok(transaction.commit()?)
+    }
+
+    pub fn set_message_links(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        links_json: &str,
+    ) -> Result<bool> {
+        let connection = self.lock()?;
+        let changed = connection.execute(
+            "UPDATE messages SET links_json = ?3
+             WHERE conversation_id = ?1 AND message_id = ?2 AND links_json <> ?3",
+            params![conversation_id, message_id, links_json],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn count_messages_after(
+        &self,
+        conversation_id: &str,
+        after: Option<DateTime<Utc>>,
+        not_from_user_id: &str,
+    ) -> Result<usize> {
+        let connection = self.lock()?;
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM messages
+             WHERE conversation_id = ?1 AND deleted = 0 AND created_at > ?2
+               AND call_event_json IS NULL
+               AND (sender_id IS NULL OR sender_id != ?3)",
+            params![
+                conversation_id,
+                optional_to_millis(after).unwrap_or(i64::MIN),
+                not_from_user_id
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    /// Teams marks a chat in the list by the importance of its last message while it is unread and from someone else.
+    pub fn unread_last_message_importance(
+        &self,
+        conversation_id: &str,
+        after: Option<DateTime<Utc>>,
+        not_from_user_id: &str,
+    ) -> Result<MessageImportance> {
+        let connection = self.lock()?;
+        let last: Option<(Option<String>, Option<String>, i64)> = connection
+            .query_row(
+                "SELECT importance, sender_id, created_at FROM messages
+                 WHERE conversation_id = ?1 AND deleted = 0 AND call_event_json IS NULL
+                 ORDER BY created_at DESC, message_id DESC LIMIT 1",
+                params![conversation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((importance, sender_id, created_at)) = last else {
+            return Ok(MessageImportance::Normal);
+        };
+        let unread = created_at > optional_to_millis(after).unwrap_or(i64::MIN);
+        let from_others = sender_id.as_deref() != Some(not_from_user_id);
+        Ok(if unread && from_others {
+            MessageImportance::from_stored(importance.as_deref())
+        } else {
+            MessageImportance::Normal
+        })
+    }
+
+    pub fn first_message_after_from_others(
+        &self,
+        conversation_id: &str,
+        after: Option<DateTime<Utc>>,
+        not_from_user_id: &str,
+    ) -> Result<Option<String>> {
+        let connection = self.lock()?;
+        Ok(connection
+            .query_row(
+                "SELECT message_id FROM messages
+                 WHERE conversation_id = ?1 AND deleted = 0 AND created_at > ?2
+                   AND call_event_json IS NULL
+                   AND (sender_id IS NULL OR sender_id != ?3)
+                 ORDER BY created_at ASC, message_id ASC LIMIT 1",
+                params![
+                    conversation_id,
+                    optional_to_millis(after).unwrap_or(i64::MIN),
+                    not_from_user_id
+                ],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Oldest-first page of the `limit` newest messages strictly older than `before` (all when `None`).
+    pub fn messages(
+        &self,
+        conversation_id: &str,
+        before: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> Result<Vec<MessageRecord>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare_cached(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages
+             WHERE conversation_id = ?1 AND (?2 IS NULL OR created_at < ?2)
+             ORDER BY created_at DESC, message_id DESC LIMIT ?3"
+        ))?;
+        let mut messages = statement
+            .query_map(
+                params![conversation_id, optional_to_millis(before), limit as i64],
+                message_from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        messages.reverse();
+        Ok(messages)
+    }
+
+    pub fn messages_between(
+        &self,
+        conversation_id: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<MessageRecord>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare_cached(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages
+             WHERE conversation_id = ?1 AND created_at >= ?2 AND created_at <= ?3
+             ORDER BY created_at ASC, message_id ASC"
+        ))?;
+        let messages = statement
+            .query_map(
+                params![conversation_id, to_millis(from), to_millis(to)],
+                message_from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(messages)
+    }
+
+    /// Oldest-first page of the `limit` oldest messages strictly newer than `after`.
+    pub fn messages_after(
+        &self,
+        conversation_id: &str,
+        after: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<MessageRecord>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare_cached(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages
+             WHERE conversation_id = ?1 AND created_at > ?2
+             ORDER BY created_at ASC, message_id ASC LIMIT ?3"
+        ))?;
+        let messages = statement
+            .query_map(
+                params![conversation_id, to_millis(after), limit as i64],
+                message_from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(messages)
+    }
+
+    /// Oldest-first root and replies of one channel thread.
+    pub fn thread_messages(
+        &self,
+        conversation_id: &str,
+        root_id: &str,
+    ) -> Result<Vec<MessageRecord>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare_cached(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages
+             WHERE conversation_id = ?1 AND (message_id = ?2 OR reply_to_id = ?2)
+             ORDER BY created_at ASC, message_id ASC"
+        ))?;
+        let messages = statement
+            .query_map(params![conversation_id, root_id], message_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(messages)
+    }
+
+    pub fn recent_messages(
+        &self,
+        scopes: &[RecentScope],
+        before: Option<(DateTime<Utc>, &str, &str)>,
+        limit: usize,
+    ) -> Result<Vec<MessageRecord>> {
+        let scope_json = serde_json::to_string(
+            &scopes
+                .iter()
+                .map(|scope| {
+                    serde_json::json!({
+                        "conversation_id": scope.conversation_id,
+                        "after": to_millis(scope.after),
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|_| "[]".to_owned());
+        let (before_time, before_message_id, before_conversation_id) = match before {
+            Some((time, message_id, conversation_id)) => (
+                Some(to_millis(time)),
+                Some(message_id),
+                Some(conversation_id),
+            ),
+            None => (None, None, None),
+        };
+        let connection = self.lock()?;
+        let mut statement = connection.prepare_cached(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages
+             JOIN json_each(?1) AS scope
+               ON messages.conversation_id = json_extract(scope.value, '$.conversation_id')
+             WHERE deleted = 0 AND created_at > json_extract(scope.value, '$.after')
+               AND (?2 IS NULL OR (created_at, message_id, messages.conversation_id) < (?2, ?3, ?4))
+             ORDER BY created_at DESC, message_id DESC, messages.conversation_id DESC LIMIT ?5"
+        ))?;
+        let messages = statement
+            .query_map(
+                params![
+                    scope_json,
+                    before_time,
+                    before_message_id,
+                    before_conversation_id,
+                    limit as i64
+                ],
+                message_from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(messages)
+    }
+
+    pub fn messages_with_attachment_type(
+        &self,
+        conversation_id: &str,
+        content_type: &str,
+    ) -> Result<Vec<MessageRecord>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare_cached(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages
+             WHERE conversation_id = ?1 AND instr(attachments_json, ?2) > 0"
+        ))?;
+        let needle = format!("\"content_type\":\"{content_type}\"");
+        let messages = statement
+            .query_map(params![conversation_id, needle], message_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(messages)
+    }
+
+    /// Chats, newest first, holding an attachment of `content_type` without content that is not marked unavailable.
+    pub fn conversations_with_stale_attachments(&self, content_type: &str) -> Result<Vec<String>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare_cached(
+            "SELECT chats.id FROM chats
+             WHERE EXISTS (
+                SELECT 1 FROM messages, json_each(messages.attachments_json) AS attachment
+                WHERE messages.conversation_id = chats.id
+                  AND instr(messages.attachments_json, ?1) > 0
+                  AND json_extract(attachment.value, '$.content_type') = ?2
+                  AND json_extract(attachment.value, '$.content') IS NULL
+                  AND NOT coalesce(json_extract(attachment.value, '$.unavailable'), 0)
+             )
+             ORDER BY chats.last_message_at DESC",
+        )?;
+        let needle = format!("\"content_type\":\"{content_type}\"");
+        let conversation_ids = statement
+            .query_map(params![needle, content_type], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(conversation_ids)
+    }
+
+    pub fn messages_by_id(
+        &self,
+        conversation_id: &str,
+        message_ids: &[String],
+    ) -> Result<HashMap<String, MessageRecord>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare_cached(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages
+             WHERE conversation_id = ?1 AND message_id IN (SELECT value FROM json_each(?2))"
+        ))?;
+        let ids = serde_json::to_string(message_ids).unwrap_or_else(|_| "[]".to_owned());
+        let rows = statement.query_map(
+            params_from_iter([conversation_id, ids.as_str()]),
+            message_from_row,
+        )?;
+        let mut found = HashMap::new();
+        for row in rows {
+            let message = row?;
+            found.insert(message.message_id.clone(), message);
+        }
+        Ok(found)
+    }
+
+    /// Newest first: (message_id, reactions_json) of the sender's undeleted messages.
+    pub fn reaction_state_of_sender(
+        &self,
+        conversation_id: &str,
+        sender_id: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare_cached(
+            "SELECT message_id, reactions_json FROM messages
+             WHERE conversation_id = ?1 AND sender_id = ?2 AND deleted = 0
+             ORDER BY created_at DESC, message_id DESC LIMIT ?3",
+        )?;
+        let rows = statement
+            .query_map(params![conversation_id, sender_id, limit as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// (user_id, display name) of the senders and mentioned people in the newest `scan` messages.
+    pub fn conversation_people(
+        &self,
+        conversation_id: &str,
+        scan: usize,
+    ) -> Result<Vec<(String, String)>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare_cached(
+            "WITH recent AS (
+                SELECT sender_id, sender_name, mentions_json FROM messages
+                WHERE conversation_id = ?1 ORDER BY created_at DESC, message_id DESC LIMIT ?2)
+             SELECT DISTINCT sender_id, sender_name FROM recent
+             WHERE sender_id IS NOT NULL AND sender_name IS NOT NULL
+             UNION
+             SELECT DISTINCT json_extract(mention.value, '$.user_id'), json_extract(mention.value, '$.name')
+             FROM recent, json_each(CASE WHEN json_valid(mentions_json) THEN mentions_json ELSE '[]' END) AS mention
+             WHERE json_extract(mention.value, '$.user_id') IS NOT NULL
+               AND json_extract(mention.value, '$.name') IS NOT NULL",
+        )?;
+        let people = statement
+            .query_map(params![conversation_id, scan as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(people)
+    }
+
+    pub fn display_names(&self, user_ids: &[String]) -> Result<HashMap<String, String>> {
+        if user_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let connection = self.lock()?;
+        let mut statement = connection.prepare_cached(
+            "SELECT value, COALESCE(
+                 (SELECT display_name FROM chat_members
+                  WHERE user_id = value AND display_name NOT IN ('', '?', ?2) LIMIT 1),
+                 (SELECT sender_name FROM messages
+                  WHERE sender_id = value AND sender_name NOT IN ('', '?', ?2)
+                  ORDER BY created_at DESC LIMIT 1))
+             FROM json_each(?1)",
+        )?;
+        let ids = serde_json::to_string(user_ids).unwrap_or_else(|_| "[]".to_owned());
+        let rows = statement.query_map(params![ids, UNKNOWN_USER_NAME], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        let mut names = HashMap::new();
+        for row in rows {
+            if let (user_id, Some(name)) = row? {
+                names.insert(user_id, name);
+            }
+        }
+        Ok(names)
+    }
+
+    pub fn thread_has_sender(
+        &self,
+        conversation_id: &str,
+        root_id: &str,
+        user_id: &str,
+    ) -> Result<bool> {
+        let connection = self.lock()?;
+        Ok(connection.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM messages
+                WHERE conversation_id = ?1 AND sender_id = ?3 AND deleted = 0
+                  AND (message_id = ?2 OR reply_to_id = ?2))",
+            params![conversation_id, root_id, user_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn message_count(&self, conversation_id: &str) -> Result<usize> {
+        let connection = self.lock()?;
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+            [conversation_id],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+}
+
+fn message_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
+    Ok(MessageRecord {
+        conversation_id: row.get(0)?,
+        message_id: row.get(1)?,
+        reply_to_id: row.get(2)?,
+        sender_id: row.get(3)?,
+        sender_name: row.get(4)?,
+        created_at: from_millis(row.get(5)?),
+        edited_at: optional_from_millis(row.get(6)?),
+        deleted: row.get(7)?,
+        body_html: row.get(8)?,
+        attachments_json: row.get(9)?,
+        reactions_json: row.get(10)?,
+        mentions_json: row.get(11)?,
+        sender_application_id: row.get(12)?,
+        links_json: row.get(13)?,
+        subject: row.get(14)?,
+        call_event_json: row.get(15)?,
+        importance: MessageImportance::from_stored(row.get::<_, Option<String>>(16)?.as_deref()),
+    })
+}

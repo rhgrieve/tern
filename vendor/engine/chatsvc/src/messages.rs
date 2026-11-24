@@ -336,9 +336,19 @@ fn edit_body(message_id: &str, html: &str) -> Value {
     })
 }
 
+tokio::task_local! {
+    static CLIENT_MESSAGE_ID: String;
+}
+
+/// Tern patch: messages posted inside `send` carry `id`, so every try of one queued message is the
+/// same message to the service.
+pub async fn with_client_message_id<F: Future>(id: String, send: F) -> F::Output {
+    CLIENT_MESSAGE_ID.scope(id, send).await
+}
+
 fn rich_text_body(html: &str, display_name: &str, properties: &Value) -> Value {
     json!({
-        "clientmessageid": new_client_message_id(),
+        "clientmessageid": CLIENT_MESSAGE_ID.try_with(Clone::clone).unwrap_or_else(|_| new_client_message_id()),
         "content": html,
         "messagetype": "RichText/Html",
         "contenttype": "text",
@@ -351,7 +361,7 @@ fn rich_text_body(html: &str, display_name: &str, properties: &Value) -> Value {
 const CLIENT_MESSAGE_ID_LENGTH: usize = 19;
 
 /// Teams web: two random `uint32` as decimal strings, joined and cut to 19 characters.
-pub(crate) fn new_client_message_id() -> String {
+pub fn new_client_message_id() -> String {
     let random = uuid::Uuid::new_v4().as_u128();
     let first = (random >> 96) as u32;
     let second = (random >> 64) as u32;
@@ -438,5 +448,18 @@ mod acl_check_tests {
             retry_after: None,
         };
         assert!(matches!(ensure_success(&other), Err(Error::Session(_))));
+    }
+}
+
+#[cfg(test)]
+mod client_id_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_queued_message_keeps_its_id_and_others_get_their_own() {
+        let body = || rich_text_body("<p>x</p>", "Me", &json!({}))["clientmessageid"].clone();
+        let (first, second) = with_client_message_id("42".into(), async { (body(), body()) }).await;
+        assert_eq!((first, second), (json!("42"), json!("42")));
+        assert_ne!(body(), body());
     }
 }

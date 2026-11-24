@@ -19,6 +19,25 @@ pub trait TokenProvider: Send + Sync {
     ) -> BoxFuture<'a, Result<String>>;
 }
 
+/// Decides whether a request may go out; see [`crate::Session::with_guard`].
+pub type Guard = std::sync::Arc<dyn Fn(&crate::Request) -> bool + Send + Sync>;
+
+/// The engine's fixed region in its Teams addresses.
+const ENGINE_REGION: &str = "emea";
+const REGIONAL: [&str; 3] = ["chatsvc", "csa", "mt"];
+
+/// The same address in the account's own region.
+pub(crate) fn in_region(url: &str, region: &str) -> Option<String> {
+    REGIONAL.iter().find_map(|service| {
+        let rest = url.strip_prefix(&format!(
+            "https://teams.cloud.microsoft/api/{service}/{ENGINE_REGION}/"
+        ))?;
+        Some(format!(
+            "https://teams.cloud.microsoft/api/{service}/{region}/{rest}"
+        ))
+    })
+}
+
 /// Stands in for the browser: there are no tabs to open.
 pub(crate) struct NoBrowser;
 
@@ -110,6 +129,32 @@ mod tests {
     const GRAPH: &str = "https://graph.microsoft.com";
     const IC3: &str = "https://ic3.teams.office.com";
     const PRESENCE: &str = "https://presence.teams.microsoft.com";
+
+    #[test]
+    fn only_the_region_segment_changes() {
+        assert_eq!(
+            in_region("https://teams.cloud.microsoft/api/chatsvc/emea/v1/users/ME/x?q=/emea/", "amer").as_deref(),
+            Some("https://teams.cloud.microsoft/api/chatsvc/amer/v1/users/ME/x?q=/emea/")
+        );
+        for other in [
+            "https://teams.cloud.microsoft/api/authsvc/emea/v1",
+            "https://teams.cloud.microsoft/api/mt/de/x",
+            "https://evil.example/api/mt/emea/x",
+        ] {
+            assert_eq!(in_region(other, "amer"), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_guard_stops_a_request_before_a_token_is_asked_for() {
+        use crate::{Method, Session, SessionConfig};
+        let session = Session::with_provider(std::sync::Arc::new(Never), SessionConfig::default())
+            .with_guard(std::sync::Arc::new(|request| request.method == Method::Get));
+        let sent = session
+            .request(Method::Post, "https://graph.microsoft.com/v1.0/x?y=1", &Scope::graph("User.Read"), None)
+            .await;
+        assert!(matches!(sent, Err(Error::Refused { url, .. }) if url == "https://graph.microsoft.com/v1.0/x"));
+    }
 
     #[test]
     fn tokens_go_to_their_own_services() {

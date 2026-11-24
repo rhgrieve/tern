@@ -1,0 +1,1907 @@
+use chrono::{DateTime, TimeZone, Utc};
+use rusqlite::Connection;
+use store::{
+    AvatarRecord, ChannelLayoutRecord, ChannelMentions, ChannelNotificationLevel,
+    ChannelNotifications, ChannelReadState, ChannelRecord, ChannelTabRecord, ChatPreview,
+    ChatRecord, FolderRecord, MemberRecord, MessageImportance, MessageRecord, ReadHorizonRecord,
+    RecentScope, Store, SyncState, TeamLayoutRecord, TeamRecord, TeamRights, UNKNOWN_USER_NAME,
+};
+
+#[test]
+fn a_system_event_keeps_the_previous_unread_state() {
+    let store = Store::open_in_memory().unwrap();
+    for (previous, expected) in [(true, true), (false, false)] {
+        let id = format!("chat-{previous}");
+        let mut seeded = chat(&id, "Planning", Some(at(5)));
+        seeded.unread = previous;
+        store.upsert_chats(&[seeded]).unwrap();
+
+        let mut event = chat(&id, "Planning", Some(at(12)));
+        event.unread = false;
+        event.last_event_system = true;
+        store.upsert_chats(&[event]).unwrap();
+        assert_eq!(store.chat(&id).unwrap().unwrap().unread, expected);
+    }
+}
+
+#[test]
+fn a_call_event_keeps_the_previous_preview() {
+    let store = Store::open_in_memory().unwrap();
+    let mut seeded = chat("chat-call", "Planning", Some(at(5)));
+    seeded.last_message_preview = Some("See you there".to_owned());
+    seeded.last_message_sender_id = Some("user-ada".to_owned());
+    seeded.last_message_sender_name = Some("Ada Example".to_owned());
+    store.upsert_chats(&[seeded]).unwrap();
+
+    let mut call = chat("chat-call", "Planning", Some(at(12)));
+    call.last_event_system = true;
+    call.keeps_stored_preview = true;
+    store.upsert_chats(&[call]).unwrap();
+    let stored = store.chat("chat-call").unwrap().unwrap();
+    assert_eq!(
+        stored.last_message_preview.as_deref(),
+        Some("See you there")
+    );
+    assert_eq!(
+        stored.last_message_sender_name.as_deref(),
+        Some("Ada Example")
+    );
+    assert_eq!(stored.last_message_at, Some(at(12)));
+
+    let mut recording = chat("chat-call", "Planning", Some(at(14)));
+    recording.last_event_system = true;
+    recording.last_message_preview = Some("Recording is ready".to_owned());
+    store.upsert_chats(&[recording]).unwrap();
+    let stored = store.chat("chat-call").unwrap().unwrap();
+    assert_eq!(
+        stored.last_message_preview.as_deref(),
+        Some("Recording is ready")
+    );
+    assert_eq!(stored.last_message_sender_name, None);
+}
+
+fn at(minute: u32) -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 10, 6, 9, minute, 0).unwrap()
+}
+
+fn chat(id: &str, title: &str, last: Option<DateTime<Utc>>) -> ChatRecord {
+    ChatRecord {
+        id: id.to_owned(),
+        kind: "group".to_owned(),
+        title: title.to_owned(),
+        member_summary: "Ada Example, Bob Sample".to_owned(),
+        last_message_at: last,
+        last_read_at: Some(at(0)),
+        unread: true,
+        members: vec![
+            MemberRecord {
+                user_id: Some("user-ada".to_owned()),
+                display_name: "Ada Example".to_owned(),
+            },
+            MemberRecord {
+                user_id: None,
+                display_name: "Bob Sample".to_owned(),
+            },
+        ],
+        ..ChatRecord::default()
+    }
+}
+
+fn message(conversation_id: &str, message_id: &str, minute: u32) -> MessageRecord {
+    MessageRecord {
+        conversation_id: conversation_id.to_owned(),
+        message_id: message_id.to_owned(),
+        reply_to_id: None,
+        sender_id: Some("user-ada".to_owned()),
+        sender_name: Some("Ada Example".to_owned()),
+        created_at: at(minute),
+        edited_at: None,
+        deleted: false,
+        body_html: format!("<p>message {message_id}</p>"),
+        attachments_json: "[]".to_owned(),
+        reactions_json: "[]".to_owned(),
+        mentions_json: "[]".to_owned(),
+        sender_application_id: None,
+        links_json: "[]".to_owned(),
+        subject: None,
+        call_event_json: None,
+        importance: MessageImportance::Normal,
+    }
+}
+
+#[test]
+fn importance_round_trips_and_survives_an_upsert_without_one() {
+    let store = Store::open_in_memory().unwrap();
+    let urgent = MessageRecord {
+        importance: MessageImportance::Urgent,
+        ..message("c1", "m1", 1)
+    };
+    store
+        .upsert_messages(std::slice::from_ref(&urgent))
+        .unwrap();
+    let found = store.messages_by_id("c1", &["m1".to_owned()]).unwrap();
+    assert_eq!(found["m1"].importance, MessageImportance::Urgent);
+
+    store.upsert_messages(&[message("c1", "m1", 1)]).unwrap();
+    let found = store.messages_by_id("c1", &["m1".to_owned()]).unwrap();
+    assert_eq!(found["m1"].importance, MessageImportance::Urgent);
+}
+
+#[test]
+fn unread_marker_follows_the_last_message_from_others() {
+    let store = Store::open_in_memory().unwrap();
+    let important = MessageRecord {
+        importance: MessageImportance::High,
+        ..message("c1", "m2", 2)
+    };
+    store
+        .upsert_messages(&[message("c1", "m1", 1), important])
+        .unwrap();
+    let marker = |after: Option<u32>, me: &str| {
+        store
+            .unread_last_message_importance("c1", after.map(at), me)
+            .unwrap()
+    };
+    assert_eq!(marker(None, "me"), MessageImportance::High);
+    assert_eq!(marker(Some(1), "me"), MessageImportance::High);
+    assert_eq!(marker(Some(2), "me"), MessageImportance::Normal);
+    assert_eq!(marker(None, "user-ada"), MessageImportance::Normal);
+
+    store.upsert_messages(&[message("c1", "m3", 3)]).unwrap();
+    assert_eq!(marker(None, "me"), MessageImportance::Normal);
+}
+
+#[test]
+fn subject_round_trips_and_survives_an_upsert_without_one() {
+    let store = Store::open_in_memory().unwrap();
+    let post = MessageRecord {
+        subject: Some("Release plan".to_owned()),
+        ..message("c1", "m1", 1)
+    };
+    store.upsert_messages(std::slice::from_ref(&post)).unwrap();
+    let found = store.messages_by_id("c1", &["m1".to_owned()]).unwrap();
+    assert_eq!(found["m1"], post);
+
+    store.upsert_messages(&[message("c1", "m1", 1)]).unwrap();
+    let found = store.messages_by_id("c1", &["m1".to_owned()]).unwrap();
+    assert_eq!(found["m1"].subject.as_deref(), Some("Release plan"));
+}
+
+#[test]
+fn thread_messages_return_root_and_replies_oldest_first_beyond_any_page() {
+    let store = Store::open_in_memory().unwrap();
+    let reply = |id: &str, minute: u32, root: &str| MessageRecord {
+        reply_to_id: Some(root.to_owned()),
+        ..message("c1", id, minute)
+    };
+    store
+        .upsert_messages(&[
+            reply("r2", 30, "root"),
+            message("c1", "root", 1),
+            message("c1", "other", 2),
+            reply("r1", 10, "root"),
+            reply("o1", 11, "other"),
+        ])
+        .unwrap();
+    let thread = store.thread_messages("c1", "root").unwrap();
+    assert_eq!(ids(&thread), ["root", "r1", "r2"]);
+}
+
+#[test]
+fn sender_application_round_trips() {
+    let store = Store::open_in_memory().unwrap();
+    let bot_message = MessageRecord {
+        sender_application_id: Some("bot-guid".to_owned()),
+        ..message("c1", "m1", 1)
+    };
+    store
+        .upsert_messages(std::slice::from_ref(&bot_message))
+        .unwrap();
+    let found = store.messages_by_id("c1", &["m1".to_owned()]).unwrap();
+    assert_eq!(found["m1"], bot_message);
+}
+
+#[test]
+fn an_upsert_without_links_keeps_the_stored_links() {
+    let store = Store::open_in_memory().unwrap();
+    store.upsert_messages(&[message("c1", "m1", 1)]).unwrap();
+    let links = r#"[{"url":"https://a.example"}]"#;
+    assert!(store.set_message_links("c1", "m1", links).unwrap());
+    assert!(!store.set_message_links("c1", "m1", links).unwrap());
+
+    let edited = MessageRecord {
+        body_html: "<p>edited</p>".to_owned(),
+        ..message("c1", "m1", 1)
+    };
+    store.upsert_messages(&[edited]).unwrap();
+    let found = store.messages_by_id("c1", &["m1".to_owned()]).unwrap();
+    assert_eq!(found["m1"].links_json, links);
+    assert_eq!(found["m1"].body_html, "<p>edited</p>");
+
+    let replaced = MessageRecord {
+        links_json: r#"[{"url":"https://b.example"}]"#.to_owned(),
+        ..message("c1", "m1", 1)
+    };
+    store
+        .upsert_messages(std::slice::from_ref(&replaced))
+        .unwrap();
+    let found = store.messages_by_id("c1", &["m1".to_owned()]).unwrap();
+    assert_eq!(found["m1"].links_json, replaced.links_json);
+}
+
+#[test]
+fn new_messages_start_without_links() {
+    let store = Store::open_in_memory().unwrap();
+    store.upsert_messages(&[message("c1", "m1", 1)]).unwrap();
+    let found = store.messages_by_id("c1", &["m1".to_owned()]).unwrap();
+    assert_eq!(found["m1"].links_json, "[]");
+}
+
+fn ids(messages: &[MessageRecord]) -> Vec<&str> {
+    messages
+        .iter()
+        .map(|message| message.message_id.as_str())
+        .collect()
+}
+
+#[test]
+fn chats_round_trip_with_members() {
+    let store = Store::open_in_memory().unwrap();
+    let original = chat("chat-1", "Planning", Some(at(5)));
+    store.upsert_chats(std::slice::from_ref(&original)).unwrap();
+    assert_eq!(store.chat("chat-1").unwrap(), Some(original));
+    assert_eq!(store.chat("missing").unwrap(), None);
+}
+
+#[test]
+fn chat_upsert_replaces_fields_and_members() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_chats(&[chat("chat-1", "Old", Some(at(1)))])
+        .unwrap();
+    let mut changed = chat("chat-1", "New", Some(at(9)));
+    changed.members.truncate(1);
+    changed.unread = false;
+    store.upsert_chats(&[changed.clone()]).unwrap();
+    assert_eq!(store.recent_chats(10).unwrap(), vec![changed]);
+}
+
+#[test]
+fn chat_upsert_keeps_a_real_title_over_the_only_you_fallback() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_chats(&[chat("chat-1", "Sample Bot", Some(at(1)))])
+        .unwrap();
+    store
+        .upsert_chats(&[chat("chat-1", "(only you)", Some(at(2)))])
+        .unwrap();
+    assert_eq!(store.chat("chat-1").unwrap().unwrap().title, "Sample Bot");
+    store
+        .upsert_chats(&[chat("chat-2", "(only you)", Some(at(2)))])
+        .unwrap();
+    store
+        .upsert_chats(&[chat("chat-2", "Sample Bot", Some(at(3)))])
+        .unwrap();
+    assert_eq!(store.chat("chat-2").unwrap().unwrap().title, "Sample Bot");
+    store
+        .upsert_chats(&[chat("chat-3", "?", Some(at(1)))])
+        .unwrap();
+    store
+        .upsert_chats(&[chat("chat-3", UNKNOWN_USER_NAME, Some(at(2)))])
+        .unwrap();
+    assert_eq!(
+        store.chat("chat-3").unwrap().unwrap().title,
+        UNKNOWN_USER_NAME
+    );
+}
+
+#[test]
+fn recent_chats_are_newest_first_with_unknown_last() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_chats(&[
+            chat("old", "Old", Some(at(1))),
+            chat("none", "None", None),
+            chat("new", "New", Some(at(30))),
+            chat("mid", "Mid", Some(at(10))),
+        ])
+        .unwrap();
+    let recent = store.recent_chats(3).unwrap();
+    let order: Vec<&str> = recent.iter().map(|chat| chat.id.as_str()).collect();
+    assert_eq!(order, ["new", "mid", "old"]);
+    assert_eq!(store.recent_chats(10).unwrap().last().unwrap().id, "none");
+}
+
+#[test]
+fn messages_page_backwards_oldest_first() {
+    let store = Store::open_in_memory().unwrap();
+    let all: Vec<MessageRecord> = (1..=10)
+        .map(|minute| message("chat-1", &format!("m{minute:02}"), minute))
+        .collect();
+    store.upsert_messages(&all).unwrap();
+    store
+        .upsert_messages(&[message("chat-2", "other", 5)])
+        .unwrap();
+
+    let newest = store.messages("chat-1", None, 4).unwrap();
+    assert_eq!(ids(&newest), ["m07", "m08", "m09", "m10"]);
+
+    let older = store
+        .messages("chat-1", Some(newest[0].created_at), 4)
+        .unwrap();
+    assert_eq!(ids(&older), ["m03", "m04", "m05", "m06"]);
+
+    let oldest = store
+        .messages("chat-1", Some(older[0].created_at), 4)
+        .unwrap();
+    assert_eq!(ids(&oldest), ["m01", "m02"]);
+    assert!(
+        store
+            .messages("chat-1", Some(oldest[0].created_at), 4)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.message_count("chat-1").unwrap(), 10);
+}
+
+#[test]
+fn equal_timestamps_keep_a_stable_order() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_messages(&[
+            message("c", "b", 1),
+            message("c", "a", 1),
+            message("c", "c", 1),
+        ])
+        .unwrap();
+    assert_eq!(
+        ids(&store.messages("c", None, 10).unwrap()),
+        ["a", "b", "c"]
+    );
+}
+
+#[test]
+fn message_upsert_updates_in_place() {
+    let store = Store::open_in_memory().unwrap();
+    let mut edited = message("c", "m1", 1);
+    store
+        .upsert_messages(std::slice::from_ref(&edited))
+        .unwrap();
+    edited.body_html = "<p>edited</p>".to_owned();
+    edited.edited_at = Some(at(2));
+    edited.reactions_json = r#"[{"type":"like"}]"#.to_owned();
+    store
+        .upsert_messages(std::slice::from_ref(&edited))
+        .unwrap();
+
+    let stored = store.messages("c", None, 10).unwrap();
+    assert_eq!(stored, vec![edited.clone()]);
+    let by_id = store
+        .messages_by_id("c", &["m1".to_owned(), "nope".to_owned()])
+        .unwrap();
+    assert_eq!(by_id.len(), 1);
+    assert_eq!(by_id["m1"], edited);
+}
+
+#[test]
+fn deleted_flag_and_json_columns_round_trip() {
+    let store = Store::open_in_memory().unwrap();
+    let mut record = message("c", "m1", 1);
+    record.deleted = true;
+    record.reply_to_id = Some("m0".to_owned());
+    record.attachments_json = r#"[{"name":"a.pdf"}]"#.to_owned();
+    record.mentions_json = r#"[{"id":"u1","name":"Ada Example"}]"#.to_owned();
+    store
+        .upsert_messages(std::slice::from_ref(&record))
+        .unwrap();
+    assert_eq!(store.messages("c", None, 1).unwrap(), vec![record]);
+}
+
+#[test]
+fn thread_has_sender_checks_root_and_replies() {
+    let store = Store::open_in_memory().unwrap();
+    let mut reply = message("c", "r1", 2);
+    reply.reply_to_id = Some("root".to_owned());
+    reply.sender_id = Some("user-bob".to_owned());
+    let mut other_reply = message("c", "r2", 3);
+    other_reply.reply_to_id = Some("other".to_owned());
+    other_reply.sender_id = Some("user-carl".to_owned());
+    store
+        .upsert_messages(&[message("c", "root", 1), reply, other_reply])
+        .unwrap();
+    assert!(store.thread_has_sender("c", "root", "user-ada").unwrap());
+    assert!(store.thread_has_sender("c", "root", "user-bob").unwrap());
+    assert!(!store.thread_has_sender("c", "root", "user-carl").unwrap());
+    assert!(!store.thread_has_sender("d", "root", "user-ada").unwrap());
+}
+
+#[test]
+fn sync_state_round_trip() {
+    let store = Store::open_in_memory().unwrap();
+    assert_eq!(store.sync_state("c").unwrap(), None);
+    let state = SyncState {
+        newest_seen: Some(at(9)),
+        oldest_loaded: Some(at(1)),
+        has_more: false,
+        older_cursor: Some("https://graph.microsoft.com/v1.0/next".to_owned()),
+        delta_link: Some("https://graph.microsoft.com/v1.0/delta".to_owned()),
+    };
+    store.set_sync_state("c", &state).unwrap();
+    assert_eq!(store.sync_state("c").unwrap(), Some(state));
+    let reset = SyncState {
+        has_more: true,
+        ..SyncState::default()
+    };
+    store.set_sync_state("c", &reset).unwrap();
+    assert_eq!(store.sync_state("c").unwrap(), Some(reset));
+}
+
+#[test]
+fn sidebar_groups_channels_under_teams() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_chats(&[chat("chat-1", "Planning", Some(at(5)))])
+        .unwrap();
+    store
+        .upsert_teams(&[
+            TeamRecord {
+                id: "t2".to_owned(),
+                name: "beta".to_owned(),
+            },
+            TeamRecord {
+                id: "t1".to_owned(),
+                name: "Alpha".to_owned(),
+            },
+        ])
+        .unwrap();
+    let channel = |id: &str, team_id: &str, name: &str| ChannelRecord {
+        id: id.to_owned(),
+        team_id: team_id.to_owned(),
+        name: name.to_owned(),
+        membership_type: Some("standard".to_owned()),
+        last_message_at: None,
+        unread: false,
+    };
+    store
+        .upsert_channels(&[
+            channel("c2", "t1", "Random"),
+            channel("c1", "t1", "General"),
+            channel("c3", "t2", "General"),
+        ])
+        .unwrap();
+
+    let sidebar = store.sidebar().unwrap();
+    assert_eq!(sidebar.chats.len(), 1);
+    let team_names: Vec<&str> = sidebar
+        .teams
+        .iter()
+        .map(|entry| entry.team.name.as_str())
+        .collect();
+    assert_eq!(team_names, ["Alpha", "beta"]);
+    let alpha_channels: Vec<&str> = sidebar.teams[0]
+        .channels
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert_eq!(alpha_channels, ["General", "Random"]);
+    assert_eq!(store.channel("c3").unwrap().unwrap().team_id, "t2");
+}
+
+#[test]
+fn channel_upsert_keeps_known_last_message_time() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_teams(&[TeamRecord {
+            id: "t1".to_owned(),
+            name: "A".to_owned(),
+        }])
+        .unwrap();
+    let mut channel = ChannelRecord {
+        id: "c1".to_owned(),
+        team_id: "t1".to_owned(),
+        name: "General".to_owned(),
+        membership_type: None,
+        last_message_at: Some(at(7)),
+        unread: false,
+    };
+    store
+        .upsert_channels(std::slice::from_ref(&channel))
+        .unwrap();
+    channel.last_message_at = None;
+    store
+        .upsert_channels(std::slice::from_ref(&channel))
+        .unwrap();
+    assert_eq!(
+        store.channel("c1").unwrap().unwrap().last_message_at,
+        Some(at(7))
+    );
+}
+
+#[test]
+fn channel_read_state_survives_a_metadata_refresh() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_teams(&[TeamRecord {
+            id: "t1".to_owned(),
+            name: "A".to_owned(),
+        }])
+        .unwrap();
+    let channel = ChannelRecord {
+        id: "c1".to_owned(),
+        team_id: "t1".to_owned(),
+        name: "General".to_owned(),
+        membership_type: None,
+        last_message_at: None,
+        unread: false,
+    };
+    store
+        .upsert_channels(std::slice::from_ref(&channel))
+        .unwrap();
+    store
+        .apply_channel_read_states(&[
+            ChannelReadState {
+                channel_id: "c1".to_owned(),
+                unread: true,
+                last_message_at: Some(at(9)),
+                read_until: Some(at(7)),
+            },
+            ChannelReadState {
+                channel_id: "unknown".to_owned(),
+                unread: true,
+                last_message_at: None,
+                read_until: None,
+            },
+        ])
+        .unwrap();
+    store
+        .upsert_channels(std::slice::from_ref(&channel))
+        .unwrap();
+    let stored = store.channel("c1").unwrap().unwrap();
+    assert!(stored.unread);
+    assert_eq!(stored.last_message_at, Some(at(9)));
+    assert_eq!(store.channel_read_until("c1").unwrap(), Some(at(7)));
+    assert_eq!(store.channel_read_until("unknown").unwrap(), None);
+    assert!(store.channel("unknown").unwrap().is_none());
+
+    store.mark_channel_read("c1").unwrap();
+    assert!(!store.channel("c1").unwrap().unwrap().unread);
+}
+
+#[test]
+fn pruning_removes_departed_teams_and_channels() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_teams(&[
+            TeamRecord {
+                id: "t1".to_owned(),
+                name: "A".to_owned(),
+            },
+            TeamRecord {
+                id: "t2".to_owned(),
+                name: "B".to_owned(),
+            },
+        ])
+        .unwrap();
+    let channel = |id: &str| ChannelRecord {
+        id: id.to_owned(),
+        team_id: "t1".to_owned(),
+        name: id.to_owned(),
+        membership_type: None,
+        last_message_at: None,
+        unread: false,
+    };
+    store
+        .upsert_channels(&[channel("c1"), channel("c2")])
+        .unwrap();
+    assert_eq!(
+        store
+            .remove_channels_except("t1", &["c1".to_owned()])
+            .unwrap(),
+        1
+    );
+    assert_eq!(store.remove_teams_except(&["t1".to_owned()]).unwrap(), 1);
+    let sidebar = store.sidebar().unwrap();
+    assert_eq!(sidebar.teams.len(), 1);
+    assert_eq!(sidebar.teams[0].channels.len(), 1);
+}
+
+#[test]
+fn file_database_uses_wal_persists_and_migrates_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("nested").join("cache.sqlite3");
+    {
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), store::latest_version());
+        store.upsert_messages(&[message("c", "m1", 1)]).unwrap();
+    }
+    let reopened = Store::open(&path).unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), store::latest_version());
+    assert_eq!(reopened.message_count("c").unwrap(), 1);
+    drop(reopened);
+    let mode: String = rusqlite_open(&path)
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+}
+
+#[test]
+fn newer_schema_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("cache.sqlite3");
+    drop(Store::open(&path).unwrap());
+    let connection = rusqlite_open(&path);
+    connection
+        .execute_batch("ALTER TABLE team_layout DROP COLUMN owner; ALTER TABLE team_layout DROP COLUMN add_channel; ALTER TABLE team_layout DROP COLUMN add_private_channel; ALTER TABLE team_layout DROP COLUMN edit_channel; ALTER TABLE team_layout DROP COLUMN delete_channel; ALTER TABLE channel_layout DROP COLUMN substrate_group_id; PRAGMA user_version = 99")
+        .unwrap();
+    drop(connection);
+    let error = Store::open(&path).err().expect("must refuse");
+    assert!(error.to_string().contains("99"), "{error}");
+}
+
+#[test]
+fn old_schema_is_upgraded_in_place() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("cache.sqlite3");
+    drop(Store::open(&path).unwrap());
+    let connection = rusqlite_open(&path);
+    connection.execute_batch("ALTER TABLE team_layout DROP COLUMN owner; ALTER TABLE team_layout DROP COLUMN add_channel; ALTER TABLE team_layout DROP COLUMN add_private_channel; ALTER TABLE team_layout DROP COLUMN edit_channel; ALTER TABLE team_layout DROP COLUMN delete_channel; ALTER TABLE channel_layout DROP COLUMN substrate_group_id; DROP TABLE messages; DROP TABLE sync_state; DROP TABLE chats; DROP TABLE chat_members; DROP TABLE channels; DROP TABLE teams; DROP TABLE meta; DROP TABLE avatars; DROP TABLE folder_items; DROP TABLE folders; DROP TABLE pinned_channels; DROP TABLE images; DROP TABLE search_keys; DROP TABLE message_search; DROP TABLE title_search; DROP TABLE team_layout; DROP TABLE channel_layout; DROP TABLE channel_tabs; DROP TABLE presence; DROP TABLE activity; DROP TABLE outbox; DROP TABLE drafts; DROP TABLE attachment_images; DROP TABLE agent_reaction_proposals; DROP TABLE agent_proposals; PRAGMA user_version = 0").unwrap();
+    drop(connection);
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), store::latest_version());
+    store.upsert_messages(&[message("c", "m1", 1)]).unwrap();
+}
+
+fn rusqlite_open(path: &std::path::Path) -> Connection {
+    Connection::open(path).unwrap()
+}
+
+#[test]
+fn meta_values_and_times_round_trip() {
+    let store = Store::open_in_memory().unwrap();
+    assert_eq!(store.meta("k").unwrap(), None);
+    store.set_meta("k", "one").unwrap();
+    store.set_meta("k", "two").unwrap();
+    assert_eq!(store.meta("k").unwrap().as_deref(), Some("two"));
+    assert_eq!(store.meta_time("t").unwrap(), None);
+    store.set_meta_time("t", at(7)).unwrap();
+    assert_eq!(store.meta_time("t").unwrap(), Some(at(7)));
+    store.set_meta("bad", "not a number").unwrap();
+    assert_eq!(store.meta_time("bad").unwrap(), None);
+}
+
+#[test]
+fn chats_can_be_pruned_and_marked_read() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_chats(&[
+            chat("a", "A", Some(at(1))),
+            chat("b", "B", Some(at(2))),
+            chat("c", "C", None),
+        ])
+        .unwrap();
+    let times = store
+        .chat_last_message_times(&["a".to_owned(), "c".to_owned(), "zzz".to_owned()])
+        .unwrap();
+    assert_eq!(times.len(), 2);
+    assert_eq!(times["a"], Some(at(1)));
+    assert_eq!(times["c"], None);
+
+    assert_eq!(store.remove_chats(&["a".to_owned()]).unwrap(), 1);
+    assert_eq!(store.remove_chats_except(&["b".to_owned()]).unwrap(), 1);
+    assert_eq!(store.chat_count().unwrap(), 1);
+
+    store.mark_chat_read("b", at(30)).unwrap();
+    let read = store.chat("b").unwrap().unwrap();
+    assert!(!read.unread);
+    assert_eq!(read.last_read_at, Some(at(30)));
+}
+
+#[test]
+fn migration_to_v2_keeps_existing_sync_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("old.sqlite3");
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(include_str!("../src/migrations/0001_initial.sql"))
+            .unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        connection
+            .execute("INSERT INTO sync_state (conversation_id, newest_seen, has_more) VALUES ('c', 5, 1)", [])
+            .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    let state = store.sync_state("c").unwrap().unwrap();
+    assert_eq!(state.delta_link, None);
+    assert_eq!(store.schema_version().unwrap(), store::latest_version());
+}
+
+#[test]
+fn migration_to_v13_clears_channel_delta_links_only() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("old.sqlite3");
+    {
+        let store = Store::open(&path).unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE team_layout DROP COLUMN owner; ALTER TABLE team_layout DROP COLUMN add_channel; ALTER TABLE team_layout DROP COLUMN add_private_channel; ALTER TABLE team_layout DROP COLUMN edit_channel; ALTER TABLE team_layout DROP COLUMN delete_channel; ALTER TABLE channel_layout DROP COLUMN substrate_group_id; INSERT INTO teams (id, name) VALUES ('t', 'T');
+                 INSERT INTO channels (id, team_id, name) VALUES ('ch', 't', 'C');
+                 INSERT INTO sync_state (conversation_id, delta_link) VALUES ('ch', 'link'), ('chat', 'link');
+                 ALTER TABLE messages DROP COLUMN subject;
+                 ALTER TABLE messages DROP COLUMN call_event_json;
+                 ALTER TABLE messages DROP COLUMN importance;
+                 ALTER TABLE folders DROP COLUMN expanded;
+                 DROP TABLE channel_tabs;
+                 DROP TABLE agent_reaction_proposals; DROP TABLE agent_proposals;
+                 ALTER TABLE channel_layout DROP COLUMN notification_level;
+                 ALTER TABLE channel_layout DROP COLUMN include_replies;
+                 ALTER TABLE channels DROP COLUMN read_until;
+                 ALTER TABLE chats DROP COLUMN preview_at; PRAGMA user_version = 12",
+            )
+            .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(
+        store
+            .sync_state("ch")
+            .unwrap()
+            .and_then(|state| state.delta_link),
+        None
+    );
+    assert_eq!(
+        store
+            .sync_state("chat")
+            .unwrap()
+            .unwrap()
+            .delta_link
+            .as_deref(),
+        Some("link")
+    );
+}
+
+#[test]
+fn preview_updates_only_for_newer_messages() {
+    let store = Store::open_in_memory().unwrap();
+    store.upsert_chats(&[chat("a", "A", Some(at(5)))]).unwrap();
+    let preview = |text| ChatPreview {
+        text: Some(text),
+        sender_id: Some("user-ada"),
+        sender_name: Some("Ada Example"),
+        deleted: false,
+    };
+    assert!(
+        !store
+            .update_chat_preview("a", at(4), &preview("older"))
+            .unwrap()
+    );
+    assert!(
+        store
+            .update_chat_preview("a", at(6), &preview("newer"))
+            .unwrap()
+    );
+    let record = store.chat("a").unwrap().unwrap();
+    assert_eq!(record.last_message_preview.as_deref(), Some("newer"));
+    assert_eq!(
+        record.last_message_sender_name.as_deref(),
+        Some("Ada Example")
+    );
+    assert_eq!(record.last_message_at, Some(at(6)));
+    assert!(!record.last_message_deleted);
+}
+
+#[test]
+fn a_call_moves_the_chat_time_and_keeps_the_line() {
+    let store = Store::open_in_memory().unwrap();
+    store.upsert_chats(&[chat("a", "A", Some(at(5)))]).unwrap();
+    let before = store.chat("a").unwrap().unwrap().last_message_preview;
+    assert!(!store.touch_chat_time("a", at(4)).unwrap());
+    assert!(store.touch_chat_time("a", at(7)).unwrap());
+    let record = store.chat("a").unwrap().unwrap();
+    assert_eq!(record.last_message_at, Some(at(7)));
+    assert_eq!(record.last_message_preview, before);
+}
+
+#[test]
+fn the_kept_line_keeps_its_own_time_after_a_call() {
+    let store = Store::open_in_memory().unwrap();
+    let mut line = chat("a", "A", Some(at(5)));
+    line.preview_at = Some(at(5));
+    store.upsert_chats(&[line]).unwrap();
+    store.touch_chat_time("a", at(7)).unwrap();
+    let mut call_sync = chat("a", "A", Some(at(9)));
+    call_sync.keeps_stored_preview = true;
+    store.upsert_chats(&[call_sync]).unwrap();
+    let record = store.chat("a").unwrap().unwrap();
+    assert_eq!(record.last_message_at, Some(at(9)));
+    assert_eq!(record.preview_at, Some(at(5)));
+}
+
+#[test]
+fn avatars_round_trip_and_report_stale_ids() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_avatar(&AvatarRecord {
+            user_id: "fresh".into(),
+            bytes: Some(vec![1, 2, 3]),
+            content_type: "image/jpeg".into(),
+            fetched_at: at(50),
+        })
+        .unwrap();
+    store
+        .upsert_avatar(&AvatarRecord {
+            user_id: "missing".into(),
+            bytes: None,
+            content_type: String::new(),
+            fetched_at: at(1),
+        })
+        .unwrap();
+    assert_eq!(
+        store.avatar("fresh").unwrap().unwrap().bytes,
+        Some(vec![1, 2, 3])
+    );
+    assert_eq!(store.avatar("missing").unwrap().unwrap().bytes, None);
+    assert!(store.avatar("unknown").unwrap().is_none());
+    let ids: Vec<String> = ["fresh", "missing", "unknown"].map(String::from).to_vec();
+    assert_eq!(
+        store.avatar_ids_needing_fetch(&ids, at(10)).unwrap(),
+        ["missing", "unknown"]
+    );
+}
+
+#[test]
+fn folders_and_pinned_channels_are_replaced_in_order() {
+    let store = Store::open_in_memory().unwrap();
+    let folder = |id: &str, kind: &str, items: &[&str]| FolderRecord {
+        id: id.into(),
+        name: id.into(),
+        kind: kind.into(),
+        expanded: kind != "MutedChats",
+        conversation_ids: items.iter().map(|item| item.to_string()).collect(),
+    };
+    let first = [
+        folder("f1", "Favorites", &["b", "a"]),
+        folder("f2", "UserCreated", &[]),
+        folder("f4", "MutedChats", &[]),
+    ];
+    store
+        .replace_folders(&first, &["c2".into(), "c1".into()])
+        .unwrap();
+    assert_eq!(store.folders().unwrap(), first);
+    assert_eq!(store.pinned_channel_ids().unwrap(), ["c2", "c1"]);
+    store.set_folder_expanded("f2", false).unwrap();
+    assert!(!store.folders().unwrap()[1].expanded);
+    store
+        .replace_folders(&[folder("f3", "UserCreated", &["z"])], &[])
+        .unwrap();
+    assert_eq!(store.folders().unwrap().len(), 1);
+    assert!(store.pinned_channel_ids().unwrap().is_empty());
+}
+
+#[test]
+fn counts_messages_after_a_time_from_others() {
+    let store = Store::open_in_memory().unwrap();
+    let mut mine = message("c", "m3", 3);
+    mine.sender_id = Some("me".into());
+    store
+        .upsert_messages(&[message("c", "m1", 1), message("c", "m2", 2), mine])
+        .unwrap();
+    assert_eq!(
+        store.count_messages_after("c", Some(at(1)), "me").unwrap(),
+        1
+    );
+    assert_eq!(store.count_messages_after("c", None, "me").unwrap(), 2);
+}
+
+#[test]
+fn messages_between_is_inclusive_and_oldest_first() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_messages(&[
+            message("c", "m4", 4),
+            message("c", "m1", 1),
+            message("c", "m3", 3),
+            message("c", "m2", 2),
+            message("other", "o3", 3),
+        ])
+        .unwrap();
+    let ids: Vec<String> = store
+        .messages_between("c", at(2), at(3))
+        .unwrap()
+        .into_iter()
+        .map(|record| record.message_id)
+        .collect();
+    assert_eq!(ids, ["m2", "m3"]);
+}
+
+fn html_message(
+    conversation_id: &str,
+    message_id: &str,
+    minute: u32,
+    sender: &str,
+    html: &str,
+) -> MessageRecord {
+    MessageRecord {
+        sender_name: Some(sender.to_owned()),
+        body_html: html.to_owned(),
+        ..message(conversation_id, message_id, minute)
+    }
+}
+
+#[test]
+fn fts5_is_available_and_matches_prefixes_with_highlights() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_messages(&[
+            html_message(
+                "c1",
+                "m1",
+                1,
+                "Ada Example",
+                "<p>The <b>budget</b> planning is done</p>",
+            ),
+            html_message("c1", "m2", 2, "Bob Sample", "<p>Lunch at noon</p>"),
+            html_message("c2", "m3", 3, "Bob Sample", "<p>Budget approved</p>"),
+        ])
+        .unwrap();
+    let hits = store.search_messages("budg plan", None, 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].message_id, "m1");
+    assert_eq!(hits[0].sender_name.as_deref(), Some("Ada Example"));
+    assert_eq!(hits[0].created_at, at(1));
+    assert!(
+        hits[0].snippet.contains("\u{1}budget\u{2}"),
+        "{}",
+        hits[0].snippet
+    );
+    let all = store.search_messages("budget", None, 10).unwrap();
+    assert_eq!(ids_of(&all), ["m3", "m1"]);
+    let scoped = store.search_messages("budget", Some("c1"), 10).unwrap();
+    assert_eq!(ids_of(&scoped), ["m1"]);
+    assert_eq!(store.search_messages("budget", None, 1).unwrap().len(), 1);
+}
+
+fn ids_of(hits: &[store::SearchHit]) -> Vec<&str> {
+    hits.iter().map(|hit| hit.message_id.as_str()).collect()
+}
+
+#[test]
+fn search_filters_by_sender_and_ignores_unsearchable_input() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_messages(&[
+            html_message("c1", "m1", 1, "Ada Example", "<p>report</p>"),
+            html_message("c1", "m2", 2, "Bob Sample", "<p>report</p>"),
+        ])
+        .unwrap();
+    assert_eq!(
+        ids_of(&store.search_messages("from:bob report", None, 10).unwrap()),
+        ["m2"]
+    );
+    assert!(store.search_messages("   ", None, 10).unwrap().is_empty());
+    assert!(store.search_messages("\"-*", None, 10).unwrap().is_empty());
+    assert!(store.search_messages("rep) OR (", None, 10).is_ok());
+}
+
+#[test]
+fn search_follows_edits_and_deletes() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_messages(&[html_message("c1", "m1", 1, "Ada", "<p>alpha</p>")])
+        .unwrap();
+    store
+        .upsert_messages(&[html_message("c1", "m1", 1, "Ada", "<p>beta</p>")])
+        .unwrap();
+    assert!(store.search_messages("alpha", None, 10).unwrap().is_empty());
+    assert_eq!(store.search_messages("beta", None, 10).unwrap().len(), 1);
+    let mut deleted = html_message("c1", "m1", 1, "Ada", "");
+    deleted.deleted = true;
+    store.upsert_messages(&[deleted]).unwrap();
+    assert!(store.search_messages("beta", None, 10).unwrap().is_empty());
+}
+
+#[test]
+fn title_search_follows_chat_renames() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_chats(&[chat("c1", "Budget planning", None)])
+        .unwrap();
+    assert_eq!(
+        store.search_conversations("budg", 10).unwrap()[0].conversation_id,
+        "c1"
+    );
+    store.upsert_chats(&[chat("c1", "Holiday", None)]).unwrap();
+    assert!(store.search_conversations("budget", 10).unwrap().is_empty());
+    assert_eq!(store.search_conversations("holi", 10).unwrap().len(), 1);
+    assert!(
+        store
+            .search_conversations("from:holi", 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn migration_indexes_rows_that_predate_search() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("cache.sqlite3");
+    {
+        let store = Store::open(&path).unwrap();
+        store.upsert_chats(&[chat("c1", "Old chat", None)]).unwrap();
+        store
+            .upsert_messages(&[html_message("c1", "m1", 1, "Ada", "<p>legacy text</p>")])
+            .unwrap();
+    }
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE team_layout DROP COLUMN owner; ALTER TABLE team_layout DROP COLUMN add_channel; ALTER TABLE team_layout DROP COLUMN add_private_channel; ALTER TABLE team_layout DROP COLUMN edit_channel; ALTER TABLE team_layout DROP COLUMN delete_channel; ALTER TABLE channel_layout DROP COLUMN substrate_group_id; DROP TRIGGER chats_title_insert; DROP TRIGGER chats_title_update; DROP TRIGGER chats_title_delete;
+                 DROP TRIGGER channels_title_insert; DROP TRIGGER channels_title_update; DROP TRIGGER channels_title_delete;
+                 DROP TABLE images; DROP TABLE search_keys; DROP TABLE message_search; DROP TABLE title_search;
+                 DROP TABLE team_layout; DROP TABLE channel_layout; DROP TABLE channel_tabs; DROP TABLE presence; DROP TABLE activity; DROP TABLE outbox; DROP TABLE drafts; DROP TABLE attachment_images; DROP TABLE agent_reaction_proposals; DROP TABLE agent_proposals;
+                 DROP INDEX messages_by_sender; DROP INDEX chat_members_by_user;
+                 ALTER TABLE messages DROP COLUMN sender_application_id;
+                 ALTER TABLE messages DROP COLUMN links_json;
+                 ALTER TABLE messages DROP COLUMN subject;
+                 ALTER TABLE messages DROP COLUMN call_event_json;
+                 ALTER TABLE messages DROP COLUMN importance;
+                 ALTER TABLE chats DROP COLUMN muted;
+                 ALTER TABLE folders DROP COLUMN expanded;
+                 ALTER TABLE channels DROP COLUMN read_until;
+                 ALTER TABLE chats DROP COLUMN preview_at; PRAGMA user_version = 3;",
+            )
+            .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.search_messages("legacy", None, 10).unwrap().len(), 1);
+    assert_eq!(store.search_conversations("old", 10).unwrap().len(), 1);
+}
+
+fn image(key: &str, minute: u32, size: usize) -> store::ImageRecord {
+    store::ImageRecord {
+        key: key.to_owned(),
+        bytes: vec![7; size],
+        content_type: "image/png".to_owned(),
+        fetched_at: at(minute),
+    }
+}
+
+#[test]
+fn images_round_trip_and_evict_the_oldest_over_the_cap() {
+    let store = Store::open_in_memory().unwrap();
+    store.put_image(&image("a", 1, 40), 100).unwrap();
+    store.put_image(&image("b", 2, 40), 100).unwrap();
+    assert_eq!(store.image("a").unwrap().unwrap().bytes.len(), 40);
+    store.put_image(&image("c", 3, 40), 100).unwrap();
+    assert!(store.image("a").unwrap().is_none());
+    assert!(store.has_image("b").unwrap());
+    assert!(store.has_image("c").unwrap());
+    assert_eq!(store.image_cache_bytes().unwrap(), 80);
+    store.put_image(&image("big", 0, 500), 100).unwrap();
+    assert!(store.has_image("big").unwrap());
+    assert_eq!(store.image_cache_bytes().unwrap(), 500);
+}
+
+#[test]
+fn first_message_after_from_others_skips_own_and_deleted() {
+    let store = Store::open_in_memory().unwrap();
+    let mut own = message("c1", "own", 2);
+    own.sender_id = Some("me".to_owned());
+    let mut gone = message("c1", "gone", 3);
+    gone.deleted = true;
+    store
+        .upsert_messages(&[message("c1", "old", 1), own, gone, message("c1", "new", 4)])
+        .unwrap();
+    assert_eq!(
+        store
+            .first_message_after_from_others("c1", Some(at(1)), "me")
+            .unwrap()
+            .as_deref(),
+        Some("new")
+    );
+    assert_eq!(
+        store
+            .first_message_after_from_others("c1", None, "me")
+            .unwrap()
+            .as_deref(),
+        Some("old")
+    );
+    assert!(
+        store
+            .first_message_after_from_others("c1", Some(at(4)), "me")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn a_team_is_found_by_id() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_teams(&[TeamRecord {
+            id: "t1".to_owned(),
+            name: "Alpha".to_owned(),
+        }])
+        .unwrap();
+    assert_eq!(store.team("t1").unwrap().unwrap().name, "Alpha");
+    assert!(store.team("nope").unwrap().is_none());
+}
+
+#[test]
+fn sync_does_not_resurrect_a_locally_read_chat() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_chats(&[chat("chat-1", "Planning", Some(at(5)))])
+        .unwrap();
+    store.mark_chat_read("chat-1", at(10)).unwrap();
+
+    store
+        .upsert_chats(&[chat("chat-1", "Planning", Some(at(5)))])
+        .unwrap();
+    let stale = store.chat("chat-1").unwrap().unwrap();
+    assert!(!stale.unread);
+    assert_eq!(stale.last_read_at, Some(at(10)));
+
+    store
+        .upsert_chats(&[chat("chat-1", "Planning", Some(at(12)))])
+        .unwrap();
+    assert!(store.chat("chat-1").unwrap().unwrap().unread);
+}
+
+#[test]
+fn mark_chat_unread_sets_the_flag_and_horizon() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_chats(&[chat("chat-1", "Planning", Some(at(5)))])
+        .unwrap();
+    store.mark_chat_read("chat-1", at(10)).unwrap();
+
+    store.mark_chat_unread("chat-1", at(4)).unwrap();
+    let unread = store.chat("chat-1").unwrap().unwrap();
+    assert!(unread.unread);
+    assert_eq!(unread.last_read_at, Some(at(4)));
+}
+
+#[test]
+fn muted_flag_survives_a_chat_refresh() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_chats(&[chat("a", "A", Some(at(1))), chat("b", "B", Some(at(2)))])
+        .unwrap();
+    assert!(!store.chat("a").unwrap().unwrap().muted);
+
+    store.set_chat_muted("a", true).unwrap();
+    store
+        .upsert_chats(&[chat("a", "A", Some(at(3))), chat("b", "B", Some(at(2)))])
+        .unwrap();
+    assert!(store.chat("a").unwrap().unwrap().muted);
+    assert!(!store.chat("b").unwrap().unwrap().muted);
+
+    store.set_chat_muted("a", false).unwrap();
+    assert!(!store.chat("a").unwrap().unwrap().muted);
+}
+
+#[test]
+fn muted_states_touch_only_the_listed_chats() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_chats(&[
+            chat("a", "A", Some(at(1))),
+            chat("b", "B", Some(at(2))),
+            chat("c", "C", Some(at(3))),
+        ])
+        .unwrap();
+    store.set_chat_muted("a", true).unwrap();
+    store.set_chat_muted("c", true).unwrap();
+
+    store
+        .apply_muted_states(&[
+            ("a".to_owned(), false),
+            ("b".to_owned(), true),
+            ("gone".to_owned(), true),
+        ])
+        .unwrap();
+    assert!(!store.chat("a").unwrap().unwrap().muted);
+    assert!(store.chat("b").unwrap().unwrap().muted);
+    assert!(store.chat("c").unwrap().unwrap().muted);
+}
+
+#[test]
+fn presence_upsert_keeps_the_latest_availability() {
+    let store = Store::open_in_memory().unwrap();
+    let first = [("ada".to_owned(), "Available".to_owned())];
+    store.upsert_presences(&first, at(1)).unwrap();
+    let second = [
+        ("ada".to_owned(), "Away".to_owned()),
+        ("bob".to_owned(), "Busy".to_owned()),
+    ];
+    store.upsert_presences(&second, at(2)).unwrap();
+    let mut presences = store.presences().unwrap();
+    presences.sort();
+    assert_eq!(presences, second.to_vec());
+}
+
+fn activity(id: i64, minute: u32) -> store::ActivityRecord {
+    store::ActivityRecord {
+        id,
+        conversation_id: "c1".to_owned(),
+        kind: "messages".to_owned(),
+        message_id: format!("m{id}"),
+        actors_json: r#"[{"user_id":"user-ada","name":"Ada Example"}]"#.to_owned(),
+        preview: "hello".to_owned(),
+        glyphs: String::new(),
+        count: 1,
+        updated_at: at(minute),
+        read: false,
+    }
+}
+
+#[test]
+fn activity_upsert_inserts_then_updates_in_place() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_activity(&[activity(1, 5), activity(2, 9)])
+        .unwrap();
+    let mut changed = activity(1, 12);
+    changed.count = 3;
+    changed.read = true;
+    store
+        .upsert_activity(std::slice::from_ref(&changed))
+        .unwrap();
+    let records = store.activity().unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0], changed);
+    assert_eq!(records[1].id, 2);
+}
+
+#[test]
+fn activity_prune_drops_only_older_rows() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_activity(&[activity(1, 5), activity(2, 9), activity(3, 20)])
+        .unwrap();
+    assert_eq!(store.prune_activity(at(9)).unwrap(), 1);
+    let ids: Vec<i64> = store
+        .activity()
+        .unwrap()
+        .iter()
+        .map(|record| record.id)
+        .collect();
+    assert_eq!(ids, vec![3, 2]);
+}
+
+#[test]
+fn display_names_prefer_members_then_latest_sender_name() {
+    let store = Store::open_in_memory().unwrap();
+    let unnamed_member = ChatRecord {
+        members: vec![MemberRecord {
+            user_id: Some("user-sam".to_owned()),
+            display_name: UNKNOWN_USER_NAME.to_owned(),
+        }],
+        ..chat("chat-2", "Review", Some(at(6)))
+    };
+    store
+        .upsert_chats(&[chat("chat-1", "Planning", Some(at(5))), unnamed_member])
+        .unwrap();
+    let sent_by = |message_id: &str, minute: u32, sender: &str, name: Option<&str>| MessageRecord {
+        sender_id: Some(sender.to_owned()),
+        sender_name: name.map(str::to_owned),
+        ..message("channel", message_id, minute)
+    };
+    store
+        .upsert_messages(&[
+            sent_by("m1", 1, "user-ada", Some("Ada Sender")),
+            sent_by("m2", 2, "user-sam", Some("Sam Old")),
+            sent_by("m3", 3, "user-sam", Some("Sam New")),
+            sent_by("m4", 4, "user-sam", None),
+            sent_by("m5", 5, "user-blank", Some("")),
+        ])
+        .unwrap();
+    let wanted: Vec<String> = ["user-ada", "user-sam", "user-blank", "user-none"]
+        .map(str::to_owned)
+        .to_vec();
+    let names = store.display_names(&wanted).unwrap();
+    assert_eq!(names.len(), 2);
+    assert_eq!(names["user-ada"], "Ada Example");
+    assert_eq!(names["user-sam"], "Sam New");
+    assert!(store.display_names(&[]).unwrap().is_empty());
+}
+
+#[test]
+fn channel_tabs_keep_their_saved_order_and_are_replaced_on_refresh() {
+    let store = Store::open_in_memory().unwrap();
+    let tab = |tab_id: &str, open_url: Option<&str>| ChannelTabRecord {
+        tab_id: tab_id.to_owned(),
+        name: format!("Tab {tab_id}"),
+        definition_id: "com.microsoft.teamspace.tab.web".to_owned(),
+        open_url: open_url.map(str::to_owned),
+    };
+    let layout = |tabs: Vec<ChannelTabRecord>| {
+        vec![TeamLayoutRecord {
+            rights: Default::default(),
+            team_id: "team".to_owned(),
+            hidden: false,
+            channels: vec![ChannelLayoutRecord {
+                substrate_group_id: None,
+                channel_id: "channel".to_owned(),
+                general: false,
+                hidden: false,
+                tabs,
+                notifications: ChannelNotifications::default(),
+            }],
+        }]
+    };
+    store
+        .replace_team_layout(&layout(vec![
+            tab("b", Some("https://b.example")),
+            tab("a", None),
+        ]))
+        .unwrap();
+    let tabs = store.channel_tabs("channel").unwrap();
+    let ids: Vec<&str> = tabs.iter().map(|tab| tab.tab_id.as_str()).collect();
+    assert_eq!(ids, ["b", "a"]);
+    assert_eq!(tabs[0].open_url.as_deref(), Some("https://b.example"));
+    assert!(store.channel_tabs("other").unwrap().is_empty());
+    store.replace_team_layout(&layout(Vec::new())).unwrap();
+    assert!(store.channel_tabs("channel").unwrap().is_empty());
+}
+
+#[test]
+fn channel_notifications_default_to_feed_and_survive_layout_and_local_writes() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_teams(&[TeamRecord {
+            id: "t1".to_owned(),
+            name: "Alpha".to_owned(),
+        }])
+        .unwrap();
+    let channel = |id: &str, name: &str| ChannelRecord {
+        id: id.to_owned(),
+        team_id: "t1".to_owned(),
+        name: name.to_owned(),
+        membership_type: None,
+        last_message_at: None,
+        unread: false,
+    };
+    store
+        .upsert_channels(&[channel("c1", "General"), channel("c2", "Random")])
+        .unwrap();
+    let team = || store.sidebar().unwrap().teams.remove(0);
+    assert_eq!(
+        team().channel_notifications("c2"),
+        ChannelNotifications::default()
+    );
+
+    let banner = ChannelNotifications {
+        level: ChannelNotificationLevel::BannerAndFeed,
+        include_replies: true,
+    };
+    store.set_channel_notifications("c2", banner).unwrap();
+    let sidebar_team = team();
+    assert_eq!(sidebar_team.channel_notifications("c2"), banner);
+    assert_eq!(sidebar_team.channels[0].name, "General");
+
+    let off = ChannelNotifications {
+        level: ChannelNotificationLevel::Off,
+        include_replies: false,
+    };
+    store
+        .replace_team_layout(&[TeamLayoutRecord {
+            rights: Default::default(),
+            team_id: "t1".to_owned(),
+            hidden: false,
+            channels: vec![ChannelLayoutRecord {
+                substrate_group_id: None,
+                channel_id: "c2".to_owned(),
+                general: false,
+                hidden: false,
+                tabs: Vec::new(),
+                notifications: off,
+            }],
+        }])
+        .unwrap();
+    assert_eq!(team().channel_notifications("c2"), off);
+}
+
+#[test]
+fn channel_mentions_are_replaced_whole_and_cleared_per_channel() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_teams(&[TeamRecord {
+            id: "t1".to_owned(),
+            name: "Alpha".to_owned(),
+        }])
+        .unwrap();
+    let channel = |id: &str, name: &str| ChannelRecord {
+        id: id.to_owned(),
+        team_id: "t1".to_owned(),
+        name: name.to_owned(),
+        membership_type: None,
+        last_message_at: None,
+        unread: true,
+    };
+    store
+        .upsert_channels(&[channel("c1", "General"), channel("c2", "Random")])
+        .unwrap();
+    let counts = |personal, channel, team| ChannelMentions {
+        personal,
+        channel,
+        team,
+    };
+    store
+        .replace_channel_mentions(&[
+            ("c1".to_owned(), counts(2, 0, 1)),
+            ("c2".to_owned(), counts(0, 0, 0)),
+        ])
+        .unwrap();
+    let team = || store.sidebar().unwrap().teams.remove(0);
+    assert_eq!(team().channel_mentions("c1"), counts(2, 0, 1));
+    assert!(!team().mentions.contains_key("c2"));
+    store
+        .replace_channel_mentions(&[("c2".to_owned(), counts(0, 1, 0))])
+        .unwrap();
+    assert_eq!(team().channel_mentions("c1"), ChannelMentions::default());
+    assert_eq!(team().channel_mentions("c2"), counts(0, 1, 0));
+    store.clear_channel_mentions("c2").unwrap();
+    assert!(team().mentions.is_empty());
+}
+
+#[test]
+fn the_team_thread_id_is_the_general_channel_id() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_teams(&["group-a", "group-b"].map(|id| TeamRecord {
+            id: id.to_owned(),
+            name: id.to_owned(),
+        }))
+        .unwrap();
+    let channel = |id: &str, team_id: &str, name: &str| ChannelRecord {
+        id: id.to_owned(),
+        team_id: team_id.to_owned(),
+        name: name.to_owned(),
+        membership_type: None,
+        last_message_at: None,
+        unread: false,
+    };
+    store
+        .upsert_channels(&[
+            channel("19:a-random", "group-a", "Random"),
+            channel("19:a-general", "group-a", "General"),
+            channel("19:b-renamed", "group-b", "Allgemein"),
+            channel("19:b-other", "group-b", "Other"),
+        ])
+        .unwrap();
+    store
+        .replace_team_layout(&[TeamLayoutRecord {
+            rights: Default::default(),
+            team_id: "group-b".to_owned(),
+            hidden: false,
+            channels: vec![ChannelLayoutRecord {
+                substrate_group_id: None,
+                channel_id: "19:b-renamed".to_owned(),
+                general: true,
+                hidden: false,
+                tabs: Vec::new(),
+                notifications: ChannelNotifications::default(),
+            }],
+        }])
+        .unwrap();
+    assert_eq!(
+        store.team_thread_id("group-a").unwrap().as_deref(),
+        Some("19:a-general")
+    );
+    assert_eq!(
+        store.team_thread_id("group-b").unwrap().as_deref(),
+        Some("19:b-renamed")
+    );
+    assert_eq!(store.team_thread_id("group-c").unwrap(), None);
+}
+
+#[test]
+fn recent_messages_run_newest_first_across_scopes_with_a_cursor() {
+    let store = Store::open_in_memory().unwrap();
+    let mut deleted = message("chat-a", "a3", 8);
+    deleted.deleted = true;
+    store
+        .upsert_messages(&[
+            message("chat-a", "a1", 1),
+            message("chat-a", "a2", 6),
+            deleted,
+            message("chat-b", "b1", 5),
+            message("chat-b", "b2", 7),
+            message("chat-c", "c1", 9),
+        ])
+        .unwrap();
+    let scope = |conversation_id: &str, minute: u32| RecentScope {
+        conversation_id: conversation_id.to_owned(),
+        after: at(minute),
+    };
+    let scopes = [scope("chat-a", 0), scope("chat-b", 5)];
+    let ids = |messages: Vec<MessageRecord>| -> Vec<String> {
+        messages
+            .into_iter()
+            .map(|message| message.message_id)
+            .collect()
+    };
+    assert_eq!(
+        ids(store.recent_messages(&scopes, None, 10).unwrap()),
+        ["b2", "a2", "a1"]
+    );
+    assert_eq!(
+        ids(store.recent_messages(&scopes, None, 2).unwrap()),
+        ["b2", "a2"]
+    );
+    assert_eq!(
+        ids(store
+            .recent_messages(&scopes, Some((at(6), "a2", "chat-a")), 10)
+            .unwrap()),
+        ["a1"]
+    );
+    assert!(store.recent_messages(&[], None, 10).unwrap().is_empty());
+}
+
+#[test]
+fn recent_messages_break_ties_by_conversation_across_the_cursor() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_messages(&[message("chat-a", "m1", 5), message("chat-b", "m1", 5)])
+        .unwrap();
+    let scopes: Vec<RecentScope> = ["chat-a", "chat-b"]
+        .into_iter()
+        .map(|conversation_id| RecentScope {
+            conversation_id: conversation_id.to_owned(),
+            after: at(0),
+        })
+        .collect();
+    let first = store.recent_messages(&scopes, None, 1).unwrap();
+    assert_eq!(first[0].conversation_id, "chat-b");
+    let second = store
+        .recent_messages(&scopes, Some((at(5), "m1", "chat-b")), 1)
+        .unwrap();
+    assert_eq!(second[0].conversation_id, "chat-a");
+    assert!(
+        store
+            .recent_messages(&scopes, Some((at(5), "m1", "chat-a")), 1)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+fn call_message(message_id: &str, minute: u32) -> MessageRecord {
+    MessageRecord {
+        sender_id: None,
+        sender_name: None,
+        body_html: String::new(),
+        call_event_json: Some(r#"{"phase":"Ended"}"#.to_owned()),
+        ..message("c", message_id, minute)
+    }
+}
+
+#[test]
+fn call_event_round_trips_and_is_not_indexed_or_unread() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_messages(&[call_message("call", 1), message("c", "text", 2)])
+        .unwrap();
+    let stored = store.messages("c", None, 10).unwrap();
+    assert_eq!(
+        stored[0].call_event_json.as_deref(),
+        Some(r#"{"phase":"Ended"}"#)
+    );
+    assert_eq!(stored[1].call_event_json, None);
+    assert_eq!(store.count_messages_after("c", None, "me").unwrap(), 1);
+    assert_eq!(
+        store
+            .first_message_after_from_others("c", None, "me")
+            .unwrap()
+            .as_deref(),
+        Some("text")
+    );
+}
+
+#[test]
+fn migration_to_v20_adds_the_call_event_column() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("old.sqlite3");
+    {
+        let store = Store::open(&path).unwrap();
+        store.upsert_messages(&[message("c", "old", 1)]).unwrap();
+        store
+            .upsert_chats(&[chat("c", "Chat", Some(at(1)))])
+            .unwrap();
+        store.set_sync_state("c", &SyncState::default()).unwrap();
+        store
+            .set_sync_state("channel", &SyncState::default())
+            .unwrap();
+        drop(store);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "ALTER TABLE team_layout DROP COLUMN owner; ALTER TABLE team_layout DROP COLUMN add_channel; ALTER TABLE team_layout DROP COLUMN add_private_channel; ALTER TABLE team_layout DROP COLUMN edit_channel; ALTER TABLE team_layout DROP COLUMN delete_channel; ALTER TABLE channel_layout DROP COLUMN substrate_group_id; ALTER TABLE channels DROP COLUMN read_until; ALTER TABLE messages DROP COLUMN call_event_json; ALTER TABLE messages DROP COLUMN importance; ALTER TABLE chats DROP COLUMN preview_at; PRAGMA user_version = 19",
+            )
+            .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), store::latest_version());
+    let old = store.messages("c", None, 10).unwrap();
+    assert_eq!(old[0].call_event_json, None);
+    assert!(store.sync_state("c").unwrap().is_none());
+    assert!(store.sync_state("channel").unwrap().is_some());
+    store.upsert_messages(&[call_message("call", 2)]).unwrap();
+    assert!(
+        store.messages("c", None, 10).unwrap()[1]
+            .call_event_json
+            .is_some()
+    );
+}
+
+#[test]
+fn migration_to_v21_refetches_chats_and_channels_for_recordings() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("old.sqlite3");
+    {
+        let store = Store::open(&path).unwrap();
+        store
+            .upsert_chats(&[chat("c", "Chat", Some(at(1)))])
+            .unwrap();
+        store
+            .upsert_teams(&[TeamRecord {
+                id: "team".to_owned(),
+                name: "Team".to_owned(),
+            }])
+            .unwrap();
+        store
+            .upsert_channels(&[ChannelRecord {
+                id: "channel".to_owned(),
+                team_id: "team".to_owned(),
+                name: "General".to_owned(),
+                membership_type: None,
+                last_message_at: None,
+                unread: false,
+            }])
+            .unwrap();
+        for conversation_id in ["c", "channel", "other"] {
+            store
+                .set_sync_state(conversation_id, &SyncState::default())
+                .unwrap();
+        }
+        drop(store);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("ALTER TABLE team_layout DROP COLUMN owner; ALTER TABLE team_layout DROP COLUMN add_channel; ALTER TABLE team_layout DROP COLUMN add_private_channel; ALTER TABLE team_layout DROP COLUMN edit_channel; ALTER TABLE team_layout DROP COLUMN delete_channel; ALTER TABLE channel_layout DROP COLUMN substrate_group_id; ALTER TABLE channels DROP COLUMN read_until; ALTER TABLE messages DROP COLUMN importance; ALTER TABLE chats DROP COLUMN preview_at; PRAGMA user_version = 20")
+            .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), store::latest_version());
+    assert!(store.sync_state("c").unwrap().is_none());
+    assert!(store.sync_state("channel").unwrap().is_none());
+    assert!(store.sync_state("other").unwrap().is_some());
+}
+
+fn horizon(member_id: &str, read_minute: u32, at_minute: Option<u32>) -> ReadHorizonRecord {
+    ReadHorizonRecord {
+        member_id: member_id.to_owned(),
+        read_until: at(read_minute),
+        read_at: at_minute.map(at),
+    }
+}
+
+#[test]
+fn migration_to_v22_adds_read_horizons_that_survive_a_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("old.sqlite3");
+    {
+        let store = Store::open(&path).unwrap();
+        store
+            .upsert_chats(&[chat("c", "Chat", Some(at(1)))])
+            .unwrap();
+        drop(store);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("ALTER TABLE team_layout DROP COLUMN owner; ALTER TABLE team_layout DROP COLUMN add_channel; ALTER TABLE team_layout DROP COLUMN add_private_channel; ALTER TABLE team_layout DROP COLUMN edit_channel; ALTER TABLE team_layout DROP COLUMN delete_channel; ALTER TABLE channel_layout DROP COLUMN substrate_group_id; ALTER TABLE channels DROP COLUMN read_until; DROP TABLE read_horizons; ALTER TABLE messages DROP COLUMN importance; ALTER TABLE chats DROP COLUMN preview_at; PRAGMA user_version = 21")
+            .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), store::latest_version());
+    assert!(store.read_horizons("c").unwrap().is_empty());
+    let horizons = [
+        horizon("8:orgid:ada", 3, Some(4)),
+        horizon("8:orgid:bob", 2, None),
+    ];
+    store.set_read_horizons("c", &horizons).unwrap();
+    drop(store);
+    let reopened = Store::open(&path).unwrap();
+    assert_eq!(reopened.read_horizons("c").unwrap(), horizons);
+}
+
+#[test]
+fn setting_read_horizons_replaces_the_conversation_only() {
+    let store = Store::open_in_memory().unwrap();
+    let first = [
+        horizon("8:orgid:ada", 3, None),
+        horizon("8:orgid:bob", 2, None),
+    ];
+    store.set_read_horizons("c", &first).unwrap();
+    store
+        .set_read_horizons("other", &[horizon("8:orgid:cy", 1, None)])
+        .unwrap();
+    let second = [horizon("8:orgid:ada", 5, Some(6))];
+    store.set_read_horizons("c", &second).unwrap();
+    assert_eq!(store.read_horizons("c").unwrap(), second);
+    assert_eq!(store.read_horizons("other").unwrap().len(), 1);
+}
+
+#[test]
+fn local_show_hide_and_channel_pin_writes_reach_the_sidebar() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_teams(&[TeamRecord {
+            id: "t1".to_owned(),
+            name: "Alpha".to_owned(),
+        }])
+        .unwrap();
+    let channel = |id: &str, name: &str| ChannelRecord {
+        id: id.to_owned(),
+        team_id: "t1".to_owned(),
+        name: name.to_owned(),
+        membership_type: None,
+        last_message_at: None,
+        unread: false,
+    };
+    store
+        .upsert_channels(&[channel("c1", "General"), channel("c2", "Random")])
+        .unwrap();
+    let team = || store.sidebar().unwrap().teams.remove(0);
+
+    store.set_channel_hidden("c2", true).unwrap();
+    store.set_team_hidden("t1", true).unwrap();
+    let hidden = team();
+    assert_eq!(hidden.hidden_channel_ids, vec!["c2".to_owned()]);
+    assert!(hidden.hidden);
+    assert_eq!(hidden.channels[0].name, "General");
+
+    store.set_channel_hidden("c2", false).unwrap();
+    store.set_team_hidden("t1", false).unwrap();
+    let shown = team();
+    assert!(shown.hidden_channel_ids.is_empty());
+    assert!(!shown.hidden);
+
+    store
+        .replace_pinned_channels(&["c2".to_owned(), "c1".to_owned()])
+        .unwrap();
+    assert_eq!(store.pinned_channel_ids().unwrap(), vec!["c2", "c1"]);
+}
+
+#[test]
+fn migration_to_v25_drops_copies_stored_under_a_float_id() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("old.sqlite3");
+    {
+        let store = Store::open(&path).unwrap();
+        store
+            .upsert_messages(&[
+                message("c", "1793871826192.0", 1),
+                message("c", "1793871826192", 1),
+            ])
+            .unwrap();
+        drop(store);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("ALTER TABLE team_layout DROP COLUMN owner; ALTER TABLE team_layout DROP COLUMN add_channel; ALTER TABLE team_layout DROP COLUMN add_private_channel; ALTER TABLE team_layout DROP COLUMN edit_channel; ALTER TABLE team_layout DROP COLUMN delete_channel; ALTER TABLE channel_layout DROP COLUMN substrate_group_id; ALTER TABLE channels DROP COLUMN read_until; ALTER TABLE chats DROP COLUMN preview_at; PRAGMA user_version = 24")
+            .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    let ids = ["1793871826192.0".to_owned(), "1793871826192".to_owned()];
+    let found = store.messages_by_id("c", &ids).unwrap();
+    assert_eq!(found.len(), 1);
+    assert!(found.contains_key("1793871826192"));
+}
+
+#[test]
+fn team_rights_come_back_with_the_sidebar() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_teams(&[TeamRecord {
+            id: "team".to_owned(),
+            name: "Team".to_owned(),
+        }])
+        .unwrap();
+    assert_eq!(
+        store.sidebar().unwrap().teams[0].rights,
+        TeamRights::default()
+    );
+    let rights = TeamRights {
+        owner: false,
+        add_channel: true,
+        add_private_channel: true,
+        edit_channel: false,
+        delete_channel: true,
+    };
+    store
+        .replace_team_layout(&[TeamLayoutRecord {
+            team_id: "team".to_owned(),
+            hidden: false,
+            rights,
+            channels: Vec::new(),
+        }])
+        .unwrap();
+    assert_eq!(store.sidebar().unwrap().teams[0].rights, rights);
+}
+
+#[test]
+fn migration_to_v29_names_departed_people_from_their_messages() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("old.sqlite3");
+    {
+        let store = Store::open(&path).unwrap();
+        store.upsert_chats(&[chat("c", "?", Some(at(1)))]).unwrap();
+        store
+            .upsert_chats(&[chat("gone", "?", Some(at(2)))])
+            .unwrap();
+        store.upsert_messages(&[message("c", "m1", 1)]).unwrap();
+        store.set_meta("me_user_id", "user-me").unwrap();
+        drop(store);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "UPDATE chats SET kind = 'oneOnOne', member_summary = '?';
+                 DELETE FROM chat_members;
+                 INSERT INTO chat_members VALUES ('c', 0, 'user-me', 'Me'), ('c', 1, 'user-ada', '?');
+                 INSERT INTO chat_members VALUES ('gone', 0, 'user-me', 'Me'), ('gone', 1, 'user-zed', '?');
+                 PRAGMA user_version = 28",
+            )
+            .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    let named = store.chat("c").unwrap().unwrap();
+    assert_eq!(named.title, "Ada Example");
+    assert_eq!(named.member_summary, "Ada Example");
+    assert_eq!(
+        store.chat("gone").unwrap().unwrap().title,
+        UNKNOWN_USER_NAME
+    );
+}
+
+#[test]
+fn a_chat_without_a_last_message_keeps_the_time_of_its_last_real_activity() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .upsert_chats(&[chat("meeting", "Review", Some(at(1)))])
+        .unwrap();
+    let left = MessageRecord {
+        call_event_json: Some(
+            r#"{"roster":{"change":"Left","member_ids":["user-bob"]}}"#.to_owned(),
+        ),
+        ..call_message("left", 40)
+    };
+    store
+        .upsert_messages(&[
+            MessageRecord {
+                conversation_id: "meeting".to_owned(),
+                ..call_message("ended", 10)
+            },
+            MessageRecord {
+                conversation_id: "meeting".to_owned(),
+                ..left
+            },
+        ])
+        .unwrap();
+    let mut bumped = chat("meeting", "Review", Some(at(40)));
+    bumped.without_last_message = true;
+    store.upsert_chats(&[bumped]).unwrap();
+    assert_eq!(
+        store.chat("meeting").unwrap().unwrap().last_message_at,
+        Some(at(10))
+    );
+
+    let mut never_used = chat("empty", "Planning", Some(at(3)));
+    never_used.without_last_message = true;
+    store.upsert_chats(&[never_used.clone()]).unwrap();
+    store.upsert_chats(&[never_used]).unwrap();
+    assert_eq!(
+        store.chat("empty").unwrap().unwrap().last_message_at,
+        Some(at(3))
+    );
+}

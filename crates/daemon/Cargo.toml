@@ -8,7 +8,12 @@ publish.workspace = true
 [dependencies]
 chatsvc.workspace = true
 session.workspace = true
+chrono.workspace = true
+percent-encoding.workspace = true
+store.workspace = true
 tern-auth.workspace = true
+tern-engine.workspace = true
+zbus.workspace = true
 tern-ipc.workspace = true
 tern-presence.workspace = true
 futures-util.workspace = true

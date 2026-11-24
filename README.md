@@ -5,12 +5,14 @@ It uses the undocumented services Teams itself uses, which can change at any tim
 organization may not allow.
 
 **Today:** a background service that keeps your Teams presence true to what you do at this
-computer, in any app, also while you still use Teams on the web.
+computer, in any app, also while you still use Teams on the web; keeps chats and channels in a
+local cache you can read and search offline; queues messages until they can be sent; and shows
+notifications you can answer. There is no window yet.
 
 | Program | What it does |
 |---|---|
 | `ternd` | The background service |
-| `tern-cli` | `login`, `logout`, `whoami`, `tokens`, `tail`, `status`, `sensors` |
+| `tern-cli` | `login`, `logout`, `whoami`, `chats`, `read`, `search`, `send`, `status`, `tokens`, `tail`, `sensors`, `probe-sync` |
 | `tern-login` | The sign-in window (WebKitGTK). It takes the redirect before the page loads; pasting that address from a browser is deliberately not supported, because that is how sign-in codes get phished |
 
 - Away after 5 minutes without keyboard or pointer input anywhere (Wayland `ext-idle-notify-v1`;
@@ -18,6 +20,11 @@ computer, in any app, also while you still use Teams on the web.
 - A status you set yourself in Teams always wins.
 - The refresh token lives in the desktop keyring; access tokens only in memory. Tokens are only
   sent to the service they were issued for.
+
+- The cache holds message text, in `~/.local/share/tern`, readable only by you. It is not encrypted
+  by itself; `logout` keeps it.
+
+To run a build beside the installed service: `TERN_INSTANCE=dev TERN_NO_PRESENCE=1 ternd`.
 
 ```sh
 cargo test --workspace

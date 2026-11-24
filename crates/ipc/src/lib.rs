@@ -17,6 +17,11 @@ pub enum Request {
     Status,
     /// The stored sign-in changed.
     Reload,
+    /// Queues a message; it is sent in the background.
+    Send {
+        conversation: String,
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +38,13 @@ pub struct Status {
     pub teams_shows: Option<String>,
     pub teams_read_secs_ago: Option<u64>,
     pub problem: Option<String>,
+    /// The chat list was read since the start.
+    pub synced: bool,
+    /// Conversations still to be read.
+    pub reading: usize,
+    /// Messages not sent yet.
+    pub unsent: usize,
+    pub sync_problem: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,7 +58,14 @@ pub enum Response {
 pub fn socket_path() -> io::Result<PathBuf> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set"))?;
-    Ok(PathBuf::from(runtime).join("tern").join("ternd.sock"))
+    // A development instance runs beside the installed one.
+    let folder = match std::env::var("TERN_INSTANCE") {
+        Ok(name) if name.bytes().all(|byte| byte.is_ascii_alphanumeric()) && !name.is_empty() => {
+            format!("tern-{name}")
+        }
+        _ => "tern".to_owned(),
+    };
+    Ok(PathBuf::from(runtime).join(folder).join("ternd.sock"))
 }
 
 /// Binds the socket. Fails when another daemon is answering on it.

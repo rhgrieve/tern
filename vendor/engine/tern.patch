@@ -1,12 +1,14 @@
 diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/error.rs vendor/engine/session/src/error.rs
 --- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/error.rs	2026-11-24 07:04:16.830396462 -0500
-+++ vendor/engine/session/src/error.rs	2026-11-24 07:06:21.009761832 -0500
-@@ -21,6 +21,10 @@
++++ vendor/engine/session/src/error.rs	2026-11-24 07:54:14.849353466 -0500
+@@ -21,6 +21,12 @@
      },
      #[error("browser protocol error: {0}")]
      Cdp(String),
 +    #[error("not available without the Teams web app: {0}")]
 +    PageOnly(String),
++    #[error("refused: {method} {url}")]
++    Refused { method: &'static str, url: String },
 +    #[error("no token for {resource} may be sent to {url}")]
 +    TokenHostRefused { resource: String, url: String },
      #[error("tab connection lost during a write ({0}); check whether it was sent before retrying")]
@@ -14,7 +16,7 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
  }
 diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/lib.rs vendor/engine/session/src/lib.rs
 --- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/lib.rs	2026-11-24 07:04:16.830396462 -0500
-+++ vendor/engine/session/src/lib.rs	2026-11-24 07:06:21.009692112 -0500
++++ vendor/engine/session/src/lib.rs	2026-11-24 07:54:14.849520402 -0500
 @@ -4,6 +4,7 @@
  mod http;
  mod native;
@@ -27,7 +29,7 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
  pub use events::{TabChannel, TabCommand, TabControl, TabEvent, TabEvents};
  pub use native::ensure_crypto_provider;
  pub use page_script::token_acquirer_script;
-+pub use provider::{TokenProvider, token_allowed};
++pub use provider::{Guard, TokenProvider, token_allowed};
  pub use request::{
      ApiResponse, AugloopExchange, AugloopStage, BodyToken, Method, Request, SignalrExchange,
  };
@@ -142,8 +144,8 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
              .expect("fetch.js contains the token marker");
 diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/provider.rs vendor/engine/session/src/provider.rs
 --- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/provider.rs	1969-12-31 19:00:00.000000000 -0500
-+++ vendor/engine/session/src/provider.rs	2026-11-24 07:37:57.554111807 -0500
-@@ -0,0 +1,213 @@
++++ vendor/engine/session/src/provider.rs	2026-11-24 07:54:14.848919996 -0500
+@@ -0,0 +1,258 @@
 +//! Tern patch: a session without a browser. Tokens come from a [`TokenProvider`], and a bearer
 +//! is only ever attached to a host that belongs to the token's audience.
 +
@@ -163,6 +165,25 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
 +        tenant: Option<&'a str>,
 +        force: bool,
 +    ) -> BoxFuture<'a, Result<String>>;
++}
++
++/// Decides whether a request may go out; see [`crate::Session::with_guard`].
++pub type Guard = std::sync::Arc<dyn Fn(&crate::Request) -> bool + Send + Sync>;
++
++/// The engine's fixed region in its Teams addresses.
++const ENGINE_REGION: &str = "emea";
++const REGIONAL: [&str; 3] = ["chatsvc", "csa", "mt"];
++
++/// The same address in the account's own region.
++pub(crate) fn in_region(url: &str, region: &str) -> Option<String> {
++    REGIONAL.iter().find_map(|service| {
++        let rest = url.strip_prefix(&format!(
++            "https://teams.cloud.microsoft/api/{service}/{ENGINE_REGION}/"
++        ))?;
++        Some(format!(
++            "https://teams.cloud.microsoft/api/{service}/{region}/{rest}"
++        ))
++    })
 +}
 +
 +/// Stands in for the browser: there are no tabs to open.
@@ -256,6 +277,32 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
 +    const GRAPH: &str = "https://graph.microsoft.com";
 +    const IC3: &str = "https://ic3.teams.office.com";
 +    const PRESENCE: &str = "https://presence.teams.microsoft.com";
++
++    #[test]
++    fn only_the_region_segment_changes() {
++        assert_eq!(
++            in_region("https://teams.cloud.microsoft/api/chatsvc/emea/v1/users/ME/x?q=/emea/", "amer").as_deref(),
++            Some("https://teams.cloud.microsoft/api/chatsvc/amer/v1/users/ME/x?q=/emea/")
++        );
++        for other in [
++            "https://teams.cloud.microsoft/api/authsvc/emea/v1",
++            "https://teams.cloud.microsoft/api/mt/de/x",
++            "https://evil.example/api/mt/emea/x",
++        ] {
++            assert_eq!(in_region(other, "amer"), None);
++        }
++    }
++
++    #[tokio::test]
++    async fn a_guard_stops_a_request_before_a_token_is_asked_for() {
++        use crate::{Method, Session, SessionConfig};
++        let session = Session::with_provider(std::sync::Arc::new(Never), SessionConfig::default())
++            .with_guard(std::sync::Arc::new(|request| request.method == Method::Get));
++        let sent = session
++            .request(Method::Post, "https://graph.microsoft.com/v1.0/x?y=1", &Scope::graph("User.Read"), None)
++            .await;
++        assert!(matches!(sent, Err(Error::Refused { url, .. }) if url == "https://graph.microsoft.com/v1.0/x"));
++    }
 +
 +    #[test]
 +    fn tokens_go_to_their_own_services() {
@@ -359,32 +406,36 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
 +}
 diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/session.rs vendor/engine/session/src/session.rs
 --- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/session.rs	2026-11-24 07:04:16.830396462 -0500
-+++ vendor/engine/session/src/session.rs	2026-11-24 07:06:21.016278189 -0500
++++ vendor/engine/session/src/session.rs	2026-11-24 07:54:14.849849842 -0500
 @@ -11,6 +11,7 @@
  use crate::error::{Error, Result};
  use crate::events::TabControl;
  use crate::native::NativeHttp;
-+use crate::provider::{NoBrowser, TokenProvider, page_only, token_allowed};
++use crate::provider::{Guard, NoBrowser, in_region, TokenProvider, page_only, token_allowed};
  use crate::request::{ApiResponse, Method, Outcome, Request, WireRequest, WireResult};
  use crate::scope::Scope;
  use crate::transport::{CdpTransport, Transport};
-@@ -75,6 +76,7 @@
+@@ -75,6 +76,9 @@
      force_refresh: Arc<AtomicBool>,
      native: Option<Arc<NativeHttp>>,
      tenant: Option<Arc<str>>,
 +    pub(crate) provider: Option<Arc<dyn TokenProvider>>,
++    guard: Option<Guard>,
++    region: Option<Arc<str>>,
  }
  
  impl Session {
-@@ -94,6 +96,7 @@
+@@ -94,6 +98,9 @@
          Ok(Session {
              native: native_http(&config),
              tenant: None,
 +            provider: None,
++            guard: None,
++            region: None,
              transport,
              config,
              tabs: Arc::new(
-@@ -106,6 +109,44 @@
+@@ -106,6 +113,62 @@
          })
      }
  
@@ -398,6 +449,8 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
 +            native: native_http(&config),
 +            tenant: None,
 +            provider: Some(provider),
++            guard: None,
++            region: None,
 +            transport: Arc::new(NoBrowser),
 +            config,
 +            tabs: Arc::new(
@@ -408,6 +461,22 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
 +            ),
 +            force_refresh: Arc::new(AtomicBool::new(false)),
 +        }
++    }
++
++    /// Refuses every request `guard` answers `false` for.
++    pub fn with_guard(mut self, guard: Guard) -> Self {
++        self.guard = Some(guard);
++        self
++    }
++
++    /// The account's region, for the Teams addresses that name one.
++    pub fn with_region(mut self, region: &str) -> Self {
++        self.region = region
++            .bytes()
++            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
++            .then(|| region.into())
++            .filter(|region: &Arc<str>| !region.is_empty());
++        self
 +    }
 +
 +    /// An access token for `scope`, from the provider or from the signed-in page.
@@ -429,7 +498,7 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
      /// The same browser session with tokens for `tenant_id`, e.g. a tenant the account is a guest in.
      /// Tokens are held apart from the home tenant's, so both can run side by side.
      pub fn in_tenant(&self, tenant_id: &str) -> Session {
-@@ -167,9 +208,11 @@
+@@ -167,9 +230,11 @@
                  // A CAE-revoked token stays unexpired in the app cache, so only a refresh-token grant replaces it.
                  self.force_refresh.store(true, Ordering::SeqCst);
                  forced_here = true;
@@ -444,7 +513,7 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
              }
              let mut retry = Vec::new();
              for (&index, answer) in pending.iter().zip(answers) {
-@@ -221,6 +264,9 @@
+@@ -221,6 +286,9 @@
          requests: &[&Request],
          scope: &Scope,
      ) -> Result<Vec<ApiResponse>> {
@@ -454,7 +523,7 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
          if let Some(native) = &self.native
              && let Some(results) = native
                  .run(
-@@ -271,6 +317,33 @@
+@@ -271,6 +339,52 @@
          })
      }
  
@@ -467,7 +536,26 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
 +            .native
 +            .as_ref()
 +            .ok_or_else(|| page_only("no HTTP client"))?;
-+        for request in requests {
++        let regional: Vec<Request> = requests
++            .iter()
++            .map(|&request| {
++                let mut request = request.clone();
++                if let Some(region) = &self.region
++                    && let Some(url) = in_region(&request.url, region)
++                {
++                    request.url = url;
++                }
++                request
++            })
++            .collect();
++        let requests: Vec<&Request> = regional.iter().collect();
++        for request in &requests {
++            if self.guard.as_ref().is_some_and(|allows| !allows(request)) {
++                return Err(Error::Refused {
++                    method: request.method.as_str(),
++                    url: without_query(&request.url).to_owned(),
++                });
++            }
 +            if !request.anonymous && !token_allowed(&scope.resource, &request.url) {
 +                return Err(Error::TokenHostRefused {
 +                    resource: scope.resource.to_string(),
@@ -477,7 +565,7 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
 +        }
 +        let force = self.force_refresh.load(Ordering::SeqCst);
 +        native
-+            .run_checked(self, requests, scope, force)
++            .run_checked(self, &requests, scope, force)
 +            .await?
 +            .ok_or_else(|| {
 +                let url = requests.first().map_or("", |request| request.url.as_str());
@@ -488,7 +576,7 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
      async fn run_in_any_tab(
          &self,
          requests: &[&Request],
-@@ -367,6 +440,10 @@
+@@ -367,6 +481,10 @@
      }
  }
  
@@ -499,6 +587,120 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
  pub struct TabHold {
      transport: Arc<dyn Transport>,
      app: App,
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/conversations.rs vendor/engine/chatsvc/src/conversations.rs
+--- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/conversations.rs	2026-11-24 07:04:16.812335646 -0500
++++ vendor/engine/chatsvc/src/conversations.rs	2026-11-24 08:11:38.936954137 -0500
+@@ -12,6 +12,7 @@
+ 
+ const PAGE_SIZE: usize = 200;
+ const MAX_PAGES: usize = 100;
++const RECENT_PAGES: usize = 2;
+ const ALERTS_OFF: &str = "false";
+ const CLEAR_HISTORY_PROPERTY: &str = "clearHistoryTime";
+ const HIDDEN_TIME_PROPERTY: &str = "unpinnedTime";
+@@ -68,26 +69,36 @@
+     }
+ 
+     pub async fn conversation_states(&self) -> Result<Vec<ConversationState>> {
++        Ok(self.states_in_pages(MAX_PAGES).await?.0)
++    }
++
++    /// Tern patch: the most recently active conversations only; the service lists them first.
++    /// `true` when that was all of them.
++    pub async fn recent_conversation_states(&self) -> Result<(Vec<ConversationState>, bool)> {
++        self.states_in_pages(RECENT_PAGES).await
++    }
++
++    async fn states_in_pages(&self, max_pages: usize) -> Result<(Vec<ConversationState>, bool)> {
+         let url = format!(
+             "{}?view=msnp24Equivalent&pageSize={PAGE_SIZE}",
+             self.base_url
+         );
+         let mut states = Vec::new();
+         let mut next_url = Some(url);
+-        for _ in 0..MAX_PAGES {
++        for _ in 0..max_pages {
+             let Some(url) = next_url.take() else {
+-                break;
++                return Ok((states, true));
+             };
+             let answer = self.transport.send(Request::get(&url)).await?;
+             ensure_success(&answer)?;
+             let page = states_in_page(&answer.body)?;
+             if page.is_empty() {
+-                break;
++                return Ok((states, true));
+             }
+             states.extend(page);
+             next_url = backward_link(&answer.body).filter(|link| *link != url);
+         }
+-        Ok(states)
++        Ok((states, next_url.is_none()))
+     }
+ 
+     pub async fn set_alerts(&self, conversation_id: &str, enabled: bool) -> Result<()> {
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/lib.rs vendor/engine/chatsvc/src/lib.rs
+--- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/lib.rs	2026-11-24 07:04:16.814467261 -0500
++++ vendor/engine/chatsvc/src/lib.rs	2026-11-24 07:57:01.968048875 -0500
+@@ -111,7 +111,7 @@
+     HistoryShare, INVALID_TOPIC_CHARACTER, MAX_HISTORY_DAYS, MAX_TOPIC_LENGTH, ThreadMembers,
+     TopicProblem, topic_problem,
+ };
+-pub use messages::{ConversationRef, Messages};
++pub use messages::{ConversationRef, Messages, new_client_message_id, with_client_message_id};
+ pub use pins::{
+     ChannelLayout, ChannelTab, Folder, FolderKind, Folders, PinnedChannels, PinnedChats,
+     PinnedMessage, Pins, TeamLayout, TeamRights,
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/messages.rs vendor/engine/chatsvc/src/messages.rs
+--- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/messages.rs	2026-11-24 07:04:16.814467261 -0500
++++ vendor/engine/chatsvc/src/messages.rs	2026-11-24 07:57:01.996077585 -0500
+@@ -336,9 +336,19 @@
+     })
+ }
+ 
++tokio::task_local! {
++    static CLIENT_MESSAGE_ID: String;
++}
++
++/// Tern patch: messages posted inside `send` carry `id`, so every try of one queued message is the
++/// same message to the service.
++pub async fn with_client_message_id<F: Future>(id: String, send: F) -> F::Output {
++    CLIENT_MESSAGE_ID.scope(id, send).await
++}
++
+ fn rich_text_body(html: &str, display_name: &str, properties: &Value) -> Value {
+     json!({
+-        "clientmessageid": new_client_message_id(),
++        "clientmessageid": CLIENT_MESSAGE_ID.try_with(Clone::clone).unwrap_or_else(|_| new_client_message_id()),
+         "content": html,
+         "messagetype": "RichText/Html",
+         "contenttype": "text",
+@@ -351,7 +361,7 @@
+ const CLIENT_MESSAGE_ID_LENGTH: usize = 19;
+ 
+ /// Teams web: two random `uint32` as decimal strings, joined and cut to 19 characters.
+-pub(crate) fn new_client_message_id() -> String {
++pub fn new_client_message_id() -> String {
+     let random = uuid::Uuid::new_v4().as_u128();
+     let first = (random >> 96) as u32;
+     let second = (random >> 64) as u32;
+@@ -440,3 +450,16 @@
+         assert!(matches!(ensure_success(&other), Err(Error::Session(_))));
+     }
+ }
++
++#[cfg(test)]
++mod client_id_tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn a_queued_message_keeps_its_id_and_others_get_their_own() {
++        let body = || rich_text_body("<p>x</p>", "Me", &json!({}))["clientmessageid"].clone();
++        let (first, second) = with_client_message_id("42".into(), async { (body(), body()) }).await;
++        assert_eq!((first, second), (json!("42"), json!("42")));
++        assert_ne!(body(), body());
++    }
++}
 diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/presence.rs vendor/engine/chatsvc/src/presence.rs
 --- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/presence.rs	2026-11-24 07:04:16.815508159 -0500
 +++ vendor/engine/chatsvc/src/presence.rs	2026-11-24 07:06:29.035276028 -0500
@@ -632,3 +834,142 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
      }
  
      pub(super) async fn run(mut self, mut stop: oneshot::Receiver<oneshot::Sender<()>>) {
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/core/src/engine.rs vendor/engine/core/src/engine.rs
+--- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/core/src/engine.rs	2026-11-24 07:04:16.821335647 -0500
++++ vendor/engine/core/src/engine.rs	2026-11-24 08:11:07.555885851 -0500
+@@ -104,6 +104,12 @@
+     pub display_name: String,
+ }
+ 
++#[derive(Default)]
++pub(crate) struct AllStates {
++    pub asked: bool,
++    pub read_at: Option<DateTime<Utc>>,
++}
++
+ pub(crate) enum Conversation {
+     Chat,
+     Channel { team_id: String },
+@@ -134,6 +140,8 @@
+     pub(crate) links_backfilled: Mutex<HashSet<String>>,
+     pub(crate) forwards_healed: Mutex<HashSet<String>>,
+     pub(crate) chat_states: Mutex<HashMap<String, ConversationState>>,
++    /// Tern patch: when all conversation states were last read, and whether any were.
++    pub(crate) all_states: Mutex<AllStates>,
+     pub(crate) app_channel_horizon_ms: Mutex<i64>,
+     pub(crate) activity: Mutex<crate::activity_sync::ActivityState>,
+     pub(crate) chat_paging: Mutex<ChatPaging>,
+@@ -173,6 +181,7 @@
+             links_backfilled: Mutex::new(HashSet::new()),
+             forwards_healed: Mutex::new(HashSet::new()),
+             chat_states: Mutex::new(HashMap::new()),
++            all_states: Mutex::default(),
+             app_channel_horizon_ms: Mutex::new(0),
+             activity: Mutex::new(crate::activity_sync::ActivityState::default()),
+             chat_paging,
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/core/src/remote.rs vendor/engine/core/src/remote.rs
+--- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/core/src/remote.rs	2026-11-24 07:04:16.825335648 -0500
++++ vendor/engine/core/src/remote.rs	2026-11-24 08:11:38.937798081 -0500
+@@ -150,6 +150,10 @@
+         share: HistoryShare,
+     ) -> Result<()>;
+     async fn chat_states(&self) -> Result<Vec<ConversationState>>;
++    /// Tern patch: the recently active ones, and whether that was all.
++    async fn recent_chat_states(&self) -> Result<(Vec<ConversationState>, bool)> {
++        Ok((self.chat_states().await?, true))
++    }
+     async fn clear_chat_history(&self, _chat_id: &str, _cleared_until_ms: i64) -> Result<()> {
+         Err(Error::Unsupported("removing chat history"))
+     }
+@@ -860,6 +864,12 @@
+             .await?)
+     }
+ 
++    async fn recent_chat_states(&self) -> Result<(Vec<ConversationState>, bool)> {
++        Ok(Conversations::new(self.session())
++            .recent_conversation_states()
++            .await?)
++    }
++
+     async fn chat_states(&self) -> Result<Vec<ConversationState>> {
+         Ok(Conversations::new(self.session())
+             .conversation_states()
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/core/src/sidebar_sync.rs vendor/engine/core/src/sidebar_sync.rs
+--- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/core/src/sidebar_sync.rs	2026-11-24 07:04:16.825335648 -0500
++++ vendor/engine/core/src/sidebar_sync.rs	2026-11-24 08:11:38.938634410 -0500
+@@ -119,14 +119,29 @@
+         Ok(refresh)
+     }
+ 
++    /// Tern patch: an account can have thousands of conversations, so all of them are read hourly
++    /// and only the recent ones in between and at the start.
+     async fn refresh_chat_states(&self) -> Option<Vec<ConversationState>> {
+-        match self.remote.chat_states().await {
+-            Ok(states) => {
+-                *self.chat_states.lock().unwrap() = states
+-                    .iter()
+-                    .map(|state| (state.id.clone(), state.clone()))
+-                    .collect();
+-                Some(states)
++        let all = {
++            let mut known = self.all_states.lock().unwrap();
++            let first = !std::mem::replace(&mut known.asked, true);
++            !first && is_due(known.read_at, Duration::hours(1))
++        };
++        let answer = if all {
++            self.remote.chat_states().await.map(|states| (states, true))
++        } else {
++            self.remote.recent_chat_states().await
++        };
++        match answer {
++            Ok((states, all)) => {
++                let fresh = states.into_iter().map(|state| (state.id.clone(), state));
++                let mut known = self.chat_states.lock().unwrap();
++                if all {
++                    known.clear();
++                    self.all_states.lock().unwrap().read_at = Some(Utc::now());
++                }
++                known.extend(fresh);
++                Some(known.values().cloned().collect())
+             }
+             Err(error) => {
+                 self.report(format!("cannot refresh muted chats: {error}"));
+@@ -200,6 +215,10 @@
+         my_user_id: &str,
+         app_horizon_ms: i64,
+     ) {
++        // Counts replace all others, so they need every channel.
++        if self.all_states.lock().unwrap().read_at.is_none() {
++            return;
++        }
+         let (Some(states), Ok(mentions)) = (
+             states,
+             mentions.inspect_err(|error| {
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/store/src/store.rs vendor/engine/store/src/store.rs
+--- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/store/src/store.rs	2026-11-24 07:04:16.832335649 -0500
++++ vendor/engine/store/src/store.rs	2026-11-24 07:54:14.850233903 -0500
+@@ -56,6 +56,24 @@
+         Self::from_connection(connection)
+     }
+ 
++    /// Tern patch: for readers beside the daemon, which is the only writer. The schema must match.
++    pub fn open_read_only(path: &Path) -> Result<Self> {
++        let connection = Connection::open_with_flags(
++            path,
++            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
++        )?;
++        connection.busy_timeout(Duration::from_secs(2))?;
++        connection.pragma_update(None, "query_only", "ON")?;
++        let found: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
++        let supported = migrations::latest_version();
++        if found != supported {
++            return Err(Error::SchemaTooNew { found, supported });
++        }
++        Ok(Store {
++            connection: Mutex::new(connection),
++        })
++    }
++
+     pub fn open_in_memory() -> Result<Self> {
+         Self::from_connection(Connection::open_in_memory()?)
+     }

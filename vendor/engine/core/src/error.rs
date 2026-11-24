@@ -1,0 +1,46 @@
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Graph(#[from] graph::Error),
+    #[error(transparent)]
+    Store(#[from] store::Error),
+    #[error("cannot write the file: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("folder service: {0}")]
+    Folders(String),
+    #[error("unknown conversation {0}")]
+    UnknownConversation(String),
+    #[error("GIFs are disabled by the organization")]
+    GifsDisabled,
+    #[error("{0} is not supported yet")]
+    Unsupported(&'static str),
+    #[error("banner image: {0}")]
+    BannerImage(&'static str),
+    /// The post is out; only its banner card could not be set.
+    #[error("posted without the banner")]
+    PostedWithoutBanner,
+}
+
+impl From<chatsvc::Error> for Error {
+    fn from(error: chatsvc::Error) -> Self {
+        match error {
+            chatsvc::Error::Session(inner) => Error::Graph(graph::Error::Session(inner)),
+            chatsvc::Error::GifsDisabled => Error::GifsDisabled,
+            chatsvc::Error::AccessDenied => Error::Graph(graph::Error::NotAMember),
+            other => Error::Folders(other.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn access_denied_is_not_a_member() {
+        let error = Error::from(chatsvc::Error::AccessDenied);
+        assert!(matches!(error, Error::Graph(graph::Error::NotAMember)));
+    }
+}

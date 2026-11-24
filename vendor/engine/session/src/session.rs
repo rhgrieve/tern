@@ -11,7 +11,7 @@ use crate::app::App;
 use crate::error::{Error, Result};
 use crate::events::TabControl;
 use crate::native::NativeHttp;
-use crate::provider::{NoBrowser, TokenProvider, page_only, token_allowed};
+use crate::provider::{Guard, NoBrowser, in_region, TokenProvider, page_only, token_allowed};
 use crate::request::{ApiResponse, Method, Outcome, Request, WireRequest, WireResult};
 use crate::scope::Scope;
 use crate::transport::{CdpTransport, Transport};
@@ -77,6 +77,8 @@ pub struct Session {
     native: Option<Arc<NativeHttp>>,
     tenant: Option<Arc<str>>,
     pub(crate) provider: Option<Arc<dyn TokenProvider>>,
+    guard: Option<Guard>,
+    region: Option<Arc<str>>,
 }
 
 impl Session {
@@ -97,6 +99,8 @@ impl Session {
             native: native_http(&config),
             tenant: None,
             provider: None,
+            guard: None,
+            region: None,
             transport,
             config,
             tabs: Arc::new(
@@ -119,6 +123,8 @@ impl Session {
             native: native_http(&config),
             tenant: None,
             provider: Some(provider),
+            guard: None,
+            region: None,
             transport: Arc::new(NoBrowser),
             config,
             tabs: Arc::new(
@@ -129,6 +135,22 @@ impl Session {
             ),
             force_refresh: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Refuses every request `guard` answers `false` for.
+    pub fn with_guard(mut self, guard: Guard) -> Self {
+        self.guard = Some(guard);
+        self
+    }
+
+    /// The account's region, for the Teams addresses that name one.
+    pub fn with_region(mut self, region: &str) -> Self {
+        self.region = region
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            .then(|| region.into())
+            .filter(|region: &Arc<str>| !region.is_empty());
+        self
     }
 
     /// An access token for `scope`, from the provider or from the signed-in page.
@@ -326,7 +348,26 @@ impl Session {
             .native
             .as_ref()
             .ok_or_else(|| page_only("no HTTP client"))?;
-        for request in requests {
+        let regional: Vec<Request> = requests
+            .iter()
+            .map(|&request| {
+                let mut request = request.clone();
+                if let Some(region) = &self.region
+                    && let Some(url) = in_region(&request.url, region)
+                {
+                    request.url = url;
+                }
+                request
+            })
+            .collect();
+        let requests: Vec<&Request> = regional.iter().collect();
+        for request in &requests {
+            if self.guard.as_ref().is_some_and(|allows| !allows(request)) {
+                return Err(Error::Refused {
+                    method: request.method.as_str(),
+                    url: without_query(&request.url).to_owned(),
+                });
+            }
             if !request.anonymous && !token_allowed(&scope.resource, &request.url) {
                 return Err(Error::TokenHostRefused {
                     resource: scope.resource.to_string(),
@@ -336,7 +377,7 @@ impl Session {
         }
         let force = self.force_refresh.load(Ordering::SeqCst);
         native
-            .run_checked(self, requests, scope, force)
+            .run_checked(self, &requests, scope, force)
             .await?
             .ok_or_else(|| {
                 let url = requests.first().map_or("", |request| request.url.as_str());

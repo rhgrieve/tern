@@ -111,7 +111,7 @@ pub use members::{
     HistoryShare, INVALID_TOPIC_CHARACTER, MAX_HISTORY_DAYS, MAX_TOPIC_LENGTH, ThreadMembers,
     TopicProblem, topic_problem,
 };
-pub use messages::{ConversationRef, Messages};
+pub use messages::{ConversationRef, Messages, new_client_message_id, with_client_message_id};
 pub use pins::{
     ChannelLayout, ChannelTab, Folder, FolderKind, Folders, PinnedChannels, PinnedChats,
     PinnedMessage, Pins, TeamLayout, TeamRights,

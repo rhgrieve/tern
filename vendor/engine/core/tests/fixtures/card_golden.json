@@ -1,0 +1,26 @@
+[
+ {
+  "content": "{\"type\": \"AdaptiveCard\", \"body\": [{\"type\": \"TextBlock\", \"text\": \"Deploy finished\"}, {\"type\": \"FactSet\", \"facts\": [{\"title\": \"Env\", \"value\": \"prod\"}, {\"title\": \"Build\", \"value\": \"42\"}]}]}",
+  "expected": "Deploy finished\nEnv: prod\nBuild: 42"
+ },
+ {
+  "content": "{\"body\": [{\"type\": \"Container\", \"items\": [{\"type\": \"TextBlock\", \"text\": \"nested\"}, {\"type\": \"TextBlock\", \"text\": \"  \"}]}, {\"type\": \"ColumnSet\", \"columns\": [{\"items\": [{\"type\": \"TextBlock\", \"text\": \"c1\"}]}, {\"items\": [{\"type\": \"TextBlock\", \"text\": \"c2\"}]}]}]}",
+  "expected": "nested\nc1\nc2"
+ },
+ {
+  "content": "{\"body\": []}",
+  "expected": null
+ },
+ {
+  "content": "{\"text\": 5, \"value\": \"v\", \"title\": \"t\"}",
+  "expected": null
+ },
+ {
+  "content": "{\"body\": [{\"type\": \"TextBlock\", \"text\": \"[**Space**](https://example.com/s) edited\"}, {\"type\": \"ActionSet\", \"actions\": [{\"type\": \"Action.OpenUrl\", \"title\": \"Open\", \"url\": \"https://example.com\"}]}]}",
+  "expected": "Space edited"
+ },
+ {
+  "content": "not json",
+  "expected": null
+ }
+]

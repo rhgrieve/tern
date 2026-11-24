@@ -1,0 +1,475 @@
+use std::collections::HashMap;
+
+use chrono::{DateTime, Utc};
+
+pub const BOT_MRI_PREFIX: &str = "28:";
+pub const UNKNOWN_USER_NAME: &str = "Unknown User";
+
+pub fn is_bot_id(user_id: &str) -> bool {
+    user_id.starts_with(BOT_MRI_PREFIX)
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MemberRecord {
+    pub user_id: Option<String>,
+    pub display_name: String,
+}
+
+impl MemberRecord {
+    pub fn is_bot(&self) -> bool {
+        self.user_id.as_deref().is_some_and(is_bot_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ChatRecord {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub member_summary: String,
+    pub last_message_at: Option<DateTime<Utc>>,
+    pub preview_at: Option<DateTime<Utc>>,
+    pub last_read_at: Option<DateTime<Utc>>,
+    pub unread: bool,
+    pub muted: bool,
+    pub members: Vec<MemberRecord>,
+    pub last_message_preview: Option<String>,
+    pub last_message_sender_id: Option<String>,
+    pub last_message_sender_name: Option<String>,
+    pub last_message_deleted: bool,
+    pub last_event_system: bool,
+    pub keeps_stored_preview: bool,
+    pub without_last_message: bool,
+}
+
+impl ChatRecord {
+    pub fn display_title(&self) -> String {
+        if !self.title.trim().is_empty() {
+            self.title.clone()
+        } else if !self.member_summary.trim().is_empty() {
+            self.member_summary.clone()
+        } else {
+            "Chat".to_owned()
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AvatarRecord {
+    pub user_id: String,
+    pub bytes: Option<Vec<u8>>,
+    pub content_type: String,
+    pub fetched_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FolderRecord {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub expanded: bool,
+    pub conversation_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TeamRecord {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChannelReadState {
+    pub channel_id: String,
+    pub unread: bool,
+    pub last_message_at: Option<DateTime<Utc>>,
+    pub read_until: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChannelRecord {
+    pub id: String,
+    pub team_id: String,
+    pub name: String,
+    pub membership_type: Option<String>,
+    pub last_message_at: Option<DateTime<Utc>>,
+    pub unread: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MessageRecord {
+    pub conversation_id: String,
+    pub message_id: String,
+    pub reply_to_id: Option<String>,
+    pub sender_id: Option<String>,
+    pub sender_name: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub edited_at: Option<DateTime<Utc>>,
+    pub deleted: bool,
+    pub body_html: String,
+    pub attachments_json: String,
+    pub reactions_json: String,
+    pub mentions_json: String,
+    pub sender_application_id: Option<String>,
+    pub links_json: String,
+    pub subject: Option<String>,
+    pub call_event_json: Option<String>,
+    pub importance: MessageImportance,
+}
+
+/// Graph `chatMessage.importance`; chatsvc keeps the same value in the message property `importance`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum MessageImportance {
+    #[default]
+    Normal,
+    High,
+    Urgent,
+}
+
+impl MessageImportance {
+    pub fn from_graph(value: &str) -> MessageImportance {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "high" => MessageImportance::High,
+            "urgent" => MessageImportance::Urgent,
+            _ => MessageImportance::Normal,
+        }
+    }
+
+    pub fn graph_value(self) -> &'static str {
+        match self {
+            MessageImportance::Normal => "normal",
+            MessageImportance::High => "high",
+            MessageImportance::Urgent => "urgent",
+        }
+    }
+
+    pub fn stored(self) -> Option<&'static str> {
+        (self != MessageImportance::Normal).then(|| self.graph_value())
+    }
+
+    pub fn from_stored(value: Option<&str>) -> MessageImportance {
+        value.map_or(MessageImportance::Normal, MessageImportance::from_graph)
+    }
+
+    pub fn is_marked(self) -> bool {
+        self != MessageImportance::Normal
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecentScope {
+    pub conversation_id: String,
+    pub after: DateTime<Utc>,
+}
+
+/// The last read position of one conversation member, as chatsvc reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadHorizonRecord {
+    pub member_id: String,
+    pub read_until: DateTime<Utc>,
+    pub read_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SyncState {
+    pub newest_seen: Option<DateTime<Utc>>,
+    pub oldest_loaded: Option<DateTime<Utc>>,
+    pub has_more: bool,
+    pub older_cursor: Option<String>,
+    pub delta_link: Option<String>,
+}
+
+impl Default for SyncState {
+    fn default() -> Self {
+        SyncState {
+            newest_seen: None,
+            oldest_loaded: None,
+            has_more: true,
+            older_cursor: None,
+            delta_link: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SidebarTeam {
+    pub team: TeamRecord,
+    pub channels: Vec<ChannelRecord>,
+    pub hidden: bool,
+    pub rights: TeamRights,
+    pub hidden_channel_ids: Vec<String>,
+    pub notifications: HashMap<String, ChannelNotifications>,
+    pub mentions: HashMap<String, ChannelMentions>,
+}
+
+impl SidebarTeam {
+    pub fn channel_notifications(&self, channel_id: &str) -> ChannelNotifications {
+        self.notifications
+            .get(channel_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn channel_mentions(&self, channel_id: &str) -> ChannelMentions {
+        self.mentions.get(channel_id).copied().unwrap_or_default()
+    }
+}
+
+/// Unread @mentions of one channel: personal (person or tag), @channel, @team.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChannelMentions {
+    pub personal: u32,
+    pub channel: u32,
+    pub team: u32,
+}
+
+impl ChannelMentions {
+    pub fn is_empty(&self) -> bool {
+        *self == ChannelMentions::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChannelNotificationLevel {
+    BannerAndFeed,
+    #[default]
+    Feed,
+    Off,
+}
+
+impl ChannelNotificationLevel {
+    pub fn key(self) -> &'static str {
+        match self {
+            ChannelNotificationLevel::BannerAndFeed => "banner",
+            ChannelNotificationLevel::Feed => "feed",
+            ChannelNotificationLevel::Off => "off",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Self {
+        match key {
+            "banner" => ChannelNotificationLevel::BannerAndFeed,
+            "off" => ChannelNotificationLevel::Off,
+            _ => ChannelNotificationLevel::Feed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChannelNotifications {
+    pub level: ChannelNotificationLevel,
+    pub include_replies: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelTabRecord {
+    pub tab_id: String,
+    pub name: String,
+    pub definition_id: String,
+    pub open_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelLayoutRecord {
+    pub channel_id: String,
+    pub general: bool,
+    pub hidden: bool,
+    pub tabs: Vec<ChannelTabRecord>,
+    pub notifications: ChannelNotifications,
+    pub substrate_group_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TeamRights {
+    pub owner: bool,
+    pub add_channel: bool,
+    pub add_private_channel: bool,
+    pub edit_channel: bool,
+    pub delete_channel: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamLayoutRecord {
+    pub team_id: String,
+    pub hidden: bool,
+    pub rights: TeamRights,
+    pub channels: Vec<ChannelLayoutRecord>,
+}
+
+/// Everything the sidebar renders: chats by last message (newest first), teams in the user's Teams order (alphabetical without one), General first, then channels by name.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Sidebar {
+    pub chats: Vec<ChatRecord>,
+    pub teams: Vec<SidebarTeam>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChatPreview<'a> {
+    pub text: Option<&'a str>,
+    pub sender_id: Option<&'a str>,
+    pub sender_name: Option<&'a str>,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageRecord {
+    pub key: String,
+    pub bytes: Vec<u8>,
+    pub content_type: String,
+    pub fetched_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHit {
+    pub conversation_id: String,
+    pub message_id: String,
+    pub sender_name: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub snippet: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationHit {
+    pub conversation_id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActivityRecord {
+    pub id: i64,
+    pub conversation_id: String,
+    pub kind: String,
+    pub message_id: String,
+    pub actors_json: String,
+    pub preview: String,
+    pub glyphs: String,
+    pub count: u32,
+    pub updated_at: DateTime<Utc>,
+    pub read: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentImage {
+    pub name: String,
+    pub format: String,
+    pub bytes: Vec<u8>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboxTarget {
+    Flat,
+    Post,
+    Thread,
+}
+
+impl OutboxTarget {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            OutboxTarget::Flat => "flat",
+            OutboxTarget::Post => "post",
+            OutboxTarget::Thread => "thread",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "flat" => Some(OutboxTarget::Flat),
+            "post" => Some(OutboxTarget::Post),
+            "thread" => Some(OutboxTarget::Thread),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboxState {
+    Sending,
+    Failed,
+}
+
+impl OutboxState {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            OutboxState::Sending => "sending",
+            OutboxState::Failed => "failed",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "sending" => Some(OutboxState::Sending),
+            "failed" => Some(OutboxState::Failed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxRecord {
+    pub id: String,
+    pub conversation_id: String,
+    pub target: OutboxTarget,
+    pub thread_root_id: Option<String>,
+    pub payload: String,
+    pub images: Vec<AttachmentImage>,
+    pub state: OutboxState,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftRecord {
+    pub conversation_id: String,
+    pub payload: String,
+    pub preview: String,
+    pub images: Vec<AttachmentImage>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentProposalMention {
+    pub user_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentProposalRecord {
+    pub id: String,
+    pub conversation_id: String,
+    pub reply_to_message_id: Option<String>,
+    pub text: String,
+    pub mentions: Vec<AgentProposalMention>,
+    pub images: Vec<AttachmentImage>,
+    pub agent: Option<String>,
+    pub session_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub state: String,
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentMeetingRecord {
+    pub id: String,
+    pub subject: String,
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    pub attendees: Vec<String>,
+    pub description: String,
+    pub agent: Option<String>,
+    pub session_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentReactionRecord {
+    pub id: String,
+    pub conversation_id: String,
+    pub message_id: String,
+    pub emoji: String,
+    pub agent: Option<String>,
+    pub session_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub state: String,
+    pub resolved_at: Option<DateTime<Utc>>,
+}

@@ -12,6 +12,7 @@ use crate::read_horizon::{self, ReadHorizon};
 
 const PAGE_SIZE: usize = 200;
 const MAX_PAGES: usize = 100;
+const RECENT_PAGES: usize = 2;
 const ALERTS_OFF: &str = "false";
 const CLEAR_HISTORY_PROPERTY: &str = "clearHistoryTime";
 const HIDDEN_TIME_PROPERTY: &str = "unpinnedTime";
@@ -68,26 +69,36 @@ impl<T: MessageTransport> Conversations<T> {
     }
 
     pub async fn conversation_states(&self) -> Result<Vec<ConversationState>> {
+        Ok(self.states_in_pages(MAX_PAGES).await?.0)
+    }
+
+    /// Tern patch: the most recently active conversations only; the service lists them first.
+    /// `true` when that was all of them.
+    pub async fn recent_conversation_states(&self) -> Result<(Vec<ConversationState>, bool)> {
+        self.states_in_pages(RECENT_PAGES).await
+    }
+
+    async fn states_in_pages(&self, max_pages: usize) -> Result<(Vec<ConversationState>, bool)> {
         let url = format!(
             "{}?view=msnp24Equivalent&pageSize={PAGE_SIZE}",
             self.base_url
         );
         let mut states = Vec::new();
         let mut next_url = Some(url);
-        for _ in 0..MAX_PAGES {
+        for _ in 0..max_pages {
             let Some(url) = next_url.take() else {
-                break;
+                return Ok((states, true));
             };
             let answer = self.transport.send(Request::get(&url)).await?;
             ensure_success(&answer)?;
             let page = states_in_page(&answer.body)?;
             if page.is_empty() {
-                break;
+                return Ok((states, true));
             }
             states.extend(page);
             next_url = backward_link(&answer.body).filter(|link| *link != url);
         }
-        Ok(states)
+        Ok((states, next_url.is_none()))
     }
 
     pub async fn set_alerts(&self, conversation_id: &str, enabled: bool) -> Result<()> {

@@ -1,0 +1,1752 @@
+use std::collections::HashMap;
+
+use chatsvc::compose_copilot::{ComposeCopilot, ComposeRewrite};
+use chatsvc::copilot::{Copilot, CopilotAsk};
+use chatsvc::sound_settings::{SoundSettings, SoundSettingsClient};
+use chatsvc::substrate_search::{
+    QueryRequest, QueryResults, SearchIdentity, SearchSession, SubstrateSearch, Suggestions,
+};
+use chatsvc::{
+    ActivityFeed, ActivitySnapshot, AppConsumptionHorizon, ChatNotificationMode,
+    ChatNotificationWrite, ChatSettingChange, ChatSettingsClient, ChatSettingsDocument,
+    DesktopNotifications, UserSettings, parse_app_consumption_horizon,
+};
+use chatsvc::{
+    BotProfile, BotProfiles, CallLogEntry, CardActions, ChatApp, ConversationRef,
+    ConversationState, Conversations, ForcedAvailability, ForwardResult, Gif, Gifs, HistoryShare,
+    InvokeRequest, InvokeResponse, Language, LanguageSettings, LanguageSettingsClient, LinkInfo,
+    MemberHorizon, MessageEmotions, MessageLanguage, MessageLinks, MessageWindow, Messages,
+    PinnedMessage, Pins, PostFollowState, PresenceLookup, PresenceService, PresenceStatus,
+    Receipts, RecordingPolicy, SavedMessage, ScheduledDraft, ScheduledDrafts, StatusNote,
+    ThreadActivity, ThreadMembers, TranslateRequest, Translation, TranslationTrigger, Translator,
+    WindowDirection, WorkLocationKind,
+};
+use chrono::{DateTime, Utc};
+use graph::{
+    Channel, Chat, CloudFile, DriveEntry, DriveFolder, Graph, Member, Message, MessageExtras,
+    MessageTarget, OutgoingMention, Photo, Presence, QuickSite, SharedFile, Tag, Team,
+    UploadDestination, UploadedFile, User,
+};
+
+use crate::error::{Error, Result};
+use crate::native::NativeChats;
+use crate::profile::PersonProfile;
+
+pub const CHATSVC_CHAT_WRITES: bool = true;
+const URGENT_ACK_EMOTION: &str = "acks";
+
+#[derive(Debug, Clone)]
+pub struct RemotePage {
+    pub items: Vec<Message>,
+    pub next_link: Option<String>,
+    pub oldest_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeltaPage {
+    pub items: Vec<Message>,
+    pub next_link: Option<String>,
+    pub delta_link: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatsPage {
+    pub items: Vec<Chat>,
+    pub next_link: Option<String>,
+}
+
+#[allow(async_fn_in_trait)]
+pub trait Remote {
+    async fn me(&self) -> Result<User>;
+    async fn chats_page(&self, top: usize) -> Result<ChatsPage>;
+    async fn chats_at(&self, next_link: &str) -> Result<ChatsPage>;
+    async fn chat(&self, chat_id: &str) -> Result<Chat>;
+    async fn chat_members(&self, chat_id: &str) -> Result<Vec<Member>>;
+    async fn joined_teams(&self) -> Result<Vec<Team>>;
+    async fn channels_for_teams(&self, team_ids: &[String]) -> Result<Vec<Result<Vec<Channel>>>>;
+    async fn chat_messages(
+        &self,
+        chat_id: &str,
+        before: Option<DateTime<Utc>>,
+        top: usize,
+    ) -> Result<RemotePage>;
+    async fn chat_message(&self, chat_id: &str, message_id: &str) -> Result<Message>;
+    async fn channel_messages(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        top: usize,
+    ) -> Result<RemotePage>;
+    async fn channel_messages_at(&self, next_link: &str) -> Result<RemotePage>;
+    async fn channel_message(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        message_id: &str,
+    ) -> Result<Message>;
+    async fn channel_reply(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        message_id: &str,
+        reply_id: &str,
+    ) -> Result<Message>;
+    async fn channel_delta(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        modified_after: Option<DateTime<Utc>>,
+    ) -> Result<DeltaPage>;
+    async fn channel_delta_at(&self, link: &str) -> Result<DeltaPage>;
+    async fn channel_replies(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        root_ids: &[String],
+    ) -> Result<Vec<Result<Vec<Message>>>>;
+    async fn send_channel_message(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        html: &str,
+        subject: Option<&str>,
+        mentions: &[OutgoingMention],
+        extras: &MessageExtras,
+    ) -> Result<Message>;
+    async fn reply_to_channel_message(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        message_id: &str,
+        html: &str,
+        mentions: &[OutgoingMention],
+        extras: &MessageExtras,
+    ) -> Result<Message>;
+    async fn post_chatsvc_message(
+        &self,
+        conversation: &ConversationRef,
+        html: &str,
+        display_name: &str,
+        properties: &serde_json::Value,
+    ) -> Result<String>;
+    /// Readable by the members of `conversation_id`; returns the object id and its full size url.
+    async fn upload_ams_image(
+        &self,
+        conversation_id: &str,
+        bytes: &[u8],
+        filename: &str,
+    ) -> Result<chatsvc::ams::AmsImage>;
+    async fn set_message_cards(
+        &self,
+        conversation: &ConversationRef,
+        message_id: &str,
+        cards: &str,
+    ) -> Result<()>;
+    async fn remove_chat_member(&self, chat_id: &str, user_id: &str) -> Result<()>;
+    async fn add_chat_members(
+        &self,
+        chat_id: &str,
+        user_ids: &[String],
+        share: HistoryShare,
+    ) -> Result<()>;
+    async fn chat_states(&self) -> Result<Vec<ConversationState>>;
+    /// Tern patch: the recently active ones, and whether that was all.
+    async fn recent_chat_states(&self) -> Result<(Vec<ConversationState>, bool)> {
+        Ok((self.chat_states().await?, true))
+    }
+    async fn clear_chat_history(&self, _chat_id: &str, _cleared_until_ms: i64) -> Result<()> {
+        Err(Error::Unsupported("removing chat history"))
+    }
+    async fn set_chat_topic(&self, _chat_id: &str, _topic: &str) -> Result<()> {
+        Err(Error::Unsupported("renaming a chat"))
+    }
+    async fn set_chat_muted(&self, chat_id: &str, muted: bool) -> Result<()>;
+    async fn set_read_horizon(&self, conversation_id: &str, horizon: &str) -> Result<()>;
+    async fn set_read_bookmark(&self, _conversation_id: &str, _bookmark: &str) -> Result<()> {
+        Err(Error::Unsupported("marking the notes chat as unread"))
+    }
+    async fn set_chat_hidden_at(&self, _chat_id: &str, _hidden_at_ms: Option<i64>) -> Result<()> {
+        Err(Error::Unsupported("hiding the notes chat"))
+    }
+    async fn set_channel_notifications(
+        &self,
+        channel_id: &str,
+        notifications: store::ChannelNotifications,
+    ) -> Result<()>;
+    async fn send_typing(&self, conversation: &ConversationRef, active: bool) -> Result<()>;
+    async fn set_reaction(&self, target: &MessageTarget, reaction_type: &str) -> Result<()>;
+    async fn unset_reaction(&self, target: &MessageTarget, reaction_type: &str) -> Result<()>;
+    async fn edit_message(
+        &self,
+        target: &MessageTarget,
+        html: &str,
+        mentions: &[OutgoingMention],
+        extras: &MessageExtras,
+    ) -> Result<()>;
+    async fn soft_delete_message(&self, user_id: &str, target: &MessageTarget) -> Result<()>;
+    async fn undo_soft_delete_message(&self, user_id: &str, target: &MessageTarget) -> Result<()>;
+    async fn create_one_on_one(&self, my_user_id: &str, user_id: &str) -> Result<Chat>;
+    async fn create_group(
+        &self,
+        my_user_id: &str,
+        user_ids: &[String],
+        topic: Option<&str>,
+    ) -> Result<Chat>;
+    async fn search_people(&self, query: &str) -> Result<Vec<User>>;
+
+    async fn team_tags(&self, _team_id: &str) -> Result<Vec<Tag>> {
+        Err(Error::Unsupported("team tags"))
+    }
+
+    async fn channel_description(&self, _team_id: &str, _channel_id: &str) -> Result<String> {
+        Err(Error::Unsupported("channel description"))
+    }
+
+    async fn channel_files_folder(&self, _team_id: &str, _channel_id: &str) -> Result<DriveFolder> {
+        Err(Error::Unsupported("a channel files folder"))
+    }
+
+    async fn channel_files_root(&self, _team_id: &str, _channel_id: &str) -> Result<DriveEntry> {
+        Err(Error::Unsupported("a channel library"))
+    }
+
+    async fn channel_tab_web_url(
+        &self,
+        _team_id: &str,
+        _channel_id: &str,
+        _tab_id: &str,
+    ) -> Result<Option<String>> {
+        Err(Error::Unsupported("a channel tab link"))
+    }
+
+    async fn channel_member_count(&self, _team_id: &str, _channel_id: &str) -> Result<usize> {
+        Err(Error::Unsupported("a channel member count"))
+    }
+
+    async fn channel_members(
+        &self,
+        _team_id: &str,
+        _channel_id: &str,
+    ) -> Result<Vec<graph::Member>> {
+        Err(Error::Unsupported("a channel member list"))
+    }
+
+    async fn list_children(&self, _folder: &DriveFolder) -> Result<Vec<DriveEntry>> {
+        Err(Error::Unsupported("a folder listing"))
+    }
+
+    async fn create_folder(&self, _parent: &DriveFolder, _name: &str) -> Result<DriveEntry> {
+        Err(Error::Unsupported("creating a folder"))
+    }
+
+    async fn upload_file(
+        &self,
+        _destination: &UploadDestination,
+        _file_name: &str,
+        _bytes: &[u8],
+        _progress: &(dyn Fn(u8) + Send + Sync),
+    ) -> Result<UploadedFile> {
+        Err(Error::Unsupported("a file upload"))
+    }
+
+    async fn share_file(&self, _file: &UploadedFile, _user_ids: &[String]) -> Result<()> {
+        Err(Error::Unsupported("sharing a file"))
+    }
+
+    async fn recent_files(&self, _top: usize) -> Result<Vec<CloudFile>> {
+        Err(Error::Unsupported("recent files"))
+    }
+
+    async fn recent_files_with_owners(
+        &self,
+        _top: usize,
+    ) -> Result<(Vec<CloudFile>, Vec<(String, String)>)> {
+        Err(Error::Unsupported("recent files"))
+    }
+
+    async fn shared_with_me(&self) -> Result<Vec<DriveEntry>> {
+        Err(Error::Unsupported("shared files"))
+    }
+
+    async fn quick_access_sites(&self) -> Result<Vec<QuickSite>> {
+        Err(Error::Unsupported("sites"))
+    }
+
+    async fn drive_root(&self, _site_id: Option<&str>) -> Result<DriveFolder> {
+        Err(Error::Unsupported("drive root"))
+    }
+
+    async fn cloud_file_reference(&self, _file: &CloudFile) -> Result<UploadedFile> {
+        Err(Error::Unsupported("cloud files"))
+    }
+
+    async fn delete_file(&self, _file: &UploadedFile) -> Result<()> {
+        Err(Error::Unsupported("deleting a file"))
+    }
+
+    async fn resolve_share(&self, _open_url: &str) -> Result<SharedFile> {
+        Err(Error::Unsupported("resolving a shared file"))
+    }
+
+    async fn resolve_drive_item(&self, _drive_id: &str, _item_id: &str) -> Result<SharedFile> {
+        Err(Error::Unsupported("resolving a drive item"))
+    }
+
+    async fn download_range(
+        &self,
+        _download_url: &str,
+        _start: u64,
+        _end: Option<u64>,
+    ) -> Result<Vec<u8>> {
+        Err(Error::Unsupported("a file download"))
+    }
+
+    async fn hosted_content(&self, _url: &str) -> Result<Photo> {
+        Err(Error::Unsupported("hosted content"))
+    }
+
+    async fn external_image(&self, _url: &str) -> Result<Photo> {
+        Err(Error::Unsupported("external images"))
+    }
+
+    async fn user_photos(&self, _user_ids: &[String]) -> Result<Vec<Result<Option<Photo>>>> {
+        Err(Error::Unsupported("profile photos"))
+    }
+
+    async fn team_photos(&self, _team_ids: &[String]) -> Result<Vec<Result<Option<Photo>>>> {
+        Err(Error::Unsupported("team pictures"))
+    }
+
+    async fn presences(&self, _user_ids: &[String]) -> Result<Vec<Presence>> {
+        Err(Error::Unsupported("presence"))
+    }
+
+    async fn person_profile(&self, _user_id: &str) -> Result<PersonProfile> {
+        Err(Error::Unsupported("profile cards"))
+    }
+
+    async fn bot_profiles(&self, _bot_ids: &[String]) -> Result<Vec<BotProfile>> {
+        Err(Error::Unsupported("bot profiles"))
+    }
+
+    async fn subscribe_presence(
+        &self,
+        _endpoint_id: &str,
+        _trouter_uri: &str,
+        _user_ids: &[String],
+        _purge: bool,
+    ) -> Result<()> {
+        Err(Error::Unsupported("presence subscriptions"))
+    }
+
+    async fn own_status(&self, _user_id: &str) -> Result<PresenceStatus> {
+        Err(Error::Unsupported("own status"))
+    }
+
+    async fn set_availability(&self, _forced: Option<&ForcedAvailability>) -> Result<()> {
+        Err(Error::Unsupported("setting availability"))
+    }
+
+    async fn set_status_note(&self, _note: Option<&StatusNote>) -> Result<()> {
+        Err(Error::Unsupported("setting the status message"))
+    }
+
+    async fn set_work_location(
+        &self,
+        _location: Option<(WorkLocationKind, DateTime<Utc>)>,
+    ) -> Result<()> {
+        Err(Error::Unsupported("setting the work location"))
+    }
+
+    async fn consumption_horizons(&self, _conversation_id: &str) -> Result<Vec<MemberHorizon>> {
+        Err(Error::Unsupported("read receipts"))
+    }
+
+    async fn forward_messages(
+        &self,
+        _source_conversation_id: &str,
+        _target_conversation_id: &str,
+        _message_ids: &[String],
+        _comment_html: &str,
+    ) -> Result<ForwardResult> {
+        Err(Error::Unsupported("forwarding messages"))
+    }
+
+    async fn set_saved(
+        &self,
+        _conversation_id: &str,
+        _root_id: &str,
+        _message_id: &str,
+        _saved: bool,
+    ) -> Result<()> {
+        Err(Error::Unsupported("saving messages"))
+    }
+
+    async fn list_saved(&self) -> Result<Vec<SavedMessage>> {
+        Err(Error::Unsupported("saved messages"))
+    }
+
+    async fn set_post_followed(
+        &self,
+        _user_id: &str,
+        _channel_id: &str,
+        _root_id: &str,
+        _followed: bool,
+    ) -> Result<Option<String>> {
+        Err(Error::Unsupported("following posts"))
+    }
+
+    async fn post_follow_states(
+        &self,
+        _channel_id: &str,
+        _root_ids: &[String],
+    ) -> Result<HashMap<String, PostFollowState>> {
+        Err(Error::Unsupported("post follow states"))
+    }
+
+    async fn list_call_logs(&self) -> Result<Vec<CallLogEntry>> {
+        Err(Error::Unsupported("call history"))
+    }
+
+    async fn chat_message_window(
+        &self,
+        _chat_id: &str,
+        _anchor_id: &str,
+        _direction: WindowDirection,
+        _page_size: usize,
+    ) -> Result<MessageWindow> {
+        Err(Error::Unsupported("message windows"))
+    }
+
+    async fn chat_thread_activities(&self, _chat_id: &str) -> Result<Vec<ThreadActivity>> {
+        Ok(Vec::new())
+    }
+
+    async fn chat_messages_by_id(
+        &self,
+        _chat_id: &str,
+        _message_ids: &[String],
+    ) -> Result<Vec<Result<Message>>> {
+        Err(Error::Unsupported("batched message reads"))
+    }
+
+    async fn chat_pins(&self, _chat_id: &str) -> Result<Vec<PinnedMessage>> {
+        Err(Error::Unsupported("pinned messages"))
+    }
+
+    async fn pin_message(&self, _chat_id: &str, _message_id: &str) -> Result<()> {
+        Err(Error::Unsupported("pinning messages"))
+    }
+
+    async fn unpin_message(
+        &self,
+        _chat_id: &str,
+        _message_id: &str,
+        _parent_id: Option<&str>,
+    ) -> Result<()> {
+        Err(Error::Unsupported("pinning messages"))
+    }
+
+    async fn channel_pinned_posts(
+        &self,
+        _team_thread_id: &str,
+        _channel_id: &str,
+    ) -> Result<Vec<PinnedMessage>> {
+        Err(Error::Unsupported("pinned channel posts"))
+    }
+
+    async fn set_post_pinned(
+        &self,
+        _team_thread_id: &str,
+        _channel_id: &str,
+        _post_id: &str,
+        _pinned: bool,
+    ) -> Result<()> {
+        Err(Error::Unsupported("pinning channel posts"))
+    }
+
+    async fn activity_feed(&self) -> Result<ActivitySnapshot> {
+        Err(Error::Unsupported("the activity feed"))
+    }
+
+    async fn mark_activity_read(&self, _message_id: &str) -> Result<()> {
+        Err(Error::Unsupported("marking activity as read"))
+    }
+
+    async fn mark_all_activity_read(&self, _now_ms: i64) -> Result<()> {
+        Err(Error::Unsupported("marking all activity as read"))
+    }
+
+    async fn app_consumption_horizon(&self) -> Result<AppConsumptionHorizon> {
+        Ok(AppConsumptionHorizon::default())
+    }
+
+    async fn mark_all_channels_read(&self, _now_ms: i64) -> Result<AppConsumptionHorizon> {
+        Err(Error::Unsupported("marking all channels as read"))
+    }
+
+    async fn chat_apps(&self, _chat_id: &str) -> Result<Vec<ChatApp>> {
+        Err(Error::Unsupported("chat apps"))
+    }
+
+    async fn invoke_card(&self, _invoke: InvokeRequest) -> Result<InvokeResponse> {
+        Err(Error::Unsupported("card actions"))
+    }
+
+    async fn message_links(
+        &self,
+        _conversation: &ConversationRef,
+        _page_size: usize,
+    ) -> Result<Vec<MessageLinks>> {
+        Err(Error::Unsupported("link previews"))
+    }
+
+    async fn message_emotions(
+        &self,
+        _conversation: &ConversationRef,
+        _newest_message_id: &str,
+        _page_size: usize,
+    ) -> Result<Vec<MessageEmotions>> {
+        Err(Error::Unsupported("chat service reactions"))
+    }
+
+    async fn set_message_links(&self, _target: &MessageTarget, _links_json: &str) -> Result<()> {
+        Err(Error::Unsupported("link previews"))
+    }
+
+    async fn link_info(&self, _url: &str) -> Result<LinkInfo> {
+        Err(Error::Unsupported("link previews"))
+    }
+
+    async fn message_languages(
+        &self,
+        _conversation: &ConversationRef,
+        _page_size: usize,
+    ) -> Result<Vec<MessageLanguage>> {
+        Err(Error::Unsupported("message languages"))
+    }
+
+    async fn ask_copilot(&self, _ask: &CopilotAsk) -> Result<String> {
+        Err(Error::Unsupported("Copilot"))
+    }
+
+    async fn rewrite_draft(&self, _rewrite: &ComposeRewrite) -> Result<String> {
+        Err(Error::Unsupported("Copilot"))
+    }
+
+    async fn translate_chat_messages(
+        &self,
+        _chat_id: &str,
+        _to_language: &str,
+        _messages: &[TranslateRequest],
+        _trigger: &TranslationTrigger,
+    ) -> Result<Vec<Translation>> {
+        Err(Error::Unsupported("translation"))
+    }
+
+    async fn translate_channel_messages(
+        &self,
+        _team_id: &str,
+        _channel_id: &str,
+        _root_id: &str,
+        _to_language: &str,
+        _messages: &[TranslateRequest],
+        _trigger: &TranslationTrigger,
+    ) -> Result<Vec<Translation>> {
+        Err(Error::Unsupported("translation"))
+    }
+
+    async fn translation_languages(&self, _locale: &str) -> Result<Vec<Language>> {
+        Err(Error::Unsupported("translation"))
+    }
+
+    async fn language_settings(&self) -> Result<LanguageSettings> {
+        Err(Error::Unsupported("translation settings"))
+    }
+
+    async fn patch_language_settings(&self, _patch: serde_json::Value) -> Result<()> {
+        Err(Error::Unsupported("translation settings"))
+    }
+
+    async fn recording_policy(&self) -> Result<RecordingPolicy> {
+        Err(Error::Unsupported("recording policy"))
+    }
+
+    async fn allow_priority_messages(&self) -> Result<bool> {
+        Err(Error::Unsupported("messaging policy"))
+    }
+
+    async fn ack_urgent_message(&self, _chat_id: &str, _message_id: &str) -> Result<()> {
+        Err(Error::Unsupported("urgent message acknowledgement"))
+    }
+
+    async fn sound_settings(&self) -> Result<SoundSettings> {
+        Err(Error::Unsupported("sound settings"))
+    }
+
+    async fn chat_settings(&self) -> Result<ChatSettingsDocument> {
+        Err(Error::Unsupported("chat settings"))
+    }
+
+    async fn save_chat_setting(&self, _change: ChatSettingChange) -> Result<ChatSettingsDocument> {
+        Err(Error::Unsupported("chat settings"))
+    }
+
+    async fn set_chat_notifications(
+        &self,
+        _chat_id: &str,
+        _current_settings: Option<&str>,
+        _mode: ChatNotificationMode,
+        _desktop: DesktopNotifications,
+    ) -> Result<ChatNotificationWrite> {
+        Err(Error::Unsupported("chat notifications"))
+    }
+
+    async fn save_sound_settings(
+        &self,
+        _user_mri: &str,
+        _previous: &SoundSettings,
+        _updated: &SoundSettings,
+    ) -> Result<()> {
+        Err(Error::Unsupported("sound settings"))
+    }
+
+    async fn search_gifs(&self, _query: &str) -> Result<Vec<Gif>> {
+        Err(Error::Unsupported("GIF search"))
+    }
+
+    async fn server_search_init(
+        &self,
+        _identity: &SearchIdentity,
+        _search_session: &SearchSession,
+    ) -> Result<()> {
+        Err(Error::Unsupported("server search"))
+    }
+
+    async fn server_suggestions(
+        &self,
+        _identity: &SearchIdentity,
+        _search_session: &SearchSession,
+        _text: &str,
+    ) -> Result<Suggestions> {
+        Err(Error::Unsupported("server search"))
+    }
+
+    async fn server_query(
+        &self,
+        _identity: &SearchIdentity,
+        _search_session: &SearchSession,
+        _request: &QueryRequest,
+    ) -> Result<QueryResults> {
+        Err(Error::Unsupported("server search"))
+    }
+
+    async fn create_scheduled(
+        &self,
+        _inner_thread_id: &str,
+        _html: &str,
+        _send_at: DateTime<Utc>,
+        _display_name: &str,
+    ) -> Result<ScheduledDraft> {
+        Err(Error::Unsupported("schedule send"))
+    }
+
+    async fn scheduled_drafts(&self) -> Result<Vec<ScheduledDraft>> {
+        Err(Error::Unsupported("schedule send"))
+    }
+
+    async fn update_scheduled(
+        &self,
+        _draft: &ScheduledDraft,
+        _html: &str,
+        _display_name: &str,
+    ) -> Result<ScheduledDraft> {
+        Err(Error::Unsupported("schedule send"))
+    }
+
+    async fn cancel_scheduled(&self, _draft_id: &str) -> Result<()> {
+        Err(Error::Unsupported("schedule send"))
+    }
+}
+
+impl Remote for Graph {
+    async fn me(&self) -> Result<User> {
+        Ok(Graph::me(self).await?)
+    }
+
+    async fn chats_page(&self, top: usize) -> Result<ChatsPage> {
+        NativeChats::new(self.session()).first_page(top).await
+    }
+
+    async fn chats_at(&self, next_link: &str) -> Result<ChatsPage> {
+        NativeChats::new(self.session()).page(next_link).await
+    }
+
+    async fn chat(&self, chat_id: &str) -> Result<Chat> {
+        NativeChats::new(self.session()).chat(chat_id).await
+    }
+
+    async fn chat_members(&self, chat_id: &str) -> Result<Vec<Member>> {
+        NativeChats::new(self.session()).members(chat_id).await
+    }
+
+    async fn joined_teams(&self) -> Result<Vec<Team>> {
+        Ok(Graph::joined_teams(self).await?)
+    }
+
+    async fn channels_for_teams(&self, team_ids: &[String]) -> Result<Vec<Result<Vec<Channel>>>> {
+        let listings = Graph::channels_for_teams(self, team_ids).await?;
+        Ok(listings
+            .into_iter()
+            .map(|listing| listing.map_err(Into::into))
+            .collect())
+    }
+
+    async fn chat_messages(
+        &self,
+        chat_id: &str,
+        before: Option<DateTime<Utc>>,
+        top: usize,
+    ) -> Result<RemotePage> {
+        NativeChats::new(self.session())
+            .messages(chat_id, before, top)
+            .await
+    }
+
+    async fn chat_message(&self, chat_id: &str, message_id: &str) -> Result<Message> {
+        NativeChats::new(self.session())
+            .message(chat_id, message_id)
+            .await
+    }
+
+    async fn channel_messages(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        top: usize,
+    ) -> Result<RemotePage> {
+        Ok(Graph::channel_messages(self, team_id, channel_id, top)
+            .await?
+            .into())
+    }
+
+    async fn channel_messages_at(&self, next_link: &str) -> Result<RemotePage> {
+        Ok(Graph::channel_messages_at(self, next_link).await?.into())
+    }
+
+    async fn channel_message(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        message_id: &str,
+    ) -> Result<Message> {
+        Ok(Graph::channel_message(self, team_id, channel_id, message_id).await?)
+    }
+
+    async fn channel_reply(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        message_id: &str,
+        reply_id: &str,
+    ) -> Result<Message> {
+        Ok(Graph::channel_reply(self, team_id, channel_id, message_id, reply_id).await?)
+    }
+
+    async fn channel_delta(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        modified_after: Option<DateTime<Utc>>,
+    ) -> Result<DeltaPage> {
+        Ok(
+            Graph::channel_delta(self, team_id, channel_id, modified_after)
+                .await?
+                .into(),
+        )
+    }
+
+    async fn channel_delta_at(&self, link: &str) -> Result<DeltaPage> {
+        Ok(Graph::channel_delta_at(self, link).await?.into())
+    }
+
+    async fn channel_replies(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        root_ids: &[String],
+    ) -> Result<Vec<Result<Vec<Message>>>> {
+        let listings = Graph::channel_replies(self, team_id, channel_id, root_ids).await?;
+        Ok(listings
+            .into_iter()
+            .map(|listing| listing.map_err(Into::into))
+            .collect())
+    }
+
+    async fn send_channel_message(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        html: &str,
+        subject: Option<&str>,
+        mentions: &[OutgoingMention],
+        extras: &MessageExtras,
+    ) -> Result<Message> {
+        Ok(
+            Graph::send_channel_message(self, team_id, channel_id, html, subject, mentions, extras)
+                .await?,
+        )
+    }
+
+    async fn reply_to_channel_message(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        message_id: &str,
+        html: &str,
+        mentions: &[OutgoingMention],
+        extras: &MessageExtras,
+    ) -> Result<Message> {
+        Ok(Graph::reply_to_channel_message(
+            self, team_id, channel_id, message_id, html, mentions, extras,
+        )
+        .await?)
+    }
+
+    async fn post_chatsvc_message(
+        &self,
+        conversation: &ConversationRef,
+        html: &str,
+        display_name: &str,
+        properties: &serde_json::Value,
+    ) -> Result<String> {
+        Ok(Messages::new(self.session())
+            .post_message(conversation, html, display_name, properties)
+            .await?)
+    }
+
+    async fn upload_ams_image(
+        &self,
+        conversation_id: &str,
+        bytes: &[u8],
+        filename: &str,
+    ) -> Result<chatsvc::ams::AmsImage> {
+        Ok(chatsvc::ams::Ams::new(self.session())
+            .upload_image(conversation_id, bytes, filename)
+            .await?)
+    }
+
+    async fn set_message_cards(
+        &self,
+        conversation: &ConversationRef,
+        message_id: &str,
+        cards: &str,
+    ) -> Result<()> {
+        Ok(Messages::new(self.session())
+            .set_cards(conversation, message_id, cards)
+            .await?)
+    }
+
+    async fn remove_chat_member(&self, chat_id: &str, user_id: &str) -> Result<()> {
+        Ok(ThreadMembers::new(self.session())
+            .remove(chat_id, user_id)
+            .await?)
+    }
+
+    async fn add_chat_members(
+        &self,
+        chat_id: &str,
+        user_ids: &[String],
+        share: HistoryShare,
+    ) -> Result<()> {
+        Ok(ThreadMembers::new(self.session())
+            .add(chat_id, user_ids, share, Utc::now().timestamp_millis())
+            .await?)
+    }
+
+    async fn recent_chat_states(&self) -> Result<(Vec<ConversationState>, bool)> {
+        Ok(Conversations::new(self.session())
+            .recent_conversation_states()
+            .await?)
+    }
+
+    async fn chat_states(&self) -> Result<Vec<ConversationState>> {
+        Ok(Conversations::new(self.session())
+            .conversation_states()
+            .await?)
+    }
+
+    async fn clear_chat_history(&self, chat_id: &str, cleared_until_ms: i64) -> Result<()> {
+        Ok(Conversations::new(self.session())
+            .clear_history(chat_id, cleared_until_ms)
+            .await?)
+    }
+
+    async fn set_chat_topic(&self, chat_id: &str, topic: &str) -> Result<()> {
+        Ok(ThreadMembers::new(self.session())
+            .set_topic(chat_id, topic)
+            .await?)
+    }
+
+    async fn set_chat_muted(&self, chat_id: &str, muted: bool) -> Result<()> {
+        Ok(Conversations::new(self.session())
+            .set_alerts(chat_id, !muted)
+            .await?)
+    }
+
+    async fn set_read_horizon(&self, conversation_id: &str, horizon: &str) -> Result<()> {
+        Ok(Conversations::new(self.session())
+            .set_read_horizon(conversation_id, horizon)
+            .await?)
+    }
+
+    async fn set_read_bookmark(&self, conversation_id: &str, bookmark: &str) -> Result<()> {
+        Ok(Conversations::new(self.session())
+            .set_read_bookmark(conversation_id, bookmark)
+            .await?)
+    }
+
+    async fn set_chat_hidden_at(&self, chat_id: &str, hidden_at_ms: Option<i64>) -> Result<()> {
+        Ok(Conversations::new(self.session())
+            .set_hidden_at(chat_id, hidden_at_ms)
+            .await?)
+    }
+
+    async fn set_channel_notifications(
+        &self,
+        channel_id: &str,
+        notifications: store::ChannelNotifications,
+    ) -> Result<()> {
+        Ok(Conversations::new(self.session())
+            .set_channel_notifications(
+                channel_id,
+                crate::folders::chatsvc_notifications(notifications),
+            )
+            .await?)
+    }
+
+    async fn send_typing(&self, conversation: &ConversationRef, active: bool) -> Result<()> {
+        Ok(Messages::new(self.session())
+            .send_typing(conversation, active)
+            .await?)
+    }
+
+    /// Teams `ackUrgentMessage`: the emotion `acks` on the message stops the urgent repeat notifications.
+    async fn ack_urgent_message(&self, chat_id: &str, message_id: &str) -> Result<()> {
+        Ok(Messages::new(self.session())
+            .set_emotion(
+                &ConversationRef::chat(chat_id),
+                message_id,
+                URGENT_ACK_EMOTION,
+            )
+            .await?)
+    }
+
+    async fn set_reaction(&self, target: &MessageTarget, reaction_type: &str) -> Result<()> {
+        if let Some(key) = chatsvc::reaction_key(reaction_type) {
+            return Ok(Messages::new(self.session())
+                .set_emotion(&conversation_ref(target), target.message_id(), &key)
+                .await?);
+        }
+        if matches!(target, MessageTarget::Chat { .. }) {
+            return Err(Error::Unsupported("this reaction in a chat"));
+        }
+        Ok(Graph::set_reaction(self, target, reaction_type).await?)
+    }
+
+    async fn unset_reaction(&self, target: &MessageTarget, reaction_type: &str) -> Result<()> {
+        let keys = chatsvc::reaction_keys(reaction_type);
+        if !keys.is_empty() {
+            let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+            return Ok(Messages::new(self.session())
+                .unset_emotions(&conversation_ref(target), target.message_id(), &keys)
+                .await?);
+        }
+        if matches!(target, MessageTarget::Chat { .. }) {
+            return Err(Error::Unsupported("this reaction in a chat"));
+        }
+        Ok(Graph::unset_reaction(self, target, reaction_type).await?)
+    }
+
+    async fn edit_message(
+        &self,
+        target: &MessageTarget,
+        html: &str,
+        mentions: &[OutgoingMention],
+        extras: &MessageExtras,
+    ) -> Result<()> {
+        match chatsvc_conversation(target) {
+            Some(conversation) if mentions.is_empty() => {
+                let html = format!("{}{html}{}", extras.kept_html(), extras.files_html());
+                Ok(Messages::new(self.session())
+                    .edit_message(&conversation, target.message_id(), &html)
+                    .await?)
+            }
+            Some(conversation @ ConversationRef::Chat { .. }) => {
+                let entries = crate::teams_quote::mention_entries(mentions).ok_or(
+                    Error::Unsupported("editing in a team, channel or tag mention"),
+                )?;
+                let html = format!(
+                    "{}{}{}",
+                    extras.kept_html(),
+                    crate::teams_quote::chatsvc_mention_html(html, mentions),
+                    extras.files_html()
+                );
+                Ok(Messages::new(self.session())
+                    .edit_message_with_mentions(
+                        &conversation,
+                        target.message_id(),
+                        &html,
+                        Some(&serde_json::Value::Array(entries).to_string()),
+                    )
+                    .await?)
+            }
+            Some(_) | None => Ok(Graph::edit_message(self, target, html, mentions, extras).await?),
+        }
+    }
+
+    async fn soft_delete_message(&self, user_id: &str, target: &MessageTarget) -> Result<()> {
+        match chatsvc_conversation(target) {
+            Some(conversation) => Ok(Messages::new(self.session())
+                .soft_delete_message(&conversation, target.message_id())
+                .await?),
+            None => Ok(Graph::soft_delete_message(self, user_id, target).await?),
+        }
+    }
+
+    async fn undo_soft_delete_message(&self, user_id: &str, target: &MessageTarget) -> Result<()> {
+        match chatsvc_conversation(target) {
+            Some(conversation) => Ok(Messages::new(self.session())
+                .undelete_message(&conversation, target.message_id())
+                .await?),
+            None => Ok(Graph::undo_soft_delete_message(self, user_id, target).await?),
+        }
+    }
+
+    /// Teams names a 1:1 chat after its two members; the chat service creates it with the first message.
+    async fn create_one_on_one(&self, my_user_id: &str, user_id: &str) -> Result<Chat> {
+        let mut pair = [my_user_id.to_owned(), user_id.to_owned()];
+        pair.sort();
+        let sorted_id = format!("19:{}_{}@unq.gbl.spaces", pair[0], pair[1]);
+        let reversed_id = format!("19:{}_{}@unq.gbl.spaces", pair[1], pair[0]);
+        let listing = chatsvc::ChatListing::new(self.session());
+        let chat_id = if listing.conversation(&sorted_id).await.is_err()
+            && listing.conversation(&reversed_id).await.is_ok()
+        {
+            reversed_id
+        } else {
+            sorted_id
+        };
+        NativeChats::new(self.session())
+            .created_chat(&chat_id, "oneOnOne", None, &pair)
+            .await
+    }
+
+    async fn create_group(
+        &self,
+        my_user_id: &str,
+        user_ids: &[String],
+        topic: Option<&str>,
+    ) -> Result<Chat> {
+        let mut members = vec![my_user_id.to_owned()];
+        members.extend(
+            user_ids
+                .iter()
+                .filter(|user_id| *user_id != my_user_id)
+                .cloned(),
+        );
+        let chat_id = ThreadMembers::new(self.session())
+            .create_group(&members, topic)
+            .await?;
+        NativeChats::new(self.session())
+            .created_chat(&chat_id, "group", topic, &members)
+            .await
+    }
+
+    async fn search_people(&self, query: &str) -> Result<Vec<User>> {
+        let mut users = Graph::search_people(self, query).await?;
+        if crate::native::is_email_address(query)
+            && !users.iter().any(|user| {
+                user.mail
+                    .as_deref()
+                    .is_some_and(|mail| mail.eq_ignore_ascii_case(query.trim()))
+            })
+            && let Ok(external) = chatsvc::UserProfiles::new(self.session())
+                .search_external(query)
+                .await
+        {
+            users.extend(crate::native::remember_external(external));
+        }
+        Ok(users)
+    }
+
+    async fn team_tags(&self, team_id: &str) -> Result<Vec<Tag>> {
+        Ok(Graph::team_tags(self, team_id).await?)
+    }
+
+    async fn channel_description(&self, team_id: &str, channel_id: &str) -> Result<String> {
+        Ok(Graph::channel_description(self, team_id, channel_id).await?)
+    }
+
+    async fn channel_files_folder(&self, team_id: &str, channel_id: &str) -> Result<DriveFolder> {
+        Ok(Graph::channel_files_folder(self, team_id, channel_id).await?)
+    }
+
+    async fn channel_files_root(&self, team_id: &str, channel_id: &str) -> Result<DriveEntry> {
+        Ok(Graph::channel_files_root(self, team_id, channel_id).await?)
+    }
+
+    async fn channel_tab_web_url(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        tab_id: &str,
+    ) -> Result<Option<String>> {
+        Ok(Graph::channel_tab_web_url(self, team_id, channel_id, tab_id).await?)
+    }
+
+    async fn channel_member_count(&self, team_id: &str, channel_id: &str) -> Result<usize> {
+        Ok(Graph::channel_member_count(self, team_id, channel_id).await?)
+    }
+
+    async fn channel_members(&self, team_id: &str, channel_id: &str) -> Result<Vec<graph::Member>> {
+        Ok(Graph::channel_member_list(self, team_id, channel_id).await?)
+    }
+
+    async fn list_children(&self, folder: &DriveFolder) -> Result<Vec<DriveEntry>> {
+        Ok(Graph::list_children(self, folder).await?)
+    }
+
+    async fn create_folder(&self, parent: &DriveFolder, name: &str) -> Result<DriveEntry> {
+        Ok(Graph::create_folder(self, parent, name).await?)
+    }
+
+    async fn upload_file(
+        &self,
+        destination: &UploadDestination,
+        file_name: &str,
+        bytes: &[u8],
+        progress: &(dyn Fn(u8) + Send + Sync),
+    ) -> Result<UploadedFile> {
+        Ok(Graph::upload_file(self, destination, file_name, bytes, progress).await?)
+    }
+
+    async fn share_file(&self, file: &UploadedFile, user_ids: &[String]) -> Result<()> {
+        Ok(Graph::share_item(self, file, user_ids).await?)
+    }
+
+    async fn recent_files(&self, top: usize) -> Result<Vec<CloudFile>> {
+        Ok(Graph::recent_files(self, top).await?)
+    }
+
+    async fn recent_files_with_owners(
+        &self,
+        top: usize,
+    ) -> Result<(Vec<CloudFile>, Vec<(String, String)>)> {
+        Ok(Graph::recent_files_with_owners(self, top).await?)
+    }
+
+    async fn shared_with_me(&self) -> Result<Vec<DriveEntry>> {
+        Ok(Graph::shared_with_me(self).await?)
+    }
+
+    async fn quick_access_sites(&self) -> Result<Vec<QuickSite>> {
+        Ok(Graph::quick_access_sites(self).await?)
+    }
+
+    async fn drive_root(&self, site_id: Option<&str>) -> Result<DriveFolder> {
+        Ok(Graph::drive_root(self, site_id).await?)
+    }
+
+    async fn cloud_file_reference(&self, file: &CloudFile) -> Result<UploadedFile> {
+        Ok(Graph::cloud_file_reference(self, file).await?)
+    }
+
+    async fn delete_file(&self, file: &UploadedFile) -> Result<()> {
+        Ok(Graph::delete_drive_item(self, &file.drive_id, &file.item_id).await?)
+    }
+
+    async fn resolve_share(&self, open_url: &str) -> Result<SharedFile> {
+        Ok(Graph::resolve_share(self, open_url).await?)
+    }
+
+    async fn resolve_drive_item(&self, drive_id: &str, item_id: &str) -> Result<SharedFile> {
+        Ok(Graph::resolve_drive_item(self, drive_id, item_id).await?)
+    }
+
+    async fn download_range(
+        &self,
+        download_url: &str,
+        start: u64,
+        end: Option<u64>,
+    ) -> Result<Vec<u8>> {
+        Ok(Graph::download_range(self, download_url, start, end).await?)
+    }
+
+    async fn hosted_content(&self, url: &str) -> Result<Photo> {
+        let ams_url = chatsvc::hosted_content_image_url(url);
+        let url = ams_url.as_deref().unwrap_or(url);
+        let image = if chatsvc::is_ams_image_url(url) {
+            chatsvc::ams::Ams::new(self.session())
+                .download_image(url)
+                .await?
+        } else if chatsvc::is_link_image_url(url) {
+            Messages::new(self.session()).link_image(url).await?
+        } else {
+            return Ok(Graph::download_hosted_content(self, url).await?);
+        };
+        Ok(Photo {
+            bytes: image.bytes,
+            content_type: image.content_type,
+        })
+    }
+
+    async fn external_image(&self, url: &str) -> Result<Photo> {
+        Ok(Graph::download_external_image(self, url).await?)
+    }
+
+    async fn user_photos(&self, user_ids: &[String]) -> Result<Vec<Result<Option<Photo>>>> {
+        let photos = Graph::user_photos(self, user_ids).await?;
+        Ok(photos
+            .into_iter()
+            .map(|photo| photo.map_err(Into::into))
+            .collect())
+    }
+
+    async fn team_photos(&self, team_ids: &[String]) -> Result<Vec<Result<Option<Photo>>>> {
+        let photos = Graph::team_photos(self, team_ids).await?;
+        Ok(photos
+            .into_iter()
+            .map(|photo| photo.map_err(Into::into))
+            .collect())
+    }
+
+    async fn presences(&self, user_ids: &[String]) -> Result<Vec<Presence>> {
+        let found = PresenceLookup::new(self.session())
+            .presences(user_ids)
+            .await?;
+        Ok(found
+            .into_iter()
+            .map(|presence| Presence {
+                user_id: presence.user_id,
+                availability: presence.availability,
+                activity: presence.activity,
+            })
+            .collect())
+    }
+
+    async fn person_profile(&self, user_id: &str) -> Result<PersonProfile> {
+        crate::profile::load_profile(self, user_id).await
+    }
+
+    async fn bot_profiles(&self, bot_ids: &[String]) -> Result<Vec<BotProfile>> {
+        Ok(BotProfiles::new(self.session()).fetch(bot_ids).await?)
+    }
+
+    async fn subscribe_presence(
+        &self,
+        endpoint_id: &str,
+        trouter_uri: &str,
+        user_ids: &[String],
+        purge: bool,
+    ) -> Result<()> {
+        Ok(PresenceLookup::new(self.session())
+            .subscribe(endpoint_id, trouter_uri, user_ids, purge)
+            .await?)
+    }
+
+    async fn own_status(&self, user_id: &str) -> Result<PresenceStatus> {
+        Ok(PresenceService::new(self.session()).status(user_id).await?)
+    }
+
+    async fn set_availability(&self, forced: Option<&ForcedAvailability>) -> Result<()> {
+        Ok(PresenceService::new(self.session())
+            .set_availability(forced)
+            .await?)
+    }
+
+    async fn set_status_note(&self, note: Option<&StatusNote>) -> Result<()> {
+        Ok(PresenceService::new(self.session()).set_note(note).await?)
+    }
+
+    async fn set_work_location(
+        &self,
+        location: Option<(WorkLocationKind, DateTime<Utc>)>,
+    ) -> Result<()> {
+        Ok(PresenceService::new(self.session())
+            .set_work_location(location)
+            .await?)
+    }
+
+    async fn consumption_horizons(&self, conversation_id: &str) -> Result<Vec<MemberHorizon>> {
+        Ok(Receipts::new(self.session())
+            .consumption_horizons(conversation_id)
+            .await?)
+    }
+
+    async fn forward_messages(
+        &self,
+        source_conversation_id: &str,
+        target_conversation_id: &str,
+        message_ids: &[String],
+        comment_html: &str,
+    ) -> Result<ForwardResult> {
+        Ok(Messages::new(self.session())
+            .forward_messages(
+                source_conversation_id,
+                target_conversation_id,
+                message_ids,
+                comment_html,
+            )
+            .await?)
+    }
+
+    async fn set_saved(
+        &self,
+        conversation_id: &str,
+        root_id: &str,
+        message_id: &str,
+        saved: bool,
+    ) -> Result<()> {
+        Ok(Messages::new(self.session())
+            .set_saved(conversation_id, root_id, message_id, saved)
+            .await?)
+    }
+
+    async fn list_saved(&self) -> Result<Vec<SavedMessage>> {
+        Ok(Messages::new(self.session()).list_saved().await?)
+    }
+
+    async fn set_post_followed(
+        &self,
+        user_id: &str,
+        channel_id: &str,
+        root_id: &str,
+        followed: bool,
+    ) -> Result<Option<String>> {
+        Ok(Messages::new(self.session())
+            .set_post_followed(user_id, channel_id, root_id, followed)
+            .await?)
+    }
+
+    async fn post_follow_states(
+        &self,
+        channel_id: &str,
+        root_ids: &[String],
+    ) -> Result<HashMap<String, PostFollowState>> {
+        Ok(Messages::new(self.session())
+            .post_follow_states(channel_id, root_ids)
+            .await?)
+    }
+
+    async fn list_call_logs(&self) -> Result<Vec<CallLogEntry>> {
+        Ok(Messages::new(self.session()).list_call_logs().await?)
+    }
+
+    async fn chat_message_window(
+        &self,
+        chat_id: &str,
+        anchor_id: &str,
+        direction: WindowDirection,
+        page_size: usize,
+    ) -> Result<MessageWindow> {
+        Ok(Messages::new(self.session())
+            .message_window(chat_id, anchor_id, direction, page_size)
+            .await?)
+    }
+
+    async fn chat_thread_activities(&self, chat_id: &str) -> Result<Vec<ThreadActivity>> {
+        Ok(Messages::new(self.session())
+            .thread_activities(chat_id)
+            .await?)
+    }
+
+    async fn chat_messages_by_id(
+        &self,
+        chat_id: &str,
+        message_ids: &[String],
+    ) -> Result<Vec<Result<Message>>> {
+        let native = NativeChats::new(self.session());
+        Ok(futures_util::future::join_all(
+            message_ids
+                .iter()
+                .map(|message_id| native.message(chat_id, message_id)),
+        )
+        .await)
+    }
+
+    async fn chat_pins(&self, chat_id: &str) -> Result<Vec<PinnedMessage>> {
+        Ok(Pins::new(self.session()).chat_pins(chat_id).await?)
+    }
+
+    async fn pin_message(&self, chat_id: &str, message_id: &str) -> Result<()> {
+        Ok(Pins::new(self.session())
+            .pin_message(chat_id, message_id)
+            .await?)
+    }
+
+    async fn unpin_message(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        parent_id: Option<&str>,
+    ) -> Result<()> {
+        Ok(Pins::new(self.session())
+            .unpin_message(chat_id, message_id, parent_id)
+            .await?)
+    }
+
+    async fn channel_pinned_posts(
+        &self,
+        team_thread_id: &str,
+        channel_id: &str,
+    ) -> Result<Vec<PinnedMessage>> {
+        Ok(Pins::with_skype_token(self.session())
+            .channel_pinned_posts(team_thread_id, channel_id)
+            .await?)
+    }
+
+    async fn set_post_pinned(
+        &self,
+        team_thread_id: &str,
+        channel_id: &str,
+        post_id: &str,
+        pinned: bool,
+    ) -> Result<()> {
+        Ok(Pins::with_skype_token(self.session())
+            .set_post_pinned(team_thread_id, channel_id, post_id, pinned)
+            .await?)
+    }
+
+    async fn activity_feed(&self) -> Result<ActivitySnapshot> {
+        Ok(ActivityFeed::new(self.session()).snapshot().await?)
+    }
+
+    async fn mark_activity_read(&self, message_id: &str) -> Result<()> {
+        Ok(ActivityFeed::new(self.session())
+            .mark_read(message_id)
+            .await?)
+    }
+
+    async fn mark_all_activity_read(&self, now_ms: i64) -> Result<()> {
+        Ok(ActivityFeed::new(self.session())
+            .mark_all_read(now_ms)
+            .await?)
+    }
+
+    async fn app_consumption_horizon(&self) -> Result<AppConsumptionHorizon> {
+        let properties = UserSettings::new(self.session()).properties().await?;
+        Ok(parse_app_consumption_horizon(&properties))
+    }
+
+    async fn mark_all_channels_read(&self, now_ms: i64) -> Result<AppConsumptionHorizon> {
+        Ok(UserSettings::new(self.session())
+            .mark_all_channels_read(now_ms)
+            .await?)
+    }
+
+    async fn chat_apps(&self, chat_id: &str) -> Result<Vec<ChatApp>> {
+        Ok(CardActions::new(self.session()).chat_apps(chat_id).await?)
+    }
+
+    async fn invoke_card(&self, invoke: InvokeRequest) -> Result<InvokeResponse> {
+        Ok(CardActions::new(self.session()).invoke(invoke).await?)
+    }
+
+    async fn message_links(
+        &self,
+        conversation: &ConversationRef,
+        page_size: usize,
+    ) -> Result<Vec<MessageLinks>> {
+        Ok(Messages::new(self.session())
+            .list_message_links(conversation, page_size)
+            .await?)
+    }
+
+    async fn message_emotions(
+        &self,
+        conversation: &ConversationRef,
+        newest_message_id: &str,
+        page_size: usize,
+    ) -> Result<Vec<MessageEmotions>> {
+        Ok(Messages::new(self.session())
+            .message_emotions(
+                &conversation.conversation_id(),
+                newest_message_id,
+                page_size,
+            )
+            .await?)
+    }
+
+    async fn set_message_links(&self, target: &MessageTarget, links_json: &str) -> Result<()> {
+        Ok(Messages::new(self.session())
+            .set_links(&conversation_ref(target), target.message_id(), links_json)
+            .await?)
+    }
+
+    async fn link_info(&self, url: &str) -> Result<LinkInfo> {
+        Ok(Messages::new(self.session()).link_info(url).await?)
+    }
+
+    async fn message_languages(
+        &self,
+        conversation: &ConversationRef,
+        page_size: usize,
+    ) -> Result<Vec<MessageLanguage>> {
+        Ok(Messages::new(self.session())
+            .list_language_stamps(conversation, page_size)
+            .await?)
+    }
+
+    async fn ask_copilot(&self, ask: &CopilotAsk) -> Result<String> {
+        Ok(Copilot::new(self.session()).ask(ask).await?)
+    }
+
+    async fn rewrite_draft(&self, rewrite: &ComposeRewrite) -> Result<String> {
+        Ok(ComposeCopilot::new(self.session()).rewrite(rewrite).await?)
+    }
+
+    async fn translate_chat_messages(
+        &self,
+        chat_id: &str,
+        to_language: &str,
+        messages: &[TranslateRequest],
+        trigger: &TranslationTrigger,
+    ) -> Result<Vec<Translation>> {
+        Ok(Translator::new(self.session())
+            .translate_chat(chat_id, to_language, messages, trigger)
+            .await?)
+    }
+
+    async fn translate_channel_messages(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        root_id: &str,
+        to_language: &str,
+        messages: &[TranslateRequest],
+        trigger: &TranslationTrigger,
+    ) -> Result<Vec<Translation>> {
+        Ok(Translator::new(self.session())
+            .translate_channel(team_id, channel_id, root_id, to_language, messages, trigger)
+            .await?)
+    }
+
+    async fn translation_languages(&self, locale: &str) -> Result<Vec<Language>> {
+        Ok(Translator::new(self.session()).languages(locale).await?)
+    }
+
+    async fn language_settings(&self) -> Result<LanguageSettings> {
+        Ok(LanguageSettingsClient::new(self.session()).read().await?)
+    }
+
+    async fn recording_policy(&self) -> Result<RecordingPolicy> {
+        Ok(LanguageSettingsClient::new(self.session())
+            .read_recording_policy()
+            .await?)
+    }
+
+    async fn allow_priority_messages(&self) -> Result<bool> {
+        Ok(LanguageSettingsClient::new(self.session())
+            .read_allow_priority_messages()
+            .await?)
+    }
+
+    async fn patch_language_settings(&self, patch: serde_json::Value) -> Result<()> {
+        Ok(LanguageSettingsClient::new(self.session())
+            .patch(patch)
+            .await?)
+    }
+
+    async fn sound_settings(&self) -> Result<SoundSettings> {
+        Ok(SoundSettingsClient::new(self.session()).read().await?)
+    }
+
+    async fn chat_settings(&self) -> Result<ChatSettingsDocument> {
+        Ok(ChatSettingsClient::new(self.session()).read().await?)
+    }
+
+    async fn save_chat_setting(&self, change: ChatSettingChange) -> Result<ChatSettingsDocument> {
+        Ok(ChatSettingsClient::new(self.session())
+            .write(change)
+            .await?)
+    }
+
+    async fn set_chat_notifications(
+        &self,
+        chat_id: &str,
+        current_settings: Option<&str>,
+        mode: ChatNotificationMode,
+        desktop: DesktopNotifications,
+    ) -> Result<ChatNotificationWrite> {
+        Ok(Conversations::new(self.session())
+            .set_chat_notifications(chat_id, current_settings, mode, desktop)
+            .await?)
+    }
+
+    async fn save_sound_settings(
+        &self,
+        user_mri: &str,
+        previous: &SoundSettings,
+        updated: &SoundSettings,
+    ) -> Result<()> {
+        Ok(SoundSettingsClient::new(self.session())
+            .write(user_mri, previous, updated)
+            .await?)
+    }
+
+    async fn search_gifs(&self, query: &str) -> Result<Vec<Gif>> {
+        Ok(Gifs::new(self.session()).search(query).await?)
+    }
+
+    async fn server_search_init(
+        &self,
+        identity: &SearchIdentity,
+        search_session: &SearchSession,
+    ) -> Result<()> {
+        Ok(SubstrateSearch::new(self.session(), identity.clone())
+            .init(search_session)
+            .await?)
+    }
+
+    async fn server_suggestions(
+        &self,
+        identity: &SearchIdentity,
+        search_session: &SearchSession,
+        text: &str,
+    ) -> Result<Suggestions> {
+        Ok(SubstrateSearch::new(self.session(), identity.clone())
+            .suggestions(search_session, text)
+            .await?)
+    }
+
+    async fn server_query(
+        &self,
+        identity: &SearchIdentity,
+        search_session: &SearchSession,
+        request: &QueryRequest,
+    ) -> Result<QueryResults> {
+        Ok(SubstrateSearch::new(self.session(), identity.clone())
+            .query(search_session, request)
+            .await?)
+    }
+
+    async fn create_scheduled(
+        &self,
+        inner_thread_id: &str,
+        html: &str,
+        send_at: DateTime<Utc>,
+        display_name: &str,
+    ) -> Result<ScheduledDraft> {
+        Ok(ScheduledDrafts::new(self.session())
+            .create(inner_thread_id, html, send_at, display_name)
+            .await?)
+    }
+
+    async fn scheduled_drafts(&self) -> Result<Vec<ScheduledDraft>> {
+        Ok(ScheduledDrafts::new(self.session()).list().await?)
+    }
+
+    async fn update_scheduled(
+        &self,
+        draft: &ScheduledDraft,
+        html: &str,
+        display_name: &str,
+    ) -> Result<ScheduledDraft> {
+        Ok(ScheduledDrafts::new(self.session())
+            .update(draft, html, display_name)
+            .await?)
+    }
+
+    async fn cancel_scheduled(&self, draft_id: &str) -> Result<()> {
+        Ok(ScheduledDrafts::new(self.session())
+            .cancel(draft_id)
+            .await?)
+    }
+}
+
+fn chatsvc_conversation(target: &MessageTarget) -> Option<ConversationRef> {
+    match target {
+        MessageTarget::Chat { .. } => CHATSVC_CHAT_WRITES.then(|| conversation_ref(target)),
+        MessageTarget::Channel { .. } => Some(conversation_ref(target)),
+    }
+}
+
+fn conversation_ref(target: &MessageTarget) -> ConversationRef {
+    match target {
+        MessageTarget::Chat { chat_id, .. } => ConversationRef::chat(chat_id),
+        MessageTarget::Channel {
+            channel_id,
+            root_id: None,
+            ..
+        } => ConversationRef::channel_root(channel_id),
+        MessageTarget::Channel {
+            channel_id,
+            root_id: Some(root_id),
+            ..
+        } => ConversationRef::channel_reply(channel_id, root_id),
+    }
+}
+
+impl From<graph::Page<Message>> for RemotePage {
+    fn from(page: graph::Page<Message>) -> Self {
+        RemotePage {
+            items: page.items,
+            next_link: page.next_link,
+            oldest_at: None,
+        }
+    }
+}
+
+impl From<graph::Page<Message>> for DeltaPage {
+    fn from(page: graph::Page<Message>) -> Self {
+        DeltaPage {
+            items: page.items,
+            next_link: page.next_link,
+            delta_link: page.delta_link,
+        }
+    }
+}
+
+impl From<graph::Page<Chat>> for ChatsPage {
+    fn from(page: graph::Page<Chat>) -> Self {
+        ChatsPage {
+            items: page.items,
+            next_link: page.next_link,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_targets_route_to_chatsvc() {
+        let root = MessageTarget::channel("t", "19:c@thread.tacv2", "m1", None);
+        let reply = MessageTarget::channel("t", "19:c@thread.tacv2", "r1", Some("m1"));
+        assert_eq!(
+            chatsvc_conversation(&root),
+            Some(ConversationRef::channel_root("19:c@thread.tacv2"))
+        );
+        assert_eq!(
+            chatsvc_conversation(&reply),
+            Some(ConversationRef::channel_reply("19:c@thread.tacv2", "m1"))
+        );
+    }
+
+    #[test]
+    fn reactions_reach_chats_regardless_of_the_feature_switch() {
+        let chat = MessageTarget::chat("19:a@thread.v2", "m1");
+        assert_eq!(
+            conversation_ref(&chat),
+            ConversationRef::chat("19:a@thread.v2")
+        );
+    }
+
+    #[test]
+    fn chats_follow_the_feature_switch() {
+        let chat = MessageTarget::chat("19:a@thread.v2", "m1");
+        assert_eq!(chatsvc_conversation(&chat).is_some(), CHATSVC_CHAT_WRITES);
+    }
+}

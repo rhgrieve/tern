@@ -23,6 +23,8 @@ pub enum Error {
     Cdp(String),
     #[error("not available without the Teams web app: {0}")]
     PageOnly(String),
+    #[error("refused: {method} {url}")]
+    Refused { method: &'static str, url: String },
     #[error("no token for {resource} may be sent to {url}")]
     TokenHostRefused { resource: String, url: String },
     #[error("tab connection lost during a write ({0}); check whether it was sent before retrying")]

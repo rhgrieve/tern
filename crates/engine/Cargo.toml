@@ -1,0 +1,23 @@
+[package]
+name = "tern-engine"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+chatsvc.workspace = true
+chrono.workspace = true
+directories.workspace = true
+graph.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+session.workspace = true
+store.workspace = true
+teams-core.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

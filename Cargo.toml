@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*", "vendor/engine/session", "vendor/engine/chatsvc"]
+members = ["crates/*", "vendor/engine/session", "vendor/engine/chatsvc", "vendor/engine/graph", "vendor/engine/core", "vendor/engine/store"]
 resolver = "2"
 
 [workspace.package]
@@ -10,6 +10,11 @@ publish = false
 
 [workspace.dependencies]
 base64 = "0.22"
+directories = "6"
+regex = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+scraper = "0.23"
+tempfile = "3"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 clap = { version = "4", features = ["derive"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
@@ -23,6 +28,7 @@ url = "2"
 uuid = { version = "1", default-features = false, features = ["v4"] }
 
 tern-auth = { path = "crates/auth" }
+tern-engine = { path = "crates/engine" }
 tern-ipc = { path = "crates/ipc" }
 tern-presence = { path = "crates/presence" }
 tracing = "0.1"
@@ -31,6 +37,9 @@ zbus = { version = "6", default-features = false, features = ["tokio", "proxy"] 
 
 session = { path = "vendor/engine/session" }
 chatsvc = { path = "vendor/engine/chatsvc" }
+graph = { path = "vendor/engine/graph" }
+store = { path = "vendor/engine/store" }
+teams-core = { path = "vendor/engine/core" }
 
 [profile.dev]
 debug = "line-tables-only"

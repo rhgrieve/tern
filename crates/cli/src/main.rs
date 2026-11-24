@@ -35,6 +35,27 @@ enum Cmd {
     Tokens,
     /// Show push events as they arrive, without message contents
     Tail,
+    /// Try message sync without writing anything, here or in Teams; prints counts only
+    ProbeSync,
+    /// List chats from the cache; works offline
+    Chats {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Read a chat from the cache, by its number in `chats` or its id
+    Read {
+        chat: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Search cached messages; `from:name` filters the sender
+    Search {
+        words: Vec<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Send a message; waits for a connection if there is none
+    Send { chat: String, text: String },
     /// What the background service is doing
     Status,
     /// Watch activity, lock and sleep detection; needs no account
@@ -222,6 +243,257 @@ async fn tail() -> Outcome {
     Ok(())
 }
 
+/// An address without ids or parameters.
+fn skeleton(text: &str) -> String {
+    text.split(['?', ' '])
+        .next()
+        .unwrap_or_default()
+        .split('/')
+        .map(|part| {
+            let id = part.contains("%3A")
+                || part.contains(':') && !part.ends_with(':')
+                || part.len() > 30
+                || part.len() > 8 && part.bytes().filter(u8::is_ascii_digit).count() > 4;
+            if id { "{id}" } else { part }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+async fn probe_sync() -> Outcome {
+    use tern_engine::{Backend, Teams, read_only_guard};
+    let (broker, _) = signed_in().await?;
+    let regions = broker.regions().await.map_err(text)?;
+    let seen: Arc<std::sync::Mutex<std::collections::BTreeMap<String, usize>>> = Arc::default();
+    let (note, allows) = (seen.clone(), read_only_guard());
+    let session = Session::with_provider(broker, SessionConfig::default())
+        .with_region(&regions.region)
+        .with_guard(Arc::new(move |request| {
+            let allowed = allows(request);
+            let line = format!(
+                "{} {} {}",
+                if allowed { "sent   " } else { "REFUSED" },
+                request.method.as_str(),
+                skeleton(&request.url)
+            );
+            *note.lock().expect("log").entry(line).or_default() += 1;
+            allowed
+        }));
+    let store = Arc::new(store::Store::open_in_memory().map_err(text)?);
+    let teams = Teams::new(session, store.clone());
+    let mut reports = teams.engine().subscribe();
+    let start = std::time::Instant::now();
+    let refreshed = teams.refresh().await;
+    println!(
+        "refresh: {:?} in {} ms",
+        refreshed.as_ref().map_err(|failure| failure.text()),
+        start.elapsed().as_millis()
+    );
+    let sidebar = store.sidebar().map_err(text)?;
+    println!(
+        "chats {}, teams {}, channels {}, unread chats {}",
+        sidebar.chats.len(),
+        sidebar.teams.len(),
+        sidebar
+            .teams
+            .iter()
+            .map(|team| team.channels.len())
+            .sum::<usize>(),
+        sidebar.chats.iter().filter(|chat| chat.unread).count(),
+    );
+    let behind = teams.behind();
+    println!("behind: {}", behind.len());
+    let mut channels: Vec<_> = sidebar
+        .teams
+        .iter()
+        .flat_map(|team| &team.channels)
+        .collect();
+    channels.sort_by_key(|channel| std::cmp::Reverse(channel.last_message_at));
+    let channels: Vec<String> = channels
+        .into_iter()
+        .take(4)
+        .map(|channel| channel.id.clone())
+        .collect();
+    for (kind, id) in behind
+        .iter()
+        .take(2)
+        .map(|id| ("chat", id))
+        .chain(channels.iter().map(|id| ("channel", id)))
+    {
+        let start = std::time::Instant::now();
+        match teams.fetch(id).await {
+            Ok(messages) => println!(
+                "{kind}: {} messages, {} events, {} from apps, {} with a sender, {} readable, {} ms",
+                messages.len(),
+                messages
+                    .iter()
+                    .filter(|message| message.call_event_json.is_some())
+                    .count(),
+                messages
+                    .iter()
+                    .filter(|message| message.sender_application_id.is_some())
+                    .count(),
+                messages
+                    .iter()
+                    .filter(|message| message.sender_name.is_some())
+                    .count(),
+                messages
+                    .iter()
+                    .filter(|message| !teams_core::readable_text(message).is_empty())
+                    .count(),
+                start.elapsed().as_millis()
+            ),
+            Err(failure) => println!("{kind}: FAILED {}", failure.text()),
+        }
+    }
+    while let Ok(event) = reports.try_recv() {
+        if let teams_core::CoreEvent::Error { message } = event {
+            let words: Vec<String> = message.split(' ').map(skeleton).collect();
+            println!(
+                "engine: {}",
+                words.join(" ").chars().take(220).collect::<String>()
+            );
+        }
+    }
+    println!("requests:");
+    for (line, count) in seen.lock().expect("log").iter() {
+        println!("  {count:3} {line}");
+    }
+    Ok(())
+}
+
+async fn cache() -> Result<store::Store, String> {
+    let (_, identity) = signed_in().await?;
+    tern_engine::open_read_only(&identity.object_id)
+}
+
+/// Other people's text: control characters must not reach the terminal.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|letter| {
+            if letter.is_control() && letter != '\n' {
+                ' '
+            } else {
+                letter
+            }
+        })
+        .collect()
+}
+
+fn one_line(text: &str) -> String {
+    printable(text).replace('\n', " ")
+}
+
+fn local(at: chrono::DateTime<chrono::Utc>) -> String {
+    at.with_timezone(&chrono::Local)
+        .format("%a %d %b %H:%M")
+        .to_string()
+}
+
+/// A chat by its number in `chats`, or by its id. The notes chat is `notes`.
+fn chat_id(store: &store::Store, chat: &str) -> Result<String, String> {
+    if chat == "notes" {
+        return Ok("48:notes".into());
+    }
+    let Ok(number) = chat.parse::<usize>() else {
+        return Ok(chat.to_owned());
+    };
+    let chats = store.recent_chats(number).map_err(text)?;
+    number
+        .checked_sub(1)
+        .and_then(|index| chats.get(index))
+        .map(|chat| chat.id.clone())
+        .ok_or_else(|| "There is no chat with that number.".into())
+}
+
+async fn chats(limit: usize) -> Outcome {
+    for (index, chat) in cache()
+        .await?
+        .recent_chats(limit)
+        .map_err(text)?
+        .iter()
+        .enumerate()
+    {
+        println!(
+            "{:3} {} {:16} {}",
+            index + 1,
+            if chat.unread { "*" } else { " " },
+            chat.last_message_at.map(local).unwrap_or_default(),
+            one_line(&chat.display_title())
+        );
+    }
+    Ok(())
+}
+
+async fn read(chat: &str, limit: usize) -> Outcome {
+    let store = cache().await?;
+    let id = chat_id(&store, chat)?;
+    let messages = store.messages(&id, None, limit).map_err(text)?;
+    if messages.is_empty() {
+        return Err("Nothing cached for this chat.".into());
+    }
+    for message in messages {
+        let body = if message.deleted {
+            "(deleted)".to_owned()
+        } else {
+            teams_core::readable_text(&message)
+        };
+        println!(
+            "{}  {}\n    {}",
+            local(message.created_at),
+            one_line(message.sender_name.as_deref().unwrap_or("")),
+            printable(&body).replace('\n', "\n    ")
+        );
+    }
+    Ok(())
+}
+
+async fn search(query: &str, limit: usize) -> Outcome {
+    let store = cache().await?;
+    let hits = store.search_messages(query, None, limit).map_err(text)?;
+    if hits.is_empty() {
+        return Err("Nothing found.".into());
+    }
+    for hit in hits {
+        let place = store
+            .chat(&hit.conversation_id)
+            .ok()
+            .flatten()
+            .map_or_else(|| "channel".to_owned(), |chat| chat.display_title());
+        let snippet: String = hit
+            .snippet
+            .chars()
+            .filter(|letter| !matches!(*letter, store::HIGHLIGHT_START | store::HIGHLIGHT_END))
+            .collect();
+        println!(
+            "{}  {} in {}\n    {}",
+            local(hit.created_at),
+            one_line(hit.sender_name.as_deref().unwrap_or("")),
+            one_line(&place),
+            one_line(&snippet)
+        );
+    }
+    Ok(())
+}
+
+async fn send(chat: &str, message: String) -> Outcome {
+    let conversation = chat_id(&cache().await?, chat)?;
+    match tern_ipc::ask(&Request::Send {
+        conversation,
+        text: message,
+    })
+    .await
+    {
+        Ok(Response::Done) => {
+            println!("Queued.");
+            Ok(())
+        }
+        Ok(Response::Error(error)) => Err(error),
+        Ok(Response::Status(_)) => Err("unexpected answer".into()),
+        Err(error) => Err(format!("The background service is not running ({error}).")),
+    }
+}
+
 fn print_status(status: &Status) {
     let line = |name: &str, value: &str| println!("{name:<12} {value}");
     line(
@@ -256,6 +528,20 @@ fn print_status(status: &Status) {
             "NOT AVAILABLE"
         },
     );
+    line(
+        "Messages",
+        &match (status.synced, status.reading) {
+            (false, _) => "reading the chat list".to_owned(),
+            (true, 0) => "up to date".to_owned(),
+            (true, count) => format!("reading {count} conversations"),
+        },
+    );
+    if status.unsent > 0 {
+        line("Unsent", &status.unsent.to_string());
+    }
+    if let Some(problem) = &status.sync_problem {
+        line("Sync", problem);
+    }
     if let Some(problem) = &status.problem {
         line("Problem", problem);
     }
@@ -311,6 +597,11 @@ async fn main() -> ExitCode {
             .map(|(_, identity)| println!("{}", identity.name)),
         Cmd::Tokens => tokens().await,
         Cmd::Tail => tail().await,
+        Cmd::Chats { limit } => chats(limit).await,
+        Cmd::Read { chat, limit } => read(&chat, limit).await,
+        Cmd::Search { words, limit } => search(&words.join(" "), limit).await,
+        Cmd::Send { chat, text } => send(&chat, text).await,
+        Cmd::ProbeSync => probe_sync().await,
         Cmd::Status => status().await,
         Cmd::Sensors { idle } => sensors(idle).await,
     };

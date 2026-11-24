@@ -1,0 +1,6128 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use chatsvc::ConversationRef;
+use chrono::{DateTime, Duration, TimeZone, Utc};
+use graph::{
+    Channel, Chat, DriveFolder, HostedImage, Member, Message, MessageExtras, MessageTarget,
+    OutgoingMention, Photo, Presence, SharedFile, Team, UploadDestination, UploadedFile, User,
+};
+use serde_json::json;
+use store::{
+    ChannelLayoutRecord, ChannelRecord, ChannelTabRecord, Store, TeamLayoutRecord, TeamRecord,
+};
+use teams_core::{
+    Availability, BoxFuture, ChannelPrivacy, ChatFolder, ChatSection, ChatSectionSettings,
+    ChatsPage, CoreEvent, DeltaPage, Error, FolderChange, FolderKind, FolderSource,
+    MentionCandidate, MentionInput, MentionTarget, NOTES_CHAT_ID, PersonSource, Remote, RemotePage,
+    Result, SyncConfig, SyncEngine, substrate_search,
+};
+
+const ME: &str = "user-me";
+const CHAT: &str = "19:chat@thread.v2";
+const CHANNEL: &str = "19:channel@thread.tacv2";
+
+fn base() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 10, 6, 8, 0, 0).unwrap()
+}
+
+fn message(id: u32, minute: i64, body: &str) -> Message {
+    serde_json::from_value(json!({
+        "id": format!("m{id:04}"),
+        "messageType": "message",
+        "createdDateTime": (base() + Duration::minutes(minute)).to_rfc3339(),
+        "from": {"user": {"id": "user-ada", "displayName": "Ada Example"}},
+        "body": {"contentType": "html", "content": body},
+    }))
+    .unwrap()
+}
+
+fn numbered(count: u32) -> Vec<Message> {
+    (1..=count)
+        .map(|index| message(index, i64::from(index), &format!("<p>n{index}</p>")))
+        .collect()
+}
+
+fn chat(
+    id: &str,
+    topic: Option<&str>,
+    last_minute: i64,
+    read_minute: i64,
+    from: &str,
+    hidden: bool,
+) -> Chat {
+    serde_json::from_value(json!({
+        "id": id,
+        "topic": topic,
+        "chatType": if topic.is_some() { "group" } else { "oneOnOne" },
+        "lastUpdatedDateTime": (base() + Duration::minutes(last_minute)).to_rfc3339(),
+        "members": [
+            {"userId": ME, "displayName": "Me Myself"},
+            {"userId": "user-ada", "displayName": "Ada Example"}
+        ],
+        "lastMessagePreview": {"id": "p", "createdDateTime": (base() + Duration::minutes(last_minute)).to_rfc3339(), "from": {"user": {"id": from}}},
+        "viewpoint": {"lastMessageReadDateTime": (base() + Duration::minutes(read_minute)).to_rfc3339(), "isHidden": hidden},
+    }))
+    .unwrap()
+}
+
+fn translated(messages: &[chatsvc::TranslateRequest]) -> Vec<chatsvc::Translation> {
+    messages
+        .iter()
+        .map(|request| chatsvc::Translation {
+            message_id: request.message_id.clone(),
+            version: None,
+            status: chatsvc::TranslationStatus::Done,
+            content_html: Some("<p>translated</p>".to_owned()),
+            subject: None,
+            title: None,
+        })
+        .collect()
+}
+
+type ScheduledCall = (String, String, DateTime<Utc>, String);
+
+#[derive(Default)]
+struct Fake {
+    chats: Mutex<Vec<Chat>>,
+    fetchable_chats: Mutex<Vec<Chat>>,
+    single_chat_calls: Mutex<usize>,
+    chat_messages: Mutex<Vec<Message>>,
+    lagging_message: Mutex<Option<(usize, Message)>>,
+    channel_pages: Mutex<Vec<Vec<Message>>>,
+    teams: Mutex<Vec<Team>>,
+    failing_team: Mutex<Option<String>>,
+    failing_cards: Mutex<bool>,
+    chat_calls: Mutex<usize>,
+    chat_page_calls: Mutex<usize>,
+    team_calls: Mutex<usize>,
+    calls: Mutex<Vec<String>>,
+    delta_items: Mutex<Vec<Message>>,
+    thread_replies: Mutex<Vec<Message>>,
+    delta_fails: Mutex<bool>,
+    photos: Mutex<HashMap<String, Vec<u8>>>,
+    photo_requests: Mutex<Vec<Vec<String>>>,
+    presence_answers: Mutex<Vec<Presence>>,
+    presence_subscriptions: Mutex<Vec<(String, Vec<String>, bool)>>,
+    hosted_requests: Mutex<Vec<String>>,
+    external_requests: Mutex<Vec<String>>,
+    mentions_sent: Mutex<Vec<Vec<OutgoingMention>>>,
+    extras_sent: Mutex<Vec<MessageExtras>>,
+    chatsvc_posts: Mutex<Vec<(String, String, String, serde_json::Value)>>,
+    folder_requests: Mutex<usize>,
+    directory_users: Mutex<Vec<User>>,
+    horizons: Mutex<Vec<chatsvc::MemberHorizon>>,
+    horizon_calls: Mutex<usize>,
+    thread_activities: Mutex<Vec<chatsvc::ThreadActivity>>,
+    apps: Mutex<Vec<chatsvc::ChatApp>>,
+    app_calls: Mutex<usize>,
+    invokes: Mutex<Vec<chatsvc::InvokeRequest>>,
+    invoke_answer: Mutex<Option<chatsvc::InvokeResponse>>,
+    muted_states: Mutex<Vec<(String, bool)>>,
+    hidden_states: Mutex<Vec<(String, bool)>>,
+    read_states: Mutex<Vec<(String, chatsvc::ReadHorizon)>>,
+    notes_placeholder: Mutex<bool>,
+    chats_fail: Mutex<bool>,
+    muted_fails: Mutex<bool>,
+    link_pages: Mutex<Vec<chatsvc::MessageLinks>>,
+    link_page_calls: Mutex<Vec<String>>,
+    links_put: Mutex<Vec<(String, String)>>,
+    link_info_calls: Mutex<usize>,
+    translate_calls: Mutex<Vec<String>>,
+    scheduled: Mutex<Vec<ScheduledCall>>,
+    own_status_answer: Mutex<chatsvc::PresenceStatus>,
+    availability_puts: Mutex<Vec<Option<chatsvc::ForcedAvailability>>>,
+    note_puts: Mutex<Vec<Option<chatsvc::StatusNote>>>,
+    window_answer: Mutex<Option<chatsvc::MessageWindow>>,
+    window_requests: Mutex<Vec<(String, chatsvc::WindowDirection)>>,
+    search_identities: Mutex<Vec<substrate_search::SearchIdentity>>,
+    member_requests: Mutex<Vec<String>>,
+    activity_feed: Mutex<chatsvc::ActivitySnapshot>,
+    app_channel_horizon_ms: Mutex<i64>,
+}
+
+impl Fake {
+    fn set_chat_messages(&self, messages: Vec<Message>) {
+        *self.chat_messages.lock().unwrap() = messages;
+    }
+}
+
+fn page_of(items: Vec<Message>, next_link: Option<String>) -> Result<RemotePage> {
+    Ok(RemotePage {
+        items,
+        next_link,
+        oldest_at: None,
+    })
+}
+
+struct Handle(Arc<Fake>);
+
+impl std::ops::Deref for Handle {
+    type Target = Fake;
+
+    fn deref(&self) -> &Fake {
+        &self.0
+    }
+}
+
+fn describe(target: &MessageTarget) -> String {
+    match target {
+        MessageTarget::Chat { message_id, .. } => message_id.clone(),
+        MessageTarget::Channel {
+            message_id,
+            root_id,
+            ..
+        } => format!("channel:{}:{message_id}", root_id.as_deref().unwrap_or("-")),
+    }
+}
+
+fn unsupported<T>() -> Result<T> {
+    Err(Error::Unsupported("not faked"))
+}
+
+impl Fake {
+    fn record(&self, call: String) {
+        self.calls.lock().unwrap().push(call);
+    }
+
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn sorted_chats(&self) -> Vec<Chat> {
+        let mut chats = self.chats.lock().unwrap().clone();
+        chats.sort_by_key(|chat| std::cmp::Reverse(chat.last_message_time()));
+        chats
+    }
+
+    fn chats_from(&self, offset: usize, top: usize) -> ChatsPage {
+        *self.chat_page_calls.lock().unwrap() += 1;
+        let chats = self.sorted_chats();
+        let items: Vec<Chat> = chats.iter().skip(offset).take(top).cloned().collect();
+        let next_link =
+            (offset + top < chats.len()).then(|| format!("chats:{}:{top}", offset + top));
+        ChatsPage { items, next_link }
+    }
+}
+
+impl Remote for Handle {
+    async fn server_suggestions(
+        &self,
+        identity: &substrate_search::SearchIdentity,
+        _search_session: &substrate_search::SearchSession,
+        text: &str,
+    ) -> Result<substrate_search::Suggestions> {
+        self.search_identities
+            .lock()
+            .unwrap()
+            .push(identity.clone());
+        self.record(format!("server_suggestions:{text}"));
+        Ok(substrate_search::Suggestions::default())
+    }
+
+    async fn me(&self) -> Result<User> {
+        Ok(serde_json::from_value(json!({"id": ME, "displayName": "Me Myself"})).unwrap())
+    }
+
+    async fn chats_page(&self, top: usize) -> Result<ChatsPage> {
+        Ok(self.chats_from(0, top))
+    }
+
+    async fn chats_at(&self, next_link: &str) -> Result<ChatsPage> {
+        if *self.chats_fail.lock().unwrap() {
+            return Err(Error::Unsupported("forced failure"));
+        }
+        let mut parts = next_link.trim_start_matches("chats:").split(':');
+        let offset = parts.next().unwrap().parse().unwrap();
+        let top = parts.next().unwrap().parse().unwrap();
+        Ok(self.chats_from(offset, top))
+    }
+
+    async fn chat(&self, chat_id: &str) -> Result<Chat> {
+        *self.single_chat_calls.lock().unwrap() += 1;
+        if chat_id == NOTES_CHAT_ID {
+            return Err(Error::Graph(graph::Error::Session(session::Error::api(
+                400,
+                chat_id,
+                json!({"error": {"code": "BadRequest", "message": "Resource is not a ChatThread"}}),
+            ))));
+        }
+        let found = self
+            .fetchable_chats
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate.id == chat_id)
+            .cloned();
+        found.ok_or_else(|| {
+            Error::Graph(graph::Error::Session(session::Error::api(
+                404,
+                chat_id,
+                json!({}),
+            )))
+        })
+    }
+
+    async fn chat_members(&self, chat_id: &str) -> Result<Vec<Member>> {
+        self.member_requests
+            .lock()
+            .unwrap()
+            .push(chat_id.to_owned());
+        Ok(vec![
+            serde_json::from_value(
+                json!({"userId": ME, "tenantId": "tenant-1", "displayName": "Me Myself"}),
+            )
+            .unwrap(),
+        ])
+    }
+
+    async fn joined_teams(&self) -> Result<Vec<Team>> {
+        *self.team_calls.lock().unwrap() += 1;
+        Ok(self.teams.lock().unwrap().clone())
+    }
+
+    async fn channels_for_teams(&self, team_ids: &[String]) -> Result<Vec<Result<Vec<Channel>>>> {
+        let failing = self.failing_team.lock().unwrap().clone();
+        Ok(team_ids
+            .iter()
+            .map(|team_id| {
+                if failing.as_deref() == Some(team_id.as_str()) {
+                    return Err(Error::Unsupported("forced failure"));
+                }
+                Ok(vec![serde_json::from_value(json!({"id": CHANNEL, "displayName": "General", "membershipType": "standard"})).unwrap()])
+            })
+            .collect())
+    }
+
+    async fn chat_messages(
+        &self,
+        _chat_id: &str,
+        before: Option<DateTime<Utc>>,
+        top: usize,
+    ) -> Result<RemotePage> {
+        let calls = {
+            let mut calls = self.chat_calls.lock().unwrap();
+            *calls += 1;
+            *calls
+        };
+        let mut lagging = self.lagging_message.lock().unwrap();
+        if lagging
+            .as_ref()
+            .is_some_and(|(visible_from, _)| calls >= *visible_from)
+            && let Some((_, message)) = lagging.take()
+        {
+            self.chat_messages.lock().unwrap().push(message);
+        }
+        drop(lagging);
+        let mut matching: Vec<Message> = self
+            .chat_messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|message| {
+                before.is_none_or(|before| message.created_date_time.unwrap() < before)
+            })
+            .cloned()
+            .collect();
+        matching.sort_by_key(|message| std::cmp::Reverse(message.created_date_time));
+        let has_more = matching.len() > top;
+        matching.truncate(top);
+        page_of(
+            matching,
+            has_more.then(|| "https://graph.microsoft.com/v1.0/next".to_owned()),
+        )
+    }
+
+    async fn chat_message_window(
+        &self,
+        _chat_id: &str,
+        anchor_id: &str,
+        direction: chatsvc::WindowDirection,
+        _page_size: usize,
+    ) -> Result<chatsvc::MessageWindow> {
+        self.window_requests
+            .lock()
+            .unwrap()
+            .push((anchor_id.to_owned(), direction));
+        self.window_answer
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(Error::Unsupported("no window"))
+    }
+
+    async fn chat_messages_by_id(
+        &self,
+        chat_id: &str,
+        message_ids: &[String],
+    ) -> Result<Vec<Result<Message>>> {
+        let mut messages = Vec::new();
+        for message_id in message_ids {
+            messages.push(self.chat_message(chat_id, message_id).await);
+        }
+        Ok(messages)
+    }
+
+    async fn chat_message(&self, _chat_id: &str, message_id: &str) -> Result<Message> {
+        self.record(format!("chat_message {message_id}"));
+        self.chat_messages
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|message| message.id == message_id)
+            .cloned()
+            .ok_or(Error::Unsupported("missing message"))
+    }
+
+    async fn channel_messages(
+        &self,
+        _team_id: &str,
+        _channel_id: &str,
+        _top: usize,
+    ) -> Result<RemotePage> {
+        let pages = self.channel_pages.lock().unwrap();
+        page_of(
+            pages[0].clone(),
+            (pages.len() > 1).then(|| "page:1".to_owned()),
+        )
+    }
+
+    async fn channel_messages_at(&self, next_link: &str) -> Result<RemotePage> {
+        let index: usize = next_link.trim_start_matches("page:").parse().unwrap();
+        let pages = self.channel_pages.lock().unwrap();
+        page_of(
+            pages[index].clone(),
+            (pages.len() > index + 1).then(|| format!("page:{}", index + 1)),
+        )
+    }
+
+    async fn channel_message(
+        &self,
+        _team_id: &str,
+        _channel_id: &str,
+        message_id: &str,
+    ) -> Result<Message> {
+        self.record(format!("channel_message {message_id}"));
+        self.channel_pages
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .find(|message| message.id == message_id)
+            .cloned()
+            .ok_or(Error::Unsupported("missing message"))
+    }
+
+    async fn channel_reply(
+        &self,
+        _team_id: &str,
+        _channel_id: &str,
+        message_id: &str,
+        reply_id: &str,
+    ) -> Result<Message> {
+        self.record(format!("channel_reply {message_id} {reply_id}"));
+        self.channel_pages
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .filter(|root| root.id == message_id)
+            .flat_map(|root| root.replies.iter())
+            .find(|reply| reply.id == reply_id)
+            .cloned()
+            .ok_or(Error::Unsupported("missing reply"))
+    }
+
+    async fn channel_delta(
+        &self,
+        _team_id: &str,
+        _channel_id: &str,
+        modified_after: Option<DateTime<Utc>>,
+    ) -> Result<DeltaPage> {
+        self.record(format!("channel_delta since={}", modified_after.is_some()));
+        if *self.delta_fails.lock().unwrap() {
+            return unsupported();
+        }
+        Ok(DeltaPage {
+            items: self.delta_items.lock().unwrap().clone(),
+            next_link: None,
+            delta_link: Some("delta:1".to_owned()),
+        })
+    }
+
+    async fn channel_delta_at(&self, link: &str) -> Result<DeltaPage> {
+        self.record(format!("channel_delta_at {link}"));
+        if *self.delta_fails.lock().unwrap() {
+            return unsupported();
+        }
+        Ok(DeltaPage {
+            items: std::mem::take(&mut *self.delta_items.lock().unwrap()),
+            next_link: None,
+            delta_link: Some("delta:2".to_owned()),
+        })
+    }
+
+    async fn channel_replies(
+        &self,
+        _team_id: &str,
+        _channel_id: &str,
+        root_ids: &[String],
+    ) -> Result<Vec<Result<Vec<Message>>>> {
+        let replies = self.thread_replies.lock().unwrap().clone();
+        Ok(root_ids
+            .iter()
+            .map(|root_id| {
+                Ok(replies
+                    .iter()
+                    .filter(|reply| reply.reply_to_id.as_deref() == Some(root_id.as_str()))
+                    .cloned()
+                    .collect())
+            })
+            .collect())
+    }
+
+    async fn send_channel_message(
+        &self,
+        _team_id: &str,
+        _channel_id: &str,
+        html: &str,
+        subject: Option<&str>,
+        mentions: &[OutgoingMention],
+        extras: &MessageExtras,
+    ) -> Result<Message> {
+        self.record(format!("post subject={subject:?}"));
+        self.mentions_sent.lock().unwrap().push(mentions.to_vec());
+        self.extras_sent.lock().unwrap().push(extras.clone());
+        Ok(message(9001, 501, html))
+    }
+
+    async fn reply_to_channel_message(
+        &self,
+        _team_id: &str,
+        _channel_id: &str,
+        message_id: &str,
+        html: &str,
+        mentions: &[OutgoingMention],
+        extras: &MessageExtras,
+    ) -> Result<Message> {
+        self.record(format!("reply to {message_id}"));
+        self.mentions_sent.lock().unwrap().push(mentions.to_vec());
+        self.extras_sent.lock().unwrap().push(extras.clone());
+        Ok(message(9002, 502, html))
+    }
+
+    async fn post_chatsvc_message(
+        &self,
+        conversation: &chatsvc::ConversationRef,
+        html: &str,
+        display_name: &str,
+        properties: &serde_json::Value,
+    ) -> Result<String> {
+        let conversation_id = conversation.conversation_id();
+        self.record(format!("chatsvc post {conversation_id}"));
+        self.chatsvc_posts.lock().unwrap().push((
+            conversation_id,
+            html.to_owned(),
+            display_name.to_owned(),
+            properties.clone(),
+        ));
+        Ok("1727203440000".to_owned())
+    }
+
+    async fn upload_ams_image(
+        &self,
+        conversation_id: &str,
+        bytes: &[u8],
+        filename: &str,
+    ) -> Result<chatsvc::ams::AmsImage> {
+        self.record(format!(
+            "ams upload {conversation_id} {filename} {}",
+            bytes.len()
+        ));
+        Ok(chatsvc::ams::AmsImage {
+            object_id: "0-ams".to_owned(),
+            url:
+                "https://de-prod.asyncgw.teams.microsoft.com/v1/objects/0-ams/views/imgpsh_fullsize"
+                    .to_owned(),
+        })
+    }
+
+    async fn set_message_cards(
+        &self,
+        conversation: &chatsvc::ConversationRef,
+        message_id: &str,
+        cards: &str,
+    ) -> Result<()> {
+        self.record(format!(
+            "cards {} {message_id} {cards}",
+            conversation.conversation_id()
+        ));
+        if *self.failing_cards.lock().unwrap() {
+            return Err(teams_core::Error::Folders("cards refused".to_owned()));
+        }
+        Ok(())
+    }
+
+    async fn remove_chat_member(&self, chat_id: &str, user_id: &str) -> Result<()> {
+        self.record(format!("remove member {chat_id} {user_id}"));
+        Ok(())
+    }
+
+    async fn add_chat_members(
+        &self,
+        chat_id: &str,
+        user_ids: &[String],
+        share: chatsvc::HistoryShare,
+    ) -> Result<()> {
+        self.record(format!(
+            "add members {chat_id} {} {share:?}",
+            user_ids.join(",")
+        ));
+        Ok(())
+    }
+
+    async fn chat_states(&self) -> Result<Vec<chatsvc::ConversationState>> {
+        if *self.muted_fails.lock().unwrap() {
+            return Err(Error::Unsupported("forced failure"));
+        }
+        let muted = self.muted_states.lock().unwrap().clone();
+        let hidden = self.hidden_states.lock().unwrap().clone();
+        let mut states: Vec<chatsvc::ConversationState> = muted
+            .into_iter()
+            .map(|(id, muted)| chatsvc::ConversationState {
+                id,
+                muted,
+                hidden: None,
+                read: chatsvc::ReadHorizon::default(),
+                notification_settings: None,
+                history_cleared_ms: None,
+                hidden_at_ms: None,
+            })
+            .collect();
+        states.extend(
+            hidden
+                .into_iter()
+                .map(|(id, hidden)| chatsvc::ConversationState {
+                    id,
+                    muted: false,
+                    hidden: Some(hidden),
+                    read: chatsvc::ReadHorizon::default(),
+                    notification_settings: None,
+                    history_cleared_ms: None,
+                    hidden_at_ms: None,
+                }),
+        );
+        let read = self.read_states.lock().unwrap().clone();
+        states.extend(
+            read.into_iter()
+                .map(|(id, read)| chatsvc::ConversationState {
+                    id,
+                    muted: false,
+                    hidden: None,
+                    read,
+                    notification_settings: None,
+                    history_cleared_ms: None,
+                    hidden_at_ms: None,
+                }),
+        );
+        if !*self.notes_placeholder.lock().unwrap()
+            && !states.iter().any(|state| state.id == NOTES_CHAT_ID)
+        {
+            states.push(chatsvc::ConversationState {
+                id: NOTES_CHAT_ID.to_owned(),
+                hidden: Some(true),
+                ..chatsvc::ConversationState::default()
+            });
+        }
+        Ok(states)
+    }
+
+    async fn set_chat_muted(&self, chat_id: &str, muted: bool) -> Result<()> {
+        self.record(format!("mute {chat_id} {muted}"));
+        Ok(())
+    }
+
+    async fn set_read_horizon(&self, conversation_id: &str, horizon: &str) -> Result<()> {
+        self.record(format!("read horizon {conversation_id} {horizon}"));
+        Ok(())
+    }
+
+    async fn set_read_bookmark(&self, conversation_id: &str, bookmark: &str) -> Result<()> {
+        self.record(format!("read bookmark {conversation_id} {bookmark}"));
+        Ok(())
+    }
+
+    async fn set_chat_hidden_at(&self, chat_id: &str, hidden_at_ms: Option<i64>) -> Result<()> {
+        let hidden = hidden_at_ms.map_or("none".to_owned(), |_| "now".to_owned());
+        self.record(format!("hidden at {chat_id} {hidden}"));
+        Ok(())
+    }
+
+    async fn set_channel_notifications(
+        &self,
+        channel_id: &str,
+        notifications: store::ChannelNotifications,
+    ) -> Result<()> {
+        self.record(format!(
+            "channel notifications {channel_id} {} {}",
+            notifications.level.key(),
+            notifications.include_replies
+        ));
+        Ok(())
+    }
+
+    async fn send_typing(&self, conversation: &ConversationRef, active: bool) -> Result<()> {
+        self.record(format!(
+            "typing {} {active}",
+            conversation.conversation_id()
+        ));
+        Ok(())
+    }
+
+    async fn set_reaction(&self, target: &MessageTarget, reaction_type: &str) -> Result<()> {
+        self.record(format!("set_reaction {} {reaction_type}", describe(target)));
+        Ok(())
+    }
+
+    async fn unset_reaction(&self, target: &MessageTarget, reaction_type: &str) -> Result<()> {
+        self.record(format!(
+            "unset_reaction {} {reaction_type}",
+            describe(target)
+        ));
+        Ok(())
+    }
+
+    async fn edit_message(
+        &self,
+        target: &MessageTarget,
+        html: &str,
+        mentions: &[OutgoingMention],
+        extras: &MessageExtras,
+    ) -> Result<()> {
+        self.record(format!("edit {} {html}", describe(target)));
+        self.mentions_sent.lock().unwrap().push(mentions.to_vec());
+        self.extras_sent.lock().unwrap().push(extras.clone());
+        Ok(())
+    }
+
+    async fn delete_file(&self, file: &UploadedFile) -> Result<()> {
+        self.record(format!("delete_file {}", file.item_id));
+        Ok(())
+    }
+
+    async fn soft_delete_message(&self, user_id: &str, target: &MessageTarget) -> Result<()> {
+        self.record(format!("soft_delete {user_id} {}", describe(target)));
+        Ok(())
+    }
+
+    async fn undo_soft_delete_message(&self, user_id: &str, target: &MessageTarget) -> Result<()> {
+        self.record(format!("undo_soft_delete {user_id} {}", describe(target)));
+        Ok(())
+    }
+
+    async fn create_one_on_one(&self, my_user_id: &str, user_id: &str) -> Result<Chat> {
+        self.record(format!("one_on_one {my_user_id} {user_id}"));
+        Ok(chat("19:new@thread.v2", None, 40, 40, ME, false))
+    }
+
+    async fn create_group(
+        &self,
+        my_user_id: &str,
+        user_ids: &[String],
+        topic: Option<&str>,
+    ) -> Result<Chat> {
+        self.record(format!(
+            "group {my_user_id} {} {topic:?}",
+            user_ids.join(",")
+        ));
+        Ok(chat("19:group@thread.v2", topic, 41, 41, ME, false))
+    }
+
+    async fn channel_files_folder(&self, team_id: &str, channel_id: &str) -> Result<DriveFolder> {
+        *self.folder_requests.lock().unwrap() += 1;
+        self.record(format!("files_folder {team_id} {channel_id}"));
+        Ok(DriveFolder {
+            drive_id: "drive-1".into(),
+            item_id: "folder-1".into(),
+        })
+    }
+
+    async fn upload_file(
+        &self,
+        destination: &UploadDestination,
+        file_name: &str,
+        bytes: &[u8],
+        progress: &(dyn Fn(u8) + Send + Sync),
+    ) -> Result<UploadedFile> {
+        let target = match destination {
+            UploadDestination::ChatFiles => "chat-files".to_owned(),
+            UploadDestination::Folder(folder) => format!("{}/{}", folder.drive_id, folder.item_id),
+        };
+        self.record(format!("upload {target} {file_name} {}", bytes.len()));
+        progress(50);
+        progress(100);
+        Ok(UploadedFile {
+            drive_id: "drive-1".into(),
+            item_id: "item-1".into(),
+            name: file_name.to_owned(),
+            web_url: "https://files.example/web".into(),
+            web_dav_url: Some("https://files.example/dav".into()),
+            etag: "\"{GUID-1},2\"".into(),
+        })
+    }
+
+    async fn resolve_share(&self, open_url: &str) -> Result<SharedFile> {
+        self.record(format!("resolve {open_url}"));
+        Ok(SharedFile {
+            name: "big.bin".into(),
+            size: 2 * graph::DOWNLOAD_CHUNK_BYTES + 3,
+            download_url: if open_url.contains("short") {
+                "https://dl.example/short".into()
+            } else if open_url.contains("grown") {
+                "https://dl.example/grown".into()
+            } else {
+                "https://dl.example/big".into()
+            },
+        })
+    }
+
+    async fn resolve_drive_item(&self, drive_id: &str, item_id: &str) -> Result<SharedFile> {
+        self.record(format!("resolve item {drive_id}/{item_id}"));
+        Ok(SharedFile {
+            name: "big.bin".into(),
+            size: 2 * graph::DOWNLOAD_CHUNK_BYTES + 3,
+            download_url: "https://dl.example/fresh".into(),
+        })
+    }
+
+    async fn download_range(
+        &self,
+        download_url: &str,
+        start: u64,
+        end: Option<u64>,
+    ) -> Result<Vec<u8>> {
+        let total = 2 * graph::DOWNLOAD_CHUNK_BYTES + 3;
+        let shown_end = end.map_or(String::new(), |end| end.to_string());
+        self.record(format!("range {download_url} {start}-{shown_end}"));
+        let length = match end {
+            _ if download_url.contains("short") => 1,
+            Some(end) => end - start + 1,
+            None if download_url.contains("grown") => total - start + 10,
+            None => total - start,
+        };
+        Ok(vec![7; length as usize])
+    }
+
+    async fn share_file(&self, file: &UploadedFile, user_ids: &[String]) -> Result<()> {
+        self.record(format!("share {} {}", file.item_id, user_ids.join(",")));
+        Ok(())
+    }
+
+    async fn external_image(&self, url: &str) -> Result<Photo> {
+        self.external_requests.lock().unwrap().push(url.to_owned());
+        self.hosted_content(url).await
+    }
+
+    async fn hosted_content(&self, url: &str) -> Result<Photo> {
+        self.hosted_requests.lock().unwrap().push(url.to_owned());
+        if url.contains("broken") {
+            return unsupported();
+        }
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend([
+            0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0, 40, 0, 0, 0, 20,
+        ]);
+        Ok(Photo {
+            bytes,
+            content_type: String::new(),
+        })
+    }
+
+    async fn user_photos(&self, user_ids: &[String]) -> Result<Vec<Result<Option<Photo>>>> {
+        self.photo_requests.lock().unwrap().push(user_ids.to_vec());
+        let photos = self.photos.lock().unwrap();
+        Ok(user_ids
+            .iter()
+            .map(|user_id| {
+                Ok(photos.get(user_id).map(|bytes| Photo {
+                    bytes: bytes.clone(),
+                    content_type: "image/jpeg".to_owned(),
+                }))
+            })
+            .collect())
+    }
+
+    async fn chat_thread_activities(&self, _chat_id: &str) -> Result<Vec<chatsvc::ThreadActivity>> {
+        Ok(self.thread_activities.lock().unwrap().clone())
+    }
+
+    async fn consumption_horizons(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Vec<chatsvc::MemberHorizon>> {
+        *self.horizon_calls.lock().unwrap() += 1;
+        Ok(self.horizons.lock().unwrap().clone())
+    }
+
+    async fn forward_messages(
+        &self,
+        source_conversation_id: &str,
+        target_conversation_id: &str,
+        message_ids: &[String],
+        comment_html: &str,
+    ) -> Result<chatsvc::ForwardResult> {
+        self.record(format!(
+            "forward {source_conversation_id} {target_conversation_id} {} {comment_html}",
+            message_ids.join(",")
+        ));
+        Ok(chatsvc::ForwardResult {
+            thread_id: target_conversation_id.to_owned(),
+            message_id: "99".to_owned(),
+        })
+    }
+
+    async fn set_saved(
+        &self,
+        conversation_id: &str,
+        root_id: &str,
+        message_id: &str,
+        saved: bool,
+    ) -> Result<()> {
+        self.record(format!(
+            "save {conversation_id} {root_id} {message_id} {saved}"
+        ));
+        Ok(())
+    }
+
+    async fn set_post_followed(
+        &self,
+        user_id: &str,
+        channel_id: &str,
+        root_id: &str,
+        followed: bool,
+    ) -> Result<Option<String>> {
+        self.record(format!(
+            "follow {user_id} {channel_id} {root_id} {followed}"
+        ));
+        Ok(None)
+    }
+
+    async fn pin_message(&self, chat_id: &str, message_id: &str) -> Result<()> {
+        self.record(format!("pin {chat_id} {message_id}"));
+        Ok(())
+    }
+
+    async fn unpin_message(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        parent_id: Option<&str>,
+    ) -> Result<()> {
+        self.record(format!("unpin {chat_id} {message_id} {parent_id:?}"));
+        Ok(())
+    }
+
+    async fn channel_pinned_posts(
+        &self,
+        team_thread_id: &str,
+        channel_id: &str,
+    ) -> Result<Vec<chatsvc::PinnedMessage>> {
+        self.record(format!("channel pins {team_thread_id} {channel_id}"));
+        Ok(vec![chatsvc::PinnedMessage {
+            message_id: "30".to_owned(),
+            pinned_at: None,
+            parent_id: None,
+        }])
+    }
+
+    async fn set_post_pinned(
+        &self,
+        team_thread_id: &str,
+        channel_id: &str,
+        post_id: &str,
+        pinned: bool,
+    ) -> Result<()> {
+        self.record(format!(
+            "post pin {team_thread_id} {channel_id} {post_id} {pinned}"
+        ));
+        Ok(())
+    }
+
+    async fn activity_feed(&self) -> Result<chatsvc::ActivitySnapshot> {
+        Ok(self.activity_feed.lock().unwrap().clone())
+    }
+
+    async fn mark_activity_read(&self, message_id: &str) -> Result<()> {
+        self.record(format!("activity read {message_id}"));
+        Ok(())
+    }
+
+    async fn mark_all_activity_read(&self, _now_ms: i64) -> Result<()> {
+        self.record("activity all read".to_owned());
+        Ok(())
+    }
+
+    async fn app_consumption_horizon(&self) -> Result<chatsvc::AppConsumptionHorizon> {
+        Ok(chatsvc::AppConsumptionHorizon {
+            channel_ms: *self.app_channel_horizon_ms.lock().unwrap(),
+            ..chatsvc::AppConsumptionHorizon::default()
+        })
+    }
+
+    async fn mark_all_channels_read(&self, now_ms: i64) -> Result<chatsvc::AppConsumptionHorizon> {
+        self.record("mark all channels read".to_owned());
+        *self.app_channel_horizon_ms.lock().unwrap() = now_ms;
+        self.app_consumption_horizon().await
+    }
+
+    async fn chat_apps(&self, _chat_id: &str) -> Result<Vec<chatsvc::ChatApp>> {
+        *self.app_calls.lock().unwrap() += 1;
+        Ok(self.apps.lock().unwrap().clone())
+    }
+
+    async fn create_scheduled(
+        &self,
+        inner_thread_id: &str,
+        html: &str,
+        send_at: DateTime<Utc>,
+        display_name: &str,
+    ) -> Result<chatsvc::ScheduledDraft> {
+        self.scheduled.lock().unwrap().push((
+            inner_thread_id.to_owned(),
+            html.to_owned(),
+            send_at,
+            display_name.to_owned(),
+        ));
+        Ok(chatsvc::ScheduledDraft {
+            id: "d1".to_owned(),
+            client_message_id: "1".to_owned(),
+            inner_thread_id: inner_thread_id.to_owned(),
+            send_at,
+            html: html.to_owned(),
+            delivery_state: None,
+        })
+    }
+
+    async fn invoke_card(&self, invoke: chatsvc::InvokeRequest) -> Result<chatsvc::InvokeResponse> {
+        self.invokes.lock().unwrap().push(invoke);
+        Ok(self
+            .invoke_answer
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(chatsvc::InvokeResponse::Empty))
+    }
+
+    async fn message_links(
+        &self,
+        conversation: &chatsvc::ConversationRef,
+        _page_size: usize,
+    ) -> Result<Vec<chatsvc::MessageLinks>> {
+        self.link_page_calls
+            .lock()
+            .unwrap()
+            .push(conversation.conversation_id());
+        Ok(self.link_pages.lock().unwrap().clone())
+    }
+
+    async fn set_message_links(&self, target: &MessageTarget, links_json: &str) -> Result<()> {
+        self.links_put
+            .lock()
+            .unwrap()
+            .push((describe(target), links_json.to_owned()));
+        Ok(())
+    }
+
+    async fn translate_chat_messages(
+        &self,
+        chat_id: &str,
+        to_language: &str,
+        messages: &[chatsvc::TranslateRequest],
+        _trigger: &chatsvc::TranslationTrigger,
+    ) -> Result<Vec<chatsvc::Translation>> {
+        self.translate_calls
+            .lock()
+            .unwrap()
+            .push(format!("chat {chat_id} {to_language} {}", messages.len()));
+        Ok(translated(messages))
+    }
+
+    async fn translate_channel_messages(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        root_id: &str,
+        to_language: &str,
+        messages: &[chatsvc::TranslateRequest],
+        _trigger: &chatsvc::TranslationTrigger,
+    ) -> Result<Vec<chatsvc::Translation>> {
+        self.translate_calls.lock().unwrap().push(format!(
+            "channel {team_id} {channel_id} {root_id} {to_language} {}",
+            messages.len()
+        ));
+        Ok(translated(messages))
+    }
+
+    async fn link_info(&self, url: &str) -> Result<chatsvc::LinkInfo> {
+        *self.link_info_calls.lock().unwrap() += 1;
+        Ok(chatsvc::LinkInfo {
+            url: url.to_owned(),
+            title: Some("Example".into()),
+            description: Some("Example page".into()),
+            ..chatsvc::LinkInfo::default()
+        })
+    }
+
+    async fn presences(&self, user_ids: &[String]) -> Result<Vec<Presence>> {
+        let answers = self.presence_answers.lock().unwrap();
+        Ok(answers
+            .iter()
+            .filter(|presence| user_ids.contains(&presence.user_id))
+            .cloned()
+            .collect())
+    }
+
+    async fn subscribe_presence(
+        &self,
+        endpoint_id: &str,
+        _trouter_uri: &str,
+        user_ids: &[String],
+        purge: bool,
+    ) -> Result<()> {
+        self.presence_subscriptions.lock().unwrap().push((
+            endpoint_id.to_owned(),
+            user_ids.to_vec(),
+            purge,
+        ));
+        Ok(())
+    }
+
+    async fn own_status(&self, _user_id: &str) -> Result<chatsvc::PresenceStatus> {
+        Ok(self.own_status_answer.lock().unwrap().clone())
+    }
+
+    async fn set_availability(&self, forced: Option<&chatsvc::ForcedAvailability>) -> Result<()> {
+        self.availability_puts.lock().unwrap().push(forced.copied());
+        Ok(())
+    }
+
+    async fn set_status_note(&self, note: Option<&chatsvc::StatusNote>) -> Result<()> {
+        self.note_puts.lock().unwrap().push(note.cloned());
+        Ok(())
+    }
+
+    async fn team_tags(&self, team_id: &str) -> Result<Vec<graph::Tag>> {
+        self.record(format!("tags {team_id}"));
+        Ok(vec![
+            serde_json::from_value(
+                json!({"id": "tag-design", "displayName": "Designers", "memberCount": 4}),
+            )
+            .unwrap(),
+        ])
+    }
+
+    async fn search_people(&self, query: &str) -> Result<Vec<User>> {
+        self.record(format!("search {query}"));
+        let configured = self.directory_users.lock().unwrap().clone();
+        if !configured.is_empty() {
+            return Ok(configured);
+        }
+        Ok(vec![
+            serde_json::from_value(json!({"id": "user-ada", "displayName": "Ada Example"}))
+                .unwrap(),
+        ])
+    }
+}
+
+fn engine_with(fake: &Arc<Fake>, config: SyncConfig) -> SyncEngine<Handle> {
+    SyncEngine::with_config(
+        Handle(fake.clone()),
+        Arc::new(Store::open_in_memory().unwrap()),
+        config,
+    )
+}
+
+fn small_pages() -> SyncConfig {
+    SyncConfig {
+        page_size: 10,
+        open_limit: 10,
+        ..SyncConfig::default()
+    }
+}
+
+async fn chat_engine(fake: &Arc<Fake>, config: SyncConfig) -> SyncEngine<Handle> {
+    *fake.chats.lock().unwrap() = vec![chat(CHAT, Some("Planning"), 5, 5, ME, false)];
+    let engine = engine_with(fake, config);
+    engine.refresh_sidebar().await.unwrap();
+    engine
+}
+
+#[tokio::test]
+async fn refresh_sidebar_fills_chats_teams_and_channels() {
+    let fake = Arc::new(Fake::default());
+    *fake.chats.lock().unwrap() = vec![
+        chat("19:read@thread.v2", Some("Read"), 10, 10, "user-ada", false),
+        chat("19:unread@thread.v2", None, 30, 10, "user-ada", false),
+        chat("19:mine@thread.v2", Some("Mine"), 20, 5, ME, false),
+        chat(
+            "19:hidden@thread.v2",
+            Some("Hidden"),
+            40,
+            1,
+            "user-ada",
+            true,
+        ),
+    ];
+    *fake.teams.lock().unwrap() =
+        vec![serde_json::from_value(json!({"id": "team-1", "displayName": "Squad"})).unwrap()];
+    let engine = engine_with(&fake, SyncConfig::default());
+    let mut events = engine.subscribe();
+
+    let summary = engine.refresh_sidebar().await.unwrap();
+    assert_eq!(
+        (
+            summary.chats,
+            summary.teams,
+            summary.channels,
+            summary.failed_teams
+        ),
+        (4, 1, 1, 0)
+    );
+    let sent: Vec<CoreEvent> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+    assert!(sent.contains(&CoreEvent::SidebarChanged), "{sent:?}");
+
+    let sidebar = engine.sidebar().unwrap();
+    let order: Vec<(&str, bool)> = sidebar
+        .chats
+        .iter()
+        .map(|chat| (chat.title.as_str(), chat.unread))
+        .collect();
+    assert_eq!(
+        order,
+        [("Ada Example", true), ("Mine", false), ("Read", false)]
+    );
+    assert_eq!(sidebar.chats[0].kind, "oneOnOne");
+    assert_eq!(sidebar.chats[1].member_summary, "Ada Example");
+    assert_eq!(sidebar.teams[0].channels[0].name, "General");
+}
+
+#[tokio::test]
+async fn channel_unread_comes_from_the_read_horizon_and_opening_marks_it_read() {
+    let fake = Arc::new(Fake::default());
+    *fake.teams.lock().unwrap() =
+        vec![serde_json::from_value(json!({"id": "team-1", "displayName": "Squad"})).unwrap()];
+    fake.read_states.lock().unwrap().push((
+        CHANNEL.to_owned(),
+        chatsvc::ReadHorizon {
+            consumed_until_ms: 5,
+            last_message_ms: 9,
+            last_message_from: Some("8:orgid:user-ada".to_owned()),
+            ..chatsvc::ReadHorizon::default()
+        },
+    ));
+    let engine = engine_with(&fake, SyncConfig::default());
+    engine.refresh_sidebar().await.unwrap();
+    engine.refresh_sidebar().await.unwrap();
+    let channel = engine.store().channel(CHANNEL).unwrap().unwrap();
+    assert!(channel.unread);
+    assert_eq!(channel.last_message_at, DateTime::from_timestamp_millis(9));
+
+    engine.mark_read(CHANNEL).await.unwrap();
+
+    assert!(!engine.store().channel(CHANNEL).unwrap().unwrap().unread);
+    let call = fake.calls().last().unwrap().clone();
+    assert!(
+        call.starts_with(&format!("read horizon {CHANNEL} 9;")),
+        "{call}"
+    );
+    assert!(call.ends_with(";0"), "{call}");
+}
+
+#[tokio::test]
+async fn refresh_sidebar_marks_muted_chats_and_keeps_flags_when_the_lookup_fails() {
+    let fake = Arc::new(Fake::default());
+    *fake.chats.lock().unwrap() = vec![chat(CHAT, Some("Planning"), 5, 5, ME, false)];
+    fake.muted_states
+        .lock()
+        .unwrap()
+        .push((CHAT.to_owned(), true));
+    let engine = engine_with(&fake, SyncConfig::default());
+    engine.refresh_sidebar().await.unwrap();
+    assert!(engine.sidebar().unwrap().chats[0].muted);
+
+    *fake.muted_fails.lock().unwrap() = true;
+    fake.muted_states.lock().unwrap().clear();
+    let mut events = engine.subscribe();
+    engine.refresh_sidebar().await.unwrap();
+    assert!(engine.sidebar().unwrap().chats[0].muted);
+    let mut reported = false;
+    while let Ok(event) = events.try_recv() {
+        reported |= matches!(event, CoreEvent::Error { .. });
+    }
+    assert!(reported);
+
+    *fake.muted_fails.lock().unwrap() = false;
+    engine.refresh_sidebar().await.unwrap();
+    assert!(engine.sidebar().unwrap().chats[0].muted);
+
+    fake.muted_states
+        .lock()
+        .unwrap()
+        .push((CHAT.to_owned(), false));
+    engine.refresh_sidebar().await.unwrap();
+    assert!(!engine.sidebar().unwrap().chats[0].muted);
+}
+
+#[tokio::test]
+async fn chatsvc_visibility_beats_the_graph_hidden_flag_and_graph_is_the_fallback() {
+    let fake = Arc::new(Fake::default());
+    *fake.chats.lock().unwrap() = vec![
+        chat("19:graph-hidden@thread.v2", Some("Kept"), 30, 30, ME, true),
+        chat(
+            "19:chatsvc-hidden@thread.v2",
+            Some("Dropped"),
+            20,
+            20,
+            ME,
+            false,
+        ),
+        chat(
+            "19:unknown-hidden@thread.v2",
+            Some("Unknown"),
+            10,
+            10,
+            ME,
+            true,
+        ),
+        chat("19:plain@thread.v2", Some("Plain"), 5, 5, ME, false),
+    ];
+    fake.hidden_states.lock().unwrap().extend([
+        ("19:graph-hidden@thread.v2".to_owned(), false),
+        ("19:chatsvc-hidden@thread.v2".to_owned(), true),
+    ]);
+    let engine = engine_with(&fake, SyncConfig::default());
+    engine.refresh_sidebar().await.unwrap();
+    let titles: Vec<String> = engine
+        .sidebar()
+        .unwrap()
+        .chats
+        .iter()
+        .map(|chat| chat.title.clone())
+        .collect();
+    assert_eq!(titles, ["Kept", "Plain"]);
+}
+
+fn numbered_chats(count: usize) -> Vec<Chat> {
+    (0..count)
+        .map(|index| {
+            chat(
+                &format!("19:c{index:03}@thread.v2"),
+                Some(&format!("Chat {index:03}")),
+                (count - index) as i64,
+                0,
+                ME,
+                false,
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn older_chats_load_page_by_page_until_the_list_ends() {
+    let fake = Arc::new(Fake::default());
+    *fake.chats.lock().unwrap() = numbered_chats(25);
+    let engine = engine_with(
+        &fake,
+        SyncConfig {
+            chat_limit: 10,
+            chat_page_size: 5,
+            ..SyncConfig::default()
+        },
+    );
+    engine.refresh_sidebar().await.unwrap();
+    assert_eq!(engine.sidebar().unwrap().chats.len(), 10);
+    assert!(engine.has_older_chats());
+    assert!(!engine.is_loading_older_chats());
+
+    let mut loaded = Vec::new();
+    while engine.has_older_chats() {
+        loaded.push(engine.load_older_chats().await.unwrap());
+    }
+    assert_eq!(loaded, [5, 5, 5]);
+    assert_eq!(engine.sidebar().unwrap().chats.len(), 25);
+    assert_eq!(engine.load_older_chats().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn the_older_chat_continuation_survives_a_restart() {
+    let fake = Arc::new(Fake::default());
+    *fake.chats.lock().unwrap() = numbered_chats(12);
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let config = SyncConfig {
+        chat_limit: 4,
+        chat_page_size: 4,
+        ..SyncConfig::default()
+    };
+    let engine = SyncEngine::with_config(Handle(fake.clone()), store.clone(), config.clone());
+    engine.refresh_sidebar().await.unwrap();
+    engine.load_older_chats().await.unwrap();
+    assert_eq!(store.chat_count().unwrap(), 8);
+
+    let restarted = SyncEngine::with_config(Handle(fake.clone()), store.clone(), config);
+    assert!(restarted.has_older_chats());
+    assert_eq!(restarted.load_older_chats().await.unwrap(), 4);
+    assert!(!restarted.has_older_chats());
+    assert_eq!(store.chat_count().unwrap(), 12);
+}
+
+#[tokio::test]
+async fn a_failed_older_page_drops_the_link_and_the_next_refresh_records_a_fresh_one() {
+    let fake = Arc::new(Fake::default());
+    *fake.chats.lock().unwrap() = numbered_chats(8);
+    let engine = engine_with(
+        &fake,
+        SyncConfig {
+            chat_limit: 4,
+            chat_page_size: 4,
+            ..SyncConfig::default()
+        },
+    );
+    engine.refresh_sidebar().await.unwrap();
+    *fake.chats_fail.lock().unwrap() = true;
+    assert!(engine.load_older_chats().await.is_err());
+    assert!(!engine.is_loading_older_chats());
+    assert!(!engine.has_older_chats());
+    assert_eq!(engine.load_older_chats().await.unwrap(), 0);
+
+    *fake.chats_fail.lock().unwrap() = false;
+    engine.refresh_sidebar().await.unwrap();
+    assert!(engine.has_older_chats());
+    assert_eq!(engine.load_older_chats().await.unwrap(), 4);
+}
+
+#[tokio::test]
+async fn a_chat_hidden_in_the_app_stays_hidden_until_a_newer_message_arrives() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    engine.hide_chat(CHAT).await.unwrap();
+
+    engine.refresh_sidebar().await.unwrap();
+    assert!(engine.sidebar().unwrap().chats.is_empty());
+    engine.refresh_sidebar_full().await.unwrap();
+    assert!(engine.sidebar().unwrap().chats.is_empty());
+
+    *fake.chats.lock().unwrap() = vec![chat(
+        CHAT,
+        Some("Planning"),
+        10_000_000,
+        5,
+        "user-ada",
+        false,
+    )];
+    engine.refresh_sidebar().await.unwrap();
+    assert_eq!(engine.sidebar().unwrap().chats.len(), 1);
+
+    *fake.chats.lock().unwrap() = vec![chat(
+        CHAT,
+        Some("Planning"),
+        10_000_000,
+        5,
+        "user-ada",
+        false,
+    )];
+    engine.refresh_sidebar_full().await.unwrap();
+    assert_eq!(engine.sidebar().unwrap().chats.len(), 1);
+}
+
+#[tokio::test]
+async fn undo_after_chatsvc_reported_the_hide_keeps_the_chat_visible() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    engine.hide_chat(CHAT).await.unwrap();
+    fake.hidden_states
+        .lock()
+        .unwrap()
+        .push((CHAT.to_owned(), true));
+    engine.refresh_sidebar().await.unwrap();
+    assert!(engine.sidebar().unwrap().chats.is_empty());
+
+    engine.unhide_chat(CHAT).await.unwrap();
+    assert_eq!(engine.sidebar().unwrap().chats.len(), 1);
+    engine.refresh_sidebar().await.unwrap();
+    assert_eq!(engine.sidebar().unwrap().chats.len(), 1);
+}
+
+#[tokio::test]
+async fn deep_chats_that_chatsvc_reports_hidden_are_removed_on_refresh() {
+    let fake = Arc::new(Fake::default());
+    *fake.chats.lock().unwrap() = numbered_chats(8);
+    let engine = engine_with(
+        &fake,
+        SyncConfig {
+            chat_limit: 4,
+            chat_page_size: 4,
+            ..SyncConfig::default()
+        },
+    );
+    engine.refresh_sidebar().await.unwrap();
+    engine.load_older_chats().await.unwrap();
+    assert_eq!(engine.store().chat_count().unwrap(), 8);
+
+    fake.hidden_states
+        .lock()
+        .unwrap()
+        .push(("19:c007@thread.v2".to_owned(), true));
+    engine.refresh_sidebar().await.unwrap();
+    assert_eq!(engine.store().chat_count().unwrap(), 7);
+}
+
+#[tokio::test]
+async fn older_pages_use_fresh_chat_states_when_none_were_loaded_yet() {
+    let fake = Arc::new(Fake::default());
+    *fake.chats.lock().unwrap() = numbered_chats(8);
+    fake.hidden_states
+        .lock()
+        .unwrap()
+        .push(("19:c005@thread.v2".to_owned(), true));
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    store.set_meta("chats_next_link", "chats:4:4").unwrap();
+    let engine = SyncEngine::with_config(Handle(fake.clone()), store.clone(), small_pages());
+
+    assert_eq!(engine.load_older_chats().await.unwrap(), 4);
+    assert_eq!(store.chat_count().unwrap(), 3);
+}
+
+#[tokio::test]
+async fn chat_state_actions_call_remote_and_update_the_store() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    let mut events = engine.subscribe();
+
+    engine.mark_unread(CHAT).await.unwrap();
+    let last_message_millis = (base() + Duration::minutes(5)).timestamp_millis();
+    assert!(fake.calls().last().unwrap().starts_with(&format!(
+        "read bookmark {CHAT} {};",
+        last_message_millis - 1
+    )));
+    let unread = engine.sidebar().unwrap().chats[0].clone();
+    assert!(unread.unread);
+    assert_eq!(
+        unread.last_read_at.unwrap().timestamp_millis(),
+        last_message_millis - 1
+    );
+    assert_eq!(events.try_recv().unwrap(), CoreEvent::SidebarChanged);
+
+    engine.set_chat_muted(CHAT, true).await.unwrap();
+    assert_eq!(fake.calls().last().unwrap(), &format!("mute {CHAT} true"));
+    assert!(engine.sidebar().unwrap().chats[0].muted);
+    assert_eq!(events.try_recv().unwrap(), CoreEvent::SidebarChanged);
+    engine.set_chat_muted(CHAT, false).await.unwrap();
+    assert!(!engine.sidebar().unwrap().chats[0].muted);
+}
+
+#[tokio::test]
+async fn hide_removes_the_chat_and_unhide_brings_it_back() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    let mut events = engine.subscribe();
+
+    engine.hide_chat(CHAT).await.unwrap();
+    assert_eq!(
+        fake.calls().last().unwrap(),
+        &format!("hidden at {CHAT} now")
+    );
+    assert!(engine.sidebar().unwrap().chats.is_empty());
+    assert_eq!(events.try_recv().unwrap(), CoreEvent::SidebarChanged);
+
+    engine.unhide_chat(CHAT).await.unwrap();
+    assert_eq!(
+        fake.calls().last().unwrap(),
+        &format!("hidden at {CHAT} none")
+    );
+    assert_eq!(engine.sidebar().unwrap().chats.len(), 1);
+    assert_eq!(events.try_recv().unwrap(), CoreEvent::SidebarChanged);
+}
+
+#[tokio::test]
+async fn leave_removes_the_chat() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    let mut events = engine.subscribe();
+
+    engine.leave_chat(CHAT).await.unwrap();
+    assert_eq!(
+        fake.calls().last().unwrap(),
+        &format!("remove member {CHAT} {ME}")
+    );
+    assert!(engine.sidebar().unwrap().chats.is_empty());
+    assert_eq!(events.try_recv().unwrap(), CoreEvent::SidebarChanged);
+}
+
+#[tokio::test]
+async fn removing_a_member_drops_them_from_the_cached_chat() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    let mut events = engine.subscribe();
+
+    engine.remove_chat_member(CHAT, "user-ada").await.unwrap();
+    assert_eq!(
+        fake.calls().last().unwrap(),
+        &format!("remove member {CHAT} user-ada")
+    );
+    let chats = engine.sidebar().unwrap().chats;
+    let member_ids: Vec<Option<&str>> = chats[0]
+        .members
+        .iter()
+        .map(|member| member.user_id.as_deref())
+        .collect();
+    assert_eq!(member_ids, [Some(ME)]);
+    assert_eq!(events.try_recv().unwrap(), CoreEvent::SidebarChanged);
+}
+
+#[tokio::test]
+async fn adding_members_writes_them_and_extends_the_cached_chat() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    let mut events = engine.subscribe();
+    let people = [store::MemberRecord {
+        user_id: Some("user-bob".to_owned()),
+        display_name: "Bob".to_owned(),
+    }];
+
+    engine
+        .add_chat_members(CHAT, &people, chatsvc::HistoryShare::Days(7))
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.calls().last().unwrap(),
+        &format!("add members {CHAT} user-bob Days(7)")
+    );
+    let chats = engine.sidebar().unwrap().chats;
+    assert!(
+        chats[0]
+            .members
+            .iter()
+            .any(|member| member.user_id.as_deref() == Some("user-bob"))
+    );
+    assert_eq!(events.try_recv().unwrap(), CoreEvent::SidebarChanged);
+}
+
+#[tokio::test]
+async fn failing_channel_listing_is_reported_not_fatal() {
+    let fake = Arc::new(Fake::default());
+    *fake.teams.lock().unwrap() = vec![
+        serde_json::from_value(json!({"id": "team-ok", "displayName": "Fine"})).unwrap(),
+        serde_json::from_value(json!({"id": "team-bad", "displayName": "Broken"})).unwrap(),
+    ];
+    *fake.failing_team.lock().unwrap() = Some("team-bad".to_owned());
+    let engine = engine_with(&fake, SyncConfig::default());
+    let mut events = engine.subscribe();
+    let summary = engine.refresh_sidebar().await.unwrap();
+    assert_eq!(
+        (summary.teams, summary.channels, summary.failed_teams),
+        (2, 1, 1)
+    );
+    let sent: Vec<CoreEvent> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+    assert!(
+        sent.iter()
+            .any(|event| matches!(event, CoreEvent::Error { .. })),
+        "{sent:?}"
+    );
+    assert!(sent.contains(&CoreEvent::SidebarChanged), "{sent:?}");
+}
+
+#[tokio::test]
+async fn cold_open_then_delta() {
+    let fake = Arc::new(Fake::default());
+    fake.set_chat_messages(numbered(25));
+    let engine = chat_engine(&fake, small_pages()).await;
+    let mut events = engine.subscribe();
+
+    assert!(engine.open_conversation(CHAT).unwrap().is_empty());
+    let first = engine.fetch_newer(CHAT).await.unwrap();
+    assert_eq!(first.added.len(), 10);
+    assert!(first.updated.is_empty());
+    assert_eq!(
+        events.try_recv().unwrap(),
+        CoreEvent::MessagesChanged {
+            conversation_id: CHAT.to_owned()
+        }
+    );
+
+    let cached = engine.open_conversation(CHAT).unwrap();
+    assert_eq!(cached.len(), 10);
+    assert_eq!(cached.first().unwrap().message_id, "m0016");
+    assert_eq!(cached.last().unwrap().message_id, "m0025");
+    *fake.chat_calls.lock().unwrap() = 0;
+
+    let mut all = numbered(25);
+    all.extend((26..=28).map(|index| message(index, i64::from(index), "<p>fresh</p>")));
+    all[24] = message(25, 25, "<p>edited</p>");
+    fake.set_chat_messages(all);
+    let delta = engine.fetch_newer(CHAT).await.unwrap();
+    let added: Vec<&str> = delta
+        .added
+        .iter()
+        .map(|record| record.message_id.as_str())
+        .collect();
+    assert_eq!(added, ["m0026", "m0027", "m0028"]);
+    assert_eq!(delta.updated.len(), 1);
+    assert_eq!(delta.updated[0].body_html, "<p>edited</p>");
+    assert_eq!(*fake.chat_calls.lock().unwrap(), 1);
+
+    while events.try_recv().is_ok() {}
+    let unchanged = engine.fetch_newer(CHAT).await.unwrap();
+    assert!(unchanged.is_empty());
+    assert!(events.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn catch_up_walks_several_pages_until_the_known_message() {
+    let fake = Arc::new(Fake::default());
+    fake.set_chat_messages(numbered(5));
+    let engine = chat_engine(&fake, small_pages()).await;
+    engine.fetch_newer(CHAT).await.unwrap();
+
+    fake.set_chat_messages(numbered(35));
+    *fake.chat_calls.lock().unwrap() = 0;
+    let delta = engine.fetch_newer(CHAT).await.unwrap();
+    assert_eq!(delta.added.len(), 30);
+    assert_eq!(*fake.chat_calls.lock().unwrap(), 4);
+    assert_eq!(engine.store().message_count(CHAT).unwrap(), 35);
+}
+
+#[tokio::test]
+async fn load_older_pages_back_to_the_start() {
+    let fake = Arc::new(Fake::default());
+    fake.set_chat_messages(numbered(25));
+    let engine = chat_engine(&fake, small_pages()).await;
+
+    let older = engine.load_older(CHAT).await.unwrap();
+    assert_eq!(older.len(), 10);
+    assert_eq!(older[0].message_id, "m0006");
+
+    let older = engine.load_older(CHAT).await.unwrap();
+    assert_eq!(older.first().unwrap().message_id, "m0001");
+    assert_eq!(older.len(), 5);
+    assert!(!engine.store().sync_state(CHAT).unwrap().unwrap().has_more);
+    assert_eq!(engine.store().message_count(CHAT).unwrap(), 25);
+
+    *fake.chat_calls.lock().unwrap() = 0;
+    assert!(engine.load_older(CHAT).await.unwrap().is_empty());
+    assert_eq!(*fake.chat_calls.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn system_messages_are_not_cached() {
+    let fake = Arc::new(Fake::default());
+    let system: Message = serde_json::from_value(json!({
+        "id": "sys", "messageType": "systemEventMessage",
+        "createdDateTime": (base() + Duration::minutes(50)).to_rfc3339(),
+        "body": {"contentType": "html", "content": "<systemEventMessage/>"}
+    }))
+    .unwrap();
+    fake.set_chat_messages(vec![message(1, 1, "<p>a</p>"), system]);
+    let engine = chat_engine(&fake, small_pages()).await;
+    let delta = engine.fetch_newer(CHAT).await.unwrap();
+    assert_eq!(delta.added.len(), 1);
+}
+
+#[tokio::test]
+async fn deleted_and_text_messages_are_normalised() {
+    let fake = Arc::new(Fake::default());
+    let deleted: Message = serde_json::from_value(json!({
+        "id": "gone", "messageType": "message",
+        "createdDateTime": (base() + Duration::minutes(1)).to_rfc3339(),
+        "deletedDateTime": (base() + Duration::minutes(2)).to_rfc3339(),
+        "body": {"contentType": "html", "content": "<p>secret</p>"}
+    }))
+    .unwrap();
+    let text: Message = serde_json::from_value(json!({
+        "id": "plain", "messageType": "message",
+        "createdDateTime": (base() + Duration::minutes(3)).to_rfc3339(),
+        "from": {"application": {"id": "bot", "displayName": "Build Bot"}},
+        "body": {"contentType": "text", "content": " a < b\nnext "}
+    }))
+    .unwrap();
+    fake.set_chat_messages(vec![deleted, text]);
+    let engine = chat_engine(&fake, small_pages()).await;
+    engine.fetch_newer(CHAT).await.unwrap();
+    let cached = engine.open_conversation(CHAT).unwrap();
+    assert!(cached[0].deleted);
+    assert_eq!(cached[0].body_html, "");
+    assert_eq!(cached[1].body_html, "a &lt; b<br>next");
+    assert_eq!(cached[1].sender_name.as_deref(), Some("Build Bot"));
+    assert_eq!(cached[1].sender_id, None);
+}
+
+#[tokio::test]
+async fn send_message_converts_markdown_and_caches_the_answer() {
+    let fake = Arc::new(Fake::default());
+    fake.set_chat_messages(numbered(3));
+    let engine = chat_engine(&fake, small_pages()).await;
+    engine.fetch_newer(CHAT).await.unwrap();
+    let mut events = engine.subscribe();
+
+    let record = engine
+        .send_message(CHAT, "hi **there** <x>", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.chatsvc_posts.lock().unwrap()[0].1,
+        "hi <b>there</b> &lt;x&gt;"
+    );
+    assert_eq!(record.message_id, "1727203440000");
+    assert_eq!(engine.store().message_count(CHAT).unwrap(), 4);
+    assert_eq!(
+        events.try_recv().unwrap(),
+        CoreEvent::MessagesChanged {
+            conversation_id: CHAT.to_owned()
+        }
+    );
+    assert!(
+        engine
+            .store()
+            .sync_state(CHAT)
+            .unwrap()
+            .unwrap()
+            .newest_seen
+            .unwrap()
+            >= record.created_at
+    );
+}
+
+#[tokio::test]
+async fn unknown_chat_is_fetched_stored_and_resolves() {
+    let fake = Arc::new(Fake::default());
+    let meeting_chat = "19:meeting_abc@thread.v2";
+    *fake.fetchable_chats.lock().unwrap() =
+        vec![chat(meeting_chat, Some("Standup"), 5, 5, ME, false)];
+    fake.set_chat_messages(vec![message(1, 1, "<p>hello</p>")]);
+    let engine = engine_with(&fake, SyncConfig::default());
+    let delta = engine.fetch_newer(meeting_chat).await.unwrap();
+    assert_eq!(delta.added.len(), 1);
+    engine.fetch_newer(meeting_chat).await.unwrap();
+    assert_eq!(*fake.single_chat_calls.lock().unwrap(), 1);
+    engine.send_message(meeting_chat, "hi", None).await.unwrap();
+}
+
+#[tokio::test]
+async fn unknown_chat_missing_remotely_stays_an_error() {
+    let fake = Arc::new(Fake::default());
+    let engine = engine_with(&fake, SyncConfig::default());
+    assert!(matches!(
+        engine.fetch_newer("19:meeting_gone@thread.v2").await,
+        Err(Error::UnknownConversation(_))
+    ));
+    assert!(matches!(
+        engine
+            .send_message("19:meeting_gone@thread.v2", "hi", None)
+            .await,
+        Err(Error::UnknownConversation(_))
+    ));
+}
+
+#[tokio::test]
+async fn unknown_conversation_is_an_error() {
+    let fake = Arc::new(Fake::default());
+    let engine = engine_with(&fake, SyncConfig::default());
+    assert!(matches!(
+        engine.fetch_newer("nope").await,
+        Err(Error::UnknownConversation(_))
+    ));
+}
+
+fn thread(id: u32, minute: i64, reply_count: u32) -> Message {
+    let mut value = json!({
+        "id": format!("m{id:04}"),
+        "messageType": "message",
+        "createdDateTime": (base() + Duration::minutes(minute)).to_rfc3339(),
+        "body": {"contentType": "html", "content": "<p>root</p>"},
+        "replies": (0..reply_count).map(|reply| json!({
+            "id": format!("r{id:04}-{reply}"),
+            "messageType": "message",
+            "replyToId": format!("m{id:04}"),
+            "createdDateTime": (base() + Duration::minutes(minute + 1 + i64::from(reply))).to_rfc3339(),
+            "body": {"contentType": "html", "content": "<p>reply</p>"}
+        })).collect::<Vec<_>>()
+    });
+    value["from"] = json!({"user": {"id": "user-ada", "displayName": "Ada Example"}});
+    serde_json::from_value(value).unwrap()
+}
+
+#[tokio::test]
+async fn channel_threads_are_flattened_and_paged_by_cursor() {
+    let fake = Arc::new(Fake::default());
+    *fake.teams.lock().unwrap() =
+        vec![serde_json::from_value(json!({"id": "team-1", "displayName": "Squad"})).unwrap()];
+    *fake.channel_pages.lock().unwrap() = vec![
+        vec![thread(30, 30, 2), thread(20, 20, 0)],
+        vec![thread(10, 10, 1)],
+    ];
+    let engine = engine_with(&fake, small_pages());
+    engine.refresh_sidebar().await.unwrap();
+
+    let delta = engine.fetch_newer(CHANNEL).await.unwrap();
+    assert_eq!(delta.added.len(), 4);
+    let reply = delta
+        .added
+        .iter()
+        .find(|record| record.message_id == "r0030-1")
+        .unwrap();
+    assert_eq!(reply.reply_to_id.as_deref(), Some("m0030"));
+    let state = engine.store().sync_state(CHANNEL).unwrap().unwrap();
+    assert_eq!(state.older_cursor.as_deref(), Some("page:1"));
+    assert!(state.has_more);
+
+    let older = engine.load_older(CHANNEL).await.unwrap();
+    assert_eq!(older.len(), 2);
+    assert!(
+        !engine
+            .store()
+            .sync_state(CHANNEL)
+            .unwrap()
+            .unwrap()
+            .has_more
+    );
+    assert!(engine.load_older(CHANNEL).await.unwrap().is_empty());
+    assert_eq!(engine.store().message_count(CHANNEL).unwrap(), 6);
+
+    assert!(matches!(
+        engine.send_message(CHANNEL, "x", None).await,
+        Err(Error::Unsupported(_))
+    ));
+}
+
+fn many_chats(count: i64) -> Vec<Chat> {
+    (1..=count)
+        .map(|index| {
+            chat(
+                &format!("19:c{index:03}@thread.v2"),
+                Some("Topic"),
+                index,
+                index,
+                "user-ada",
+                false,
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn warm_refresh_stops_after_the_first_unchanged_page() {
+    let fake = Arc::new(Fake::default());
+    *fake.chats.lock().unwrap() = many_chats(120);
+    let engine = engine_with(
+        &fake,
+        SyncConfig {
+            chat_page_size: 25,
+            ..SyncConfig::default()
+        },
+    );
+    let cold = engine.refresh_sidebar().await.unwrap();
+    assert!(cold.full_chat_refresh);
+    assert_eq!(cold.chat_pages, 5);
+    assert_eq!(engine.store().chat_count().unwrap(), 120);
+
+    *fake.chat_page_calls.lock().unwrap() = 0;
+    *fake.team_calls.lock().unwrap() = 0;
+    let warm = engine.refresh_sidebar().await.unwrap();
+    assert!(!warm.full_chat_refresh);
+    assert_eq!(warm.chat_pages, 1);
+    assert_eq!(*fake.chat_page_calls.lock().unwrap(), 1);
+    assert_eq!(*fake.team_calls.lock().unwrap(), 0);
+    assert!(!warm.teams_refreshed);
+}
+
+#[tokio::test]
+async fn warm_refresh_walks_on_while_pages_hold_new_activity() {
+    let fake = Arc::new(Fake::default());
+    *fake.chats.lock().unwrap() = many_chats(120);
+    let engine = engine_with(
+        &fake,
+        SyncConfig {
+            chat_page_size: 25,
+            ..SyncConfig::default()
+        },
+    );
+    engine.refresh_sidebar().await.unwrap();
+
+    let mut chats = many_chats(120);
+    for chat in chats.iter_mut().take(30) {
+        *chat = self::chat(&chat.id.clone(), Some("Topic"), 500, 1, "user-ada", false);
+    }
+    *fake.chats.lock().unwrap() = chats;
+    *fake.chat_page_calls.lock().unwrap() = 0;
+    let warm = engine.refresh_sidebar().await.unwrap();
+    assert_eq!(warm.chat_pages, 3);
+}
+
+#[tokio::test]
+async fn full_refresh_prunes_chats_the_user_left() {
+    let fake = Arc::new(Fake::default());
+    *fake.chats.lock().unwrap() = many_chats(5);
+    let engine = engine_with(&fake, SyncConfig::default());
+    engine.refresh_sidebar().await.unwrap();
+    assert_eq!(engine.store().chat_count().unwrap(), 5);
+
+    *fake.chats.lock().unwrap() = many_chats(3);
+    engine.refresh_sidebar_full().await.unwrap();
+    assert_eq!(engine.store().chat_count().unwrap(), 3);
+}
+
+#[tokio::test]
+async fn teams_refresh_is_skipped_inside_the_interval() {
+    let fake = Arc::new(Fake::default());
+    *fake.teams.lock().unwrap() =
+        vec![serde_json::from_value(json!({"id": "team-1", "displayName": "Squad"})).unwrap()];
+    let engine = engine_with(&fake, SyncConfig::default());
+    assert!(engine.refresh_sidebar().await.unwrap().teams_refreshed);
+    assert!(!engine.refresh_sidebar().await.unwrap().teams_refreshed);
+    assert!(engine.refresh_sidebar_full().await.unwrap().teams_refreshed);
+    assert_eq!(*fake.team_calls.lock().unwrap(), 2);
+}
+
+async fn channel_engine(fake: &Arc<Fake>) -> SyncEngine<Handle> {
+    *fake.teams.lock().unwrap() =
+        vec![serde_json::from_value(json!({"id": "team-1", "displayName": "Squad"})).unwrap()];
+    *fake.channel_pages.lock().unwrap() = vec![vec![thread(30, 30, 1)]];
+    let engine = engine_with(fake, small_pages());
+    engine.refresh_sidebar().await.unwrap();
+    engine
+}
+
+#[tokio::test]
+async fn refreshing_a_thread_stores_every_reply_of_that_root() {
+    let fake = Arc::new(Fake::default());
+    let engine = channel_engine(&fake).await;
+    engine.fetch_newer(CHANNEL).await.unwrap();
+    let root_id = engine.open_conversation(CHANNEL).unwrap()[0]
+        .message_id
+        .clone();
+    let reply = |id: u32, minute: i64, root: &str| -> Message {
+        let mut reply = message(id, minute, &format!("<p>reply {id}</p>"));
+        reply.reply_to_id = Some(root.to_owned());
+        reply
+    };
+    *fake.thread_replies.lock().unwrap() = vec![
+        reply(7001, 90, &root_id),
+        reply(7002, 91, &root_id),
+        reply(7003, 92, "other-root"),
+    ];
+    let delta = engine.refresh_thread(CHANNEL, &root_id).await.unwrap();
+    assert_eq!(delta.added.len(), 2);
+    let thread = engine.store().thread_messages(CHANNEL, &root_id).unwrap();
+    assert_eq!(thread.len(), 4);
+}
+
+#[tokio::test]
+async fn opening_an_uncached_post_stores_it_with_its_replies_in_one_go() {
+    let fake = Arc::new(Fake::default());
+    let engine = channel_engine(&fake).await;
+    let root_id = fake.channel_pages.lock().unwrap()[0][0].id.clone();
+    let reply = |id: u32, minute: i64| -> Message {
+        let mut reply = message(id, minute, &format!("<p>reply {id}</p>"));
+        reply.reply_to_id = Some(root_id.clone());
+        reply
+    };
+    *fake.thread_replies.lock().unwrap() = vec![reply(7001, 90), reply(7002, 91)];
+    let post = engine.open_post(CHANNEL, &root_id).await.unwrap().unwrap();
+    assert_eq!(post.record.message_id, root_id);
+    assert!(post.replies_loaded);
+    let thread = engine.store().thread_messages(CHANNEL, &root_id).unwrap();
+    assert_eq!(thread.len(), 3);
+}
+
+#[tokio::test]
+async fn channel_delta_picks_up_new_and_edited_posts_and_stores_the_link() {
+    let fake = Arc::new(Fake::default());
+    let engine = channel_engine(&fake).await;
+    engine.fetch_newer(CHANNEL).await.unwrap();
+    let state = engine.store().sync_state(CHANNEL).unwrap().unwrap();
+    assert_eq!(state.delta_link.as_deref(), Some("delta:1"));
+
+    let mut edited = thread(30, 30, 0);
+    edited.body =
+        serde_json::from_value(json!({"contentType": "html", "content": "<p>edited root</p>"}))
+            .unwrap();
+    *fake.delta_items.lock().unwrap() = vec![edited, thread(40, 40, 0)];
+    let delta = engine.fetch_newer(CHANNEL).await.unwrap();
+    assert_eq!(
+        delta
+            .added
+            .iter()
+            .map(|record| record.message_id.as_str())
+            .collect::<Vec<_>>(),
+        ["m0040"]
+    );
+    assert_eq!(delta.updated.len(), 1);
+    assert_eq!(delta.updated[0].body_html, "<p>edited root</p>");
+    assert!(
+        fake.calls()
+            .iter()
+            .any(|call| call == "channel_delta_at delta:1")
+    );
+    assert_eq!(
+        engine
+            .store()
+            .sync_state(CHANNEL)
+            .unwrap()
+            .unwrap()
+            .delta_link
+            .as_deref(),
+        Some("delta:2")
+    );
+}
+
+#[tokio::test]
+async fn channel_delta_failure_falls_back_to_the_first_page() {
+    let fake = Arc::new(Fake::default());
+    let engine = channel_engine(&fake).await;
+    engine.fetch_newer(CHANNEL).await.unwrap();
+
+    *fake.delta_fails.lock().unwrap() = true;
+    *fake.channel_pages.lock().unwrap() = vec![vec![thread(50, 50, 0), thread(30, 30, 1)]];
+    let delta = engine.fetch_newer(CHANNEL).await.unwrap();
+    assert_eq!(
+        delta
+            .added
+            .iter()
+            .map(|record| record.message_id.as_str())
+            .collect::<Vec<_>>(),
+        ["m0050"]
+    );
+    assert_eq!(
+        engine
+            .store()
+            .sync_state(CHANNEL)
+            .unwrap()
+            .unwrap()
+            .delta_link,
+        None
+    );
+}
+
+#[tokio::test]
+async fn an_announcement_posts_through_graph_then_adds_the_banner_card() {
+    let fake = Arc::new(Fake::default());
+    let engine = channel_engine(&fake).await;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("banner.png");
+    let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+    png.extend_from_slice(&1317u32.to_be_bytes());
+    png.extend_from_slice(&366u32.to_be_bytes());
+    std::fs::write(&path, &png).unwrap();
+    let banner = teams_core::AnnouncementBanner {
+        title: "Ship it".to_owned(),
+        background: teams_core::BannerBackground::LocalImage(path.to_string_lossy().into_owned()),
+    };
+    let record = engine
+        .post_announcement(
+            CHANNEL,
+            "<p>hi</p>",
+            Some("Topic"),
+            &[],
+            &MessageExtras::default(),
+            &banner,
+        )
+        .await
+        .unwrap();
+    let calls: Vec<String> = fake
+        .calls()
+        .into_iter()
+        .filter(|call| !call.starts_with("channel_delta"))
+        .collect();
+    assert_eq!(calls.len(), 3);
+    assert!(calls[0].starts_with(&format!("ams upload {CHANNEL} MicrosoftTeams-image.png")));
+    assert_eq!(calls[1], "post subject=Some(\"Topic\")");
+    assert!(calls[2].starts_with(&format!("cards {CHANNEL} m9001 ")));
+    assert!(calls[2].contains("\"imageHeight\":366"));
+    let shown = teams_core::AnnouncementBanner::from_attachments(&teams_core::attachments(&record));
+    assert_eq!(
+        shown.map(|banner| banner.background),
+        Some(teams_core::BannerBackground::Image(
+            "https://de-prod.asyncgw.teams.microsoft.com/v1/objects/0-ams/views/imgpsh_fullsize"
+                .to_owned()
+        ))
+    );
+}
+
+#[tokio::test]
+async fn a_refused_banner_card_still_keeps_the_post() {
+    let fake = Arc::new(Fake::default());
+    *fake.failing_cards.lock().unwrap() = true;
+    let engine = channel_engine(&fake).await;
+    let banner = teams_core::AnnouncementBanner {
+        title: "Ship it".to_owned(),
+        background: teams_core::BannerBackground::Color("rose".to_owned()),
+    };
+    let posted = engine
+        .post_announcement(
+            CHANNEL,
+            "<p>hi</p>",
+            None,
+            &[],
+            &MessageExtras::default(),
+            &banner,
+        )
+        .await;
+    assert!(matches!(
+        posted,
+        Err(teams_core::Error::PostedWithoutBanner)
+    ));
+    let tries = fake
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with("cards "))
+        .count();
+    assert_eq!(tries, 3);
+    let cached = engine.store().messages(CHANNEL, None, 10).unwrap();
+    assert!(cached.iter().any(|record| record.message_id == "m9001"));
+}
+
+#[tokio::test]
+async fn channel_sends_post_and_reply_through_graph() {
+    let fake = Arc::new(Fake::default());
+    let engine = channel_engine(&fake).await;
+    engine.fetch_newer(CHANNEL).await.unwrap();
+
+    engine
+        .post_to_channel(CHANNEL, "hello", Some("Topic"))
+        .await
+        .unwrap();
+    let reply = engine
+        .send_message(CHANNEL, "answer", Some("m0030"))
+        .await
+        .unwrap();
+    assert_eq!(reply.message_id, "m9002");
+    let sends: Vec<String> = fake
+        .calls()
+        .into_iter()
+        .filter(|call| !call.starts_with("channel_delta"))
+        .collect();
+    assert_eq!(sends, ["post subject=Some(\"Topic\")", "reply to m0030"]);
+    assert!(engine.post_to_channel(CHAT, "x", None).await.is_err());
+}
+
+#[tokio::test]
+async fn chat_upload_goes_to_chat_files_and_is_shared_with_the_other_members() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    let steps = Arc::new(Mutex::new(Vec::new()));
+    let seen = steps.clone();
+
+    let reference = engine
+        .upload_attachment(CHAT, "plan.pdf", &[1, 2, 3], move |percent| {
+            seen.lock().unwrap().push(percent)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fake.calls(),
+        ["upload chat-files plan.pdf 3", "share item-1 user-ada"]
+    );
+    assert_eq!(*steps.lock().unwrap(), [50, 100]);
+    assert_eq!(reference.attachment_id, "GUID-1");
+    assert_eq!(reference.content_url, "https://files.example/dav");
+    assert_eq!(reference.name, "plan.pdf");
+}
+
+#[tokio::test]
+async fn channel_upload_uses_the_cached_files_folder_and_shares_nothing() {
+    let fake = Arc::new(Fake::default());
+    let engine = channel_engine(&fake).await;
+
+    engine
+        .upload_attachment(CHANNEL, "a.pdf", &[1], |_| {})
+        .await
+        .unwrap();
+    engine
+        .upload_attachment(CHANNEL, "b.pdf", &[1, 2], |_| {})
+        .await
+        .unwrap();
+
+    assert_eq!(*fake.folder_requests.lock().unwrap(), 1);
+    let uploads: Vec<String> = fake
+        .calls()
+        .into_iter()
+        .filter(|call| call.starts_with("upload") || call.starts_with("share"))
+        .collect();
+    assert_eq!(
+        uploads,
+        [
+            "upload drive-1/folder-1 a.pdf 1",
+            "upload drive-1/folder-1 b.pdf 2"
+        ]
+    );
+}
+
+fn uploaded() -> UploadedFile {
+    UploadedFile {
+        drive_id: "drive-1".into(),
+        item_id: "item-1".into(),
+        name: "a.pdf".into(),
+        web_url: "https://files.example/web".into(),
+        web_dav_url: None,
+        etag: "\"{GUID-1},2\"".into(),
+    }
+}
+
+#[tokio::test]
+async fn sharing_fails_loudly_when_the_chat_members_are_unknown() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    engine
+        .store()
+        .upsert_chats(&[store::ChatRecord {
+            id: "19:bare@thread.v2".into(),
+            ..Default::default()
+        }])
+        .unwrap();
+
+    let error = engine
+        .share_attachment("19:bare@thread.v2", &uploaded())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Chat members not loaded yet."));
+    engine.share_attachment(CHAT, &uploaded()).await.unwrap();
+    assert!(fake.calls().contains(&"share item-1 user-ada".to_owned()));
+}
+
+#[tokio::test]
+async fn discarding_an_upload_deletes_the_drive_item() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    engine.discard_attachment(&uploaded()).await.unwrap();
+    assert_eq!(fake.calls(), ["delete_file item-1"]);
+}
+
+#[tokio::test]
+async fn an_edit_keeps_the_images_and_files_of_the_original() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    engine
+        .store()
+        .upsert_messages(&[store::MessageRecord {
+            conversation_id: CHAT.into(),
+            message_id: "m-edit".into(),
+            created_at: base(),
+            body_html: "<p>old</p><p><img src=\"https://graph.microsoft.com/v1.0/chats/c/messages/1/hostedContents/9/$value\"></p><attachment id=\"G1\"></attachment>".into(),
+            attachments_json: r#"[{"content_type":"reference","name":"a.pdf","url":"https://x/a.pdf","text":null}]"#.into(),
+            reactions_json: "[]".into(),
+            mentions_json: "[]".into(),
+            ..Default::default()
+        }])
+        .unwrap();
+
+    let _ = engine.edit_message(CHAT, "m-edit", "new").await;
+
+    let call = fake
+        .calls()
+        .into_iter()
+        .find(|call| call.starts_with("edit"))
+        .unwrap();
+    assert!(call.contains("new<p><img src=\"https://graph.microsoft.com/"));
+    let extras = fake.extras_sent.lock().unwrap();
+    assert_eq!(extras[0].files[0].attachment_id, "G1");
+    assert_eq!(extras[0].files[0].content_url, "https://x/a.pdf");
+}
+
+#[tokio::test]
+async fn download_streams_every_chunk_and_reports_progress() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    let written = Mutex::new(0usize);
+    let percents = Mutex::new(Vec::new());
+    let shared = engine
+        .download_file(
+            "https://files.example/doc",
+            |bytes| {
+                *written.lock().unwrap() += bytes.len();
+                Ok(())
+            },
+            |percent| percents.lock().unwrap().push(percent),
+        )
+        .await
+        .unwrap();
+    assert_eq!(*written.lock().unwrap() as u64, shared.size);
+    let chunk = graph::DOWNLOAD_CHUNK_BYTES;
+    let ranges: Vec<String> = fake
+        .calls()
+        .into_iter()
+        .filter(|call| call.starts_with("range"))
+        .collect();
+    assert_eq!(
+        ranges,
+        vec![
+            format!("range https://dl.example/big 0-{}", chunk - 1),
+            format!("range https://dl.example/big {chunk}-{}", 2 * chunk - 1),
+            format!("range https://dl.example/big {}-", 2 * chunk),
+        ]
+    );
+    let percents = percents.lock().unwrap();
+    assert_eq!(percents.first(), Some(&0));
+    assert_eq!(percents.last(), Some(&100));
+    assert!(percents.windows(2).all(|pair| pair[0] <= pair[1]));
+}
+
+#[tokio::test]
+async fn library_download_uses_the_listing_url_and_refetches_the_item_without_one() {
+    let library_file = |cached_url: Option<&str>| teams_core::LibraryFile {
+        drive_id: "drive".into(),
+        item_id: "item".into(),
+        name: "big.bin".into(),
+        size: 2 * graph::DOWNLOAD_CHUNK_BYTES + 3,
+        cached_url: cached_url.map(str::to_owned),
+    };
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    engine
+        .download_library_file(
+            &library_file(Some("https://dl.example/listed")),
+            |_| Ok(()),
+            |_| {},
+        )
+        .await
+        .unwrap();
+    let calls = fake.calls();
+    assert!(!calls.iter().any(|call| call.starts_with("resolve")));
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.starts_with("range https://dl.example/listed "))
+    );
+    engine
+        .download_library_file(&library_file(None), |_| Ok(()), |_| {})
+        .await
+        .unwrap();
+    let calls = fake.calls();
+    assert!(calls.contains(&"resolve item drive/item".to_owned()));
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.starts_with("range https://dl.example/fresh "))
+    );
+}
+
+#[tokio::test]
+async fn download_keeps_a_file_that_grew_past_the_reported_size() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    let written = Mutex::new(0usize);
+    let percents = Mutex::new(Vec::new());
+    let shared = engine
+        .download_file(
+            "https://files.example/grown",
+            |bytes| {
+                *written.lock().unwrap() += bytes.len();
+                Ok(())
+            },
+            |percent| percents.lock().unwrap().push(percent),
+        )
+        .await
+        .unwrap();
+    assert_eq!(*written.lock().unwrap() as u64, shared.size + 10);
+    assert!(
+        percents
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|percent| *percent <= 100)
+    );
+}
+
+#[tokio::test]
+async fn download_rejects_a_short_chunk() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    let result = engine
+        .download_file("https://files.example/short", |_| Ok(()), |_| {})
+        .await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn download_stops_when_the_writer_fails() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    let result = engine
+        .download_file(
+            "https://files.example/doc",
+            |_| Err(std::io::Error::other("disk full")),
+            |_| {},
+        )
+        .await;
+    assert!(matches!(result, Err(Error::Io(_))));
+    let ranges = fake
+        .calls()
+        .into_iter()
+        .filter(|call| call.starts_with("range"))
+        .count();
+    assert_eq!(ranges, 1);
+}
+
+#[tokio::test]
+async fn upload_to_an_unknown_conversation_fails() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    assert!(
+        engine
+            .upload_attachment("unknown", "a.pdf", &[1], |_| {})
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn the_notes_chat_takes_every_write_without_a_graph_chat_lookup() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    let extras = MessageExtras {
+        kept: Vec::new(),
+        images: vec![HostedImage {
+            content_type: "image/png".into(),
+            bytes: Arc::new(vec![9]),
+        }],
+        files: Vec::new(),
+        importance: None,
+    };
+
+    let sent = engine
+        .send_message_with_extras(NOTES_CHAT_ID, "note to self", None, &[], &extras)
+        .await
+        .unwrap();
+    let mut sent_note = message(9000, 500, "<p>note to self</p>");
+    sent_note.id = sent.message_id.clone();
+    fake.set_chat_messages(vec![sent_note]);
+    engine
+        .reply_to_with_extras(
+            NOTES_CHAT_ID,
+            &sent.message_id,
+            "again",
+            &[],
+            &MessageExtras::default(),
+        )
+        .await
+        .unwrap();
+    engine
+        .edit_message_html(NOTES_CHAT_ID, &sent.message_id, "edited", &[])
+        .await
+        .unwrap();
+    engine
+        .set_reaction(NOTES_CHAT_ID, &sent.message_id, "\u{1f44d}")
+        .await
+        .unwrap();
+    engine
+        .unset_reaction(NOTES_CHAT_ID, &sent.message_id, "\u{1f44d}")
+        .await
+        .unwrap();
+    engine
+        .upload_attachment(NOTES_CHAT_ID, "plan.txt", b"plan", |_| {})
+        .await
+        .unwrap();
+    engine
+        .soft_delete_message(NOTES_CHAT_ID, &sent.message_id)
+        .await
+        .unwrap();
+
+    assert_eq!(*fake.single_chat_calls.lock().unwrap(), 0);
+    assert!(
+        fake.chatsvc_posts.lock().unwrap()[0]
+            .1
+            .starts_with("note to self")
+    );
+    let calls = fake.calls();
+    for expected in [
+        "chatsvc post 48:notes",
+        "edit 1727203440000 edited",
+        "set_reaction 1727203440000 \u{1f44d}",
+        "unset_reaction 1727203440000 \u{1f44d}",
+        "upload chat-files plan.txt 4",
+        "soft_delete user-me 1727203440000",
+    ] {
+        assert!(
+            calls.iter().any(|call| call == expected),
+            "{expected} in {calls:?}"
+        );
+    }
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.starts_with("share ") && call.ends_with(' ')),
+        "{calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn send_with_extras_hands_images_and_files_to_the_remote() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    let extras = MessageExtras {
+        kept: Vec::new(),
+        images: vec![HostedImage {
+            content_type: "image/png".into(),
+            bytes: Arc::new(vec![9]),
+        }],
+        files: Vec::new(),
+        importance: None,
+    };
+
+    engine
+        .send_message_with_extras(CHAT, "look", None, &[], &extras)
+        .await
+        .unwrap();
+    engine.send_message(CHAT, "plain", None).await.unwrap();
+
+    let calls = fake.calls();
+    assert!(
+        calls.contains(&format!("ams upload {CHAT} image.png 1")),
+        "{calls:?}"
+    );
+    let posts = fake.chatsvc_posts.lock().unwrap();
+    assert!(posts[0].1.contains("0-ams"));
+    assert_eq!(posts[1].1, "plain");
+}
+
+#[tokio::test]
+async fn a_sent_image_is_cached_under_the_server_url_without_a_download() {
+    let directory = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    *fake.chats.lock().unwrap() = vec![chat(CHAT, Some("Planning"), 5, 5, ME, false)];
+    let engine = engine_with(&fake, small_pages())
+        .with_image_dir(directory.path(), 1024 * 1024)
+        .unwrap();
+    engine.refresh_sidebar().await.unwrap();
+    let extras = MessageExtras {
+        kept: Vec::new(),
+        images: vec![HostedImage {
+            content_type: "image/png".into(),
+            bytes: Arc::new(vec![9, 8, 7]),
+        }],
+        files: Vec::new(),
+        importance: None,
+    };
+    let mut events = engine.subscribe();
+
+    engine
+        .send_message_with_extras(CHAT, "look", None, &[], &extras)
+        .await
+        .unwrap();
+
+    assert_eq!(engine.image(SENT_AMS_IMAGE).unwrap().bytes, vec![9, 8, 7]);
+    assert!(fake.hosted_requests.lock().unwrap().is_empty());
+    let mut seeded = false;
+    while let Ok(event) = events.try_recv() {
+        seeded |= matches!(event, CoreEvent::ImagesChanged { keys } if keys == vec![SENT_AMS_IMAGE.to_owned()]);
+    }
+    assert!(seeded);
+}
+
+#[tokio::test]
+async fn refresh_message_upserts_an_edit_older_than_the_newest_cached() {
+    let fake = Arc::new(Fake::default());
+    fake.set_chat_messages(numbered(5));
+    let engine = chat_engine(&fake, small_pages()).await;
+    engine.fetch_newer(CHAT).await.unwrap();
+    let mut events = engine.subscribe();
+
+    let mut changed = numbered(5);
+    changed[1] = message(2, 2, "<p>old but edited</p>");
+    fake.set_chat_messages(changed);
+    let record = engine
+        .refresh_message(CHAT, "m0002")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.body_html, "<p>old but edited</p>");
+    assert_eq!(
+        engine.open_conversation(CHAT).unwrap()[1].body_html,
+        "<p>old but edited</p>"
+    );
+    assert_eq!(
+        events.try_recv().unwrap(),
+        CoreEvent::MessagesChanged {
+            conversation_id: CHAT.to_owned()
+        }
+    );
+
+    assert!(engine.refresh_message(CHAT, "m0999").await.is_err());
+}
+
+#[tokio::test]
+async fn refresh_message_marks_a_message_it_stores_first_as_late() {
+    let fake = Arc::new(Fake::default());
+    fake.set_chat_messages(numbered(3));
+    let engine = chat_engine(&fake, small_pages()).await;
+    engine.fetch_newer(CHAT).await.unwrap();
+    let mut reacted = message(4, 4, "<p>PR link</p>");
+    reacted.reactions = serde_json::from_value(json!([
+        {"reactionType": "like", "user": {"user": {"id": ME}}}
+    ]))
+    .unwrap();
+    fake.chat_messages.lock().unwrap().push(reacted);
+    let mut events = engine.subscribe();
+
+    engine.refresh_message(CHAT, "m0004").await.unwrap();
+    assert_eq!(
+        events.try_recv().unwrap(),
+        CoreEvent::MessagesStoredLate {
+            conversation_id: CHAT.to_owned(),
+            message_ids: vec!["m0004".to_owned()],
+        }
+    );
+    assert_eq!(
+        events.try_recv().unwrap(),
+        CoreEvent::MessagesChanged {
+            conversation_id: CHAT.to_owned()
+        }
+    );
+
+    engine.refresh_message(CHAT, "m0004").await.unwrap();
+    while let Ok(event) = events.try_recv() {
+        assert!(!matches!(event, CoreEvent::MessagesStoredLate { .. }));
+    }
+}
+
+#[tokio::test]
+async fn fetch_until_cached_retries_while_graph_lags_behind_the_push() {
+    let fake = Arc::new(Fake::default());
+    fake.set_chat_messages(numbered(3));
+    let engine = chat_engine(&fake, small_pages()).await;
+    engine.fetch_newer(CHAT).await.unwrap();
+    let calls_before = *fake.chat_calls.lock().unwrap();
+    *fake.lagging_message.lock().unwrap() = Some((calls_before + 2, message(4, 4, "<p>neu</p>")));
+    let delays = [std::time::Duration::ZERO; 3];
+
+    assert!(engine.fetch_newer(CHAT).await.unwrap().added.is_empty());
+    let delta = engine
+        .fetch_until_cached(CHAT, "m0004", &delays)
+        .await
+        .unwrap();
+    assert_eq!(delta.added.len(), 1);
+    assert_eq!(delta.added[0].message_id, "m0004");
+    assert_eq!(*fake.chat_calls.lock().unwrap(), calls_before + 2);
+
+    let delta = engine
+        .fetch_until_cached(CHAT, "m0004", &delays)
+        .await
+        .unwrap();
+    assert!(delta.is_empty());
+    assert_eq!(*fake.chat_calls.lock().unwrap(), calls_before + 2);
+}
+
+#[tokio::test]
+async fn fetch_until_cached_gives_up_after_the_last_delay() {
+    let fake = Arc::new(Fake::default());
+    fake.set_chat_messages(numbered(3));
+    let engine = chat_engine(&fake, small_pages()).await;
+    engine.fetch_newer(CHAT).await.unwrap();
+    let calls_before = *fake.chat_calls.lock().unwrap();
+
+    let delta = engine
+        .fetch_until_cached(CHAT, "m0099", &[std::time::Duration::ZERO; 3])
+        .await
+        .unwrap();
+    assert!(delta.is_empty());
+    assert_eq!(*fake.chat_calls.lock().unwrap(), calls_before + 3);
+}
+
+#[tokio::test]
+async fn send_typing_addresses_chats_channels_and_threads() {
+    let chat_fake = Arc::new(Fake::default());
+    let chat_engine = chat_engine(&chat_fake, small_pages()).await;
+    chat_engine.send_typing(CHAT, None, true).await.unwrap();
+    chat_engine.send_typing(CHAT, None, false).await.unwrap();
+    assert!(
+        chat_engine
+            .send_typing("19:unknown@thread.v2", None, true)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        chat_fake.calls(),
+        [
+            format!("typing {CHAT} true"),
+            format!("typing {CHAT} false")
+        ]
+    );
+
+    let channel_fake = Arc::new(Fake::default());
+    let channel_engine = channel_engine(&channel_fake).await;
+    channel_engine
+        .send_typing(CHANNEL, None, true)
+        .await
+        .unwrap();
+    channel_engine
+        .send_typing(CHANNEL, Some("m0042"), true)
+        .await
+        .unwrap();
+    assert_eq!(
+        channel_fake.calls(),
+        [
+            format!("typing {CHANNEL} true"),
+            format!("typing {CHANNEL};messageid=m0042 true"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn chat_actions_call_the_remote_with_the_right_ids() {
+    let fake = Arc::new(Fake::default());
+    fake.set_chat_messages(numbered(3));
+    let engine = chat_engine(&fake, small_pages()).await;
+    engine.fetch_newer(CHAT).await.unwrap();
+
+    engine.mark_read(CHAT).await.unwrap();
+    engine.set_reaction(CHAT, "m0001", "like").await.unwrap();
+    engine.unset_reaction(CHAT, "m0001", "like").await.unwrap();
+    engine
+        .edit_message(CHAT, "m0002", "new **text**")
+        .await
+        .unwrap();
+    engine.soft_delete_message(CHAT, "m0003").await.unwrap();
+    engine
+        .undo_soft_delete_message(CHAT, "m0003")
+        .await
+        .unwrap();
+    let calls = fake.calls();
+    assert!(calls[0].starts_with(&format!("read horizon {CHAT} ")));
+    assert!(calls.contains(&"set_reaction m0001 like".to_owned()));
+    assert!(calls.contains(&"unset_reaction m0001 like".to_owned()));
+    assert!(calls.contains(&"edit m0002 new <b>text</b>".to_owned()));
+    assert!(calls.contains(&format!("soft_delete {ME} m0003")));
+    assert!(calls.contains(&format!("undo_soft_delete {ME} m0003")));
+    assert!(!engine.sidebar().unwrap().chats[0].unread);
+}
+
+#[tokio::test]
+async fn new_chats_are_cached_and_people_are_searched() {
+    let fake = Arc::new(Fake::default());
+    let engine = engine_with(&fake, SyncConfig::default());
+    let one_on_one = engine.create_one_on_one("user-ada").await.unwrap();
+    let group = engine
+        .create_group(
+            &["user-ada".to_owned(), "user-bob".to_owned()],
+            Some("Crew"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (one_on_one.as_str(), group.as_str()),
+        ("19:new@thread.v2", "19:group@thread.v2")
+    );
+    assert_eq!(engine.store().chat_count().unwrap(), 2);
+    assert_eq!(
+        fake.calls()[1],
+        format!("group {ME} user-ada,user-bob Some(\"Crew\")")
+    );
+    assert_eq!(engine.search_people("ada").await.unwrap().len(), 1);
+}
+
+fn chat_with_preview(
+    id: &str,
+    minute: i64,
+    content_type: &str,
+    content: &str,
+    deleted: bool,
+) -> Chat {
+    let mut chat = chat(id, Some("Planning"), minute, 0, "user-ada", false);
+    let preview = chat.last_message_preview.as_mut().unwrap();
+    preview.body = Some(graph::Body {
+        content_type: content_type.to_owned(),
+        content: Some(content.to_owned()),
+    });
+    preview.from =
+        serde_json::from_value(json!({"user": {"id": "user-ada", "displayName": "Ada Example"}}))
+            .unwrap();
+    preview.message_type = Some("message".to_owned());
+    if deleted {
+        preview.deleted_date_time = Some(base());
+    }
+    chat
+}
+
+#[tokio::test]
+async fn sidebar_sync_fills_the_last_message_preview() {
+    let fake = Arc::new(Fake::default());
+    *fake.chats.lock().unwrap() = vec![
+        chat_with_preview(
+            "c-html",
+            5,
+            "html",
+            "<p>Hello <b>team</b></p><p>second</p>",
+            false,
+        ),
+        chat_with_preview("c-gone", 4, "html", "<p>secret</p>", true),
+        chat_with_preview("c-image", 3, "html", "<p><img src=\"x\"></p>", false),
+        chat_with_preview("c-text", 2, "text", &"x".repeat(500), false),
+    ];
+    let engine = engine_with(&fake, SyncConfig::default());
+    engine.refresh_sidebar().await.unwrap();
+    let chats = engine.sidebar().unwrap().chats;
+    let by_id = |id: &str| chats.iter().find(|chat| chat.id == id).unwrap().clone();
+    let html = by_id("c-html");
+    assert_eq!(
+        html.last_message_preview.as_deref(),
+        Some("Hello team second")
+    );
+    assert_eq!(
+        html.last_message_sender_name.as_deref(),
+        Some("Ada Example")
+    );
+    assert_eq!(html.last_message_sender_id.as_deref(), Some("user-ada"));
+    assert!(!html.last_message_deleted);
+    let gone = by_id("c-gone");
+    assert!(gone.last_message_deleted);
+    assert_eq!(gone.last_message_preview, None);
+    assert_eq!(
+        by_id("c-image").last_message_preview.as_deref(),
+        Some("Sent an image")
+    );
+    assert_eq!(
+        by_id("c-text")
+            .last_message_preview
+            .unwrap()
+            .chars()
+            .count(),
+        200
+    );
+    assert!(
+        html.members
+            .iter()
+            .all(|member| member.user_id.is_some() && !member.display_name.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn a_newer_message_updates_the_preview_and_announces_the_sidebar() {
+    let fake = Arc::new(Fake::default());
+    fake.set_chat_messages(numbered(3));
+    let engine = chat_engine(&fake, SyncConfig::default()).await;
+    engine.fetch_newer(CHAT).await.unwrap();
+    let mut events = engine.subscribe();
+    let mut all = numbered(3);
+    all.push(message(4, 40, "<p>brand <i>new</i></p>"));
+    fake.set_chat_messages(all);
+    engine.fetch_newer(CHAT).await.unwrap();
+    let record = engine.sidebar().unwrap().chats.remove(0);
+    assert_eq!(record.last_message_preview.as_deref(), Some("brand new"));
+    assert_eq!(
+        record.last_message_sender_name.as_deref(),
+        Some("Ada Example")
+    );
+    assert_eq!(record.last_message_at, Some(base() + Duration::minutes(40)));
+    let mut seen = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        seen.push(event);
+    }
+    assert!(seen.contains(&CoreEvent::SidebarChanged));
+}
+
+#[tokio::test]
+async fn a_card_line_survives_the_graph_chat_refresh() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, SyncConfig::default()).await;
+    let body = r#"<attachment id="a1"></attachment>"#;
+    let card: Message = serde_json::from_value(json!({
+        "id": "card", "messageType": "message",
+        "createdDateTime": (base() + Duration::minutes(5)).to_rfc3339(),
+        "from": {"user": {"id": "user-ada", "displayName": "Ada Example"}},
+        "body": {"contentType": "html", "content": body},
+        "attachments": [{
+            "id": "a1", "contentType": "application/vnd.microsoft.card.adaptive",
+            "content": json!({"type": "AdaptiveCard", "body": [
+                {"type": "TextBlock", "text": "Ada edited Engine Notes"},
+            ]}).to_string(),
+        }],
+    }))
+    .unwrap();
+    fake.set_chat_messages(vec![card]);
+    engine.fetch_newer(CHAT).await.unwrap();
+    let line = |engine: &SyncEngine<Handle>| {
+        engine
+            .sidebar()
+            .unwrap()
+            .chats
+            .remove(0)
+            .last_message_preview
+    };
+    assert_eq!(line(&engine).as_deref(), Some("Ada edited Engine Notes"));
+    *fake.chats.lock().unwrap() = vec![chat_with_preview(CHAT, 5, "html", body, false)];
+    engine.refresh_sidebar().await.unwrap();
+    assert_eq!(line(&engine).as_deref(), Some("Ada edited Engine Notes"));
+}
+
+#[tokio::test]
+async fn a_newer_call_event_keeps_the_line_and_moves_the_time() {
+    let fake = Arc::new(Fake::default());
+    let mut before = numbered(3);
+    before.push(message(4, 30, "<p>before the call</p>"));
+    fake.set_chat_messages(before.clone());
+    let engine = chat_engine(&fake, SyncConfig::default()).await;
+    engine.fetch_newer(CHAT).await.unwrap();
+    let call: Message = serde_json::from_value(json!({
+        "id": "call", "messageType": "systemEventMessage",
+        "createdDateTime": (base() + Duration::minutes(40)).to_rfc3339(),
+        "body": {"contentType": "html", "content": "<systemEventMessage/>"},
+        "eventDetail": {
+            "@odata.type": "#microsoft.graph.callEndedEventMessageDetail",
+            "callId": "c1", "callDuration": "PT1M2S", "callEventType": "call",
+            "callParticipants": [],
+        },
+    }))
+    .unwrap();
+    before.push(call);
+    fake.set_chat_messages(before);
+    engine.fetch_newer(CHAT).await.unwrap();
+    let record = engine.sidebar().unwrap().chats.remove(0);
+    assert_eq!(
+        record.last_message_preview.as_deref(),
+        Some("before the call")
+    );
+    assert_eq!(record.last_message_at, Some(base() + Duration::minutes(40)));
+}
+
+#[tokio::test]
+async fn a_departed_partner_keeps_their_name_from_the_chat_history() {
+    let fake = Arc::new(Fake::default());
+    let departed = "19:user-ada_user-me@unq.gbl.spaces";
+    let mut alone = chat(departed, None, 5, 5, ME, false);
+    alone
+        .members
+        .retain(|member| member.user_id.as_deref() == Some(ME));
+    *fake.chats.lock().unwrap() = vec![alone];
+    let engine = engine_with(&fake, SyncConfig::default());
+    engine.refresh_sidebar().await.unwrap();
+    assert_eq!(engine.sidebar().unwrap().chats[0].title, "Unknown User");
+    fake.set_chat_messages(numbered(1));
+    engine.fetch_newer(departed).await.unwrap();
+    engine.refresh_sidebar().await.unwrap();
+    assert_eq!(engine.sidebar().unwrap().chats[0].title, "Ada Example");
+}
+
+#[tokio::test]
+async fn a_partner_graph_lists_as_question_mark_keeps_their_name_from_the_chat_history() {
+    let fake = Arc::new(Fake::default());
+    let departed = "19:user-ada_user-me@unq.gbl.spaces";
+    let mut unnamed = chat(departed, None, 5, 5, ME, false);
+    for member in &mut unnamed.members {
+        if member.user_id.as_deref() == Some("user-ada") {
+            member.display_name = Some("?".to_owned());
+        }
+    }
+    *fake.chats.lock().unwrap() = vec![unnamed];
+    let engine = engine_with(&fake, SyncConfig::default());
+    engine.refresh_sidebar().await.unwrap();
+    assert_eq!(engine.sidebar().unwrap().chats[0].title, "Unknown User");
+    fake.set_chat_messages(numbered(1));
+    engine.fetch_newer(departed).await.unwrap();
+    engine.refresh_sidebar().await.unwrap();
+    assert_eq!(engine.sidebar().unwrap().chats[0].title, "Ada Example");
+}
+
+#[tokio::test]
+async fn an_edited_old_message_leaves_the_preview_alone() {
+    let fake = Arc::new(Fake::default());
+    fake.set_chat_messages(numbered(3));
+    let engine = chat_engine(&fake, SyncConfig::default()).await;
+    engine.fetch_newer(CHAT).await.unwrap();
+    let before = engine.sidebar().unwrap().chats.remove(0);
+    let mut all = numbered(3);
+    all[0] = message(1, 1, "<p>edited early</p>");
+    fake.set_chat_messages(all);
+    engine.fetch_newer(CHAT).await.unwrap();
+    assert_eq!(engine.sidebar().unwrap().chats.remove(0), before);
+}
+
+#[tokio::test]
+async fn me_is_known_after_the_first_sync() {
+    let fake = Arc::new(Fake::default());
+    let engine = engine_with(&fake, SyncConfig::default());
+    assert_eq!(engine.me(), None);
+    *fake.chats.lock().unwrap() = vec![chat(CHAT, Some("Planning"), 5, 5, ME, false)];
+    engine.refresh_sidebar().await.unwrap();
+    let me = engine.me().unwrap();
+    assert_eq!(me.user_id, ME);
+    assert_eq!(me.display_name, "Me Myself");
+}
+
+#[tokio::test]
+async fn unread_count_uses_cached_messages_after_the_read_time() {
+    let fake = Arc::new(Fake::default());
+    *fake.chats.lock().unwrap() = vec![chat(CHAT, Some("Planning"), 10, 2, "user-ada", false)];
+    fake.set_chat_messages(numbered(5));
+    let engine = engine_with(&fake, SyncConfig::default());
+    engine.refresh_sidebar().await.unwrap();
+    assert_eq!(engine.unread_count(CHAT), 1);
+    engine.fetch_newer(CHAT).await.unwrap();
+    assert_eq!(engine.unread_count(CHAT), 3);
+    assert_eq!(engine.unread_count("unknown"), 0);
+    engine.mark_read(CHAT).await.unwrap();
+    assert_eq!(engine.unread_count(CHAT), 0);
+}
+
+fn ids(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| value.to_string()).collect()
+}
+
+#[tokio::test]
+async fn avatars_are_fetched_cached_and_not_refetched_inside_seven_days() {
+    let fake = Arc::new(Fake::default());
+    fake.photos
+        .lock()
+        .unwrap()
+        .insert("ada".into(), vec![1, 2, 3]);
+    let engine = engine_with(&fake, SyncConfig::default());
+    let mut events = engine.subscribe();
+    engine
+        .fetch_avatars(&ids(&["ada", "nobody", "ada"]))
+        .await
+        .unwrap();
+    assert_eq!(
+        *fake.photo_requests.lock().unwrap(),
+        vec![ids(&["ada", "nobody"])]
+    );
+    let avatar = engine.avatar("ada").unwrap();
+    assert_eq!(avatar.bytes, [1, 2, 3]);
+    assert_eq!(avatar.content_type, "image/jpeg");
+    assert!(engine.avatar("nobody").is_none());
+    assert_eq!(
+        events.try_recv().unwrap(),
+        CoreEvent::AvatarsChanged {
+            user_ids: ids(&["ada"])
+        }
+    );
+    engine
+        .fetch_avatars(&ids(&["ada", "nobody"]))
+        .await
+        .unwrap();
+    assert_eq!(fake.photo_requests.lock().unwrap().len(), 1);
+    assert!(events.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn stale_avatars_are_fetched_again() {
+    let fake = Arc::new(Fake::default());
+    fake.photos.lock().unwrap().insert("ada".into(), vec![9]);
+    let engine = engine_with(&fake, SyncConfig::default());
+    engine
+        .store()
+        .upsert_avatar(&store::AvatarRecord {
+            user_id: "ada".into(),
+            bytes: None,
+            content_type: String::new(),
+            fetched_at: chrono::Utc::now() - Duration::days(8),
+        })
+        .unwrap();
+    engine.fetch_avatars(&ids(&["ada"])).await.unwrap();
+    assert_eq!(engine.avatar("ada").unwrap().bytes, [9]);
+}
+
+#[tokio::test]
+async fn presence_maps_availability_and_announces_changes_once() {
+    let fake = Arc::new(Fake::default());
+    let entry = |user_id: &str, availability: &str| Presence {
+        user_id: user_id.to_owned(),
+        availability: availability.to_owned(),
+        activity: None,
+    };
+    *fake.presence_answers.lock().unwrap() = vec![
+        entry("ada", "BusyIdle"),
+        entry("bob", "BeRightBack"),
+        entry("cy", "PresenceUnknown"),
+        entry("di", "DoNotDisturb"),
+    ];
+    let engine = engine_with(&fake, SyncConfig::default());
+    let mut events = engine.subscribe();
+    assert!(engine.presence("ada").is_none());
+    let wanted = ids(&["ada", "bob", "cy", "di"]);
+    engine.refresh_presence(&wanted).await.unwrap();
+    assert_eq!(
+        engine.presence("ada").unwrap().availability,
+        Availability::Busy
+    );
+    assert_eq!(
+        engine.presence("bob").unwrap().availability,
+        Availability::Away
+    );
+    assert_eq!(
+        engine.presence("cy").unwrap().availability,
+        Availability::Unknown
+    );
+    assert_eq!(
+        engine.presence("di").unwrap().availability,
+        Availability::DoNotDisturb
+    );
+    assert_eq!(events.try_recv().unwrap(), CoreEvent::PresenceChanged);
+    engine.refresh_presence(&wanted).await.unwrap();
+    assert!(events.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn setting_own_availability_writes_then_reads_back_and_announces() {
+    let fake = Arc::new(Fake::default());
+    *fake.own_status_answer.lock().unwrap() = chatsvc::PresenceStatus {
+        availability: "Busy".into(),
+        ..chatsvc::PresenceStatus::default()
+    };
+    let engine = engine_with(&fake, SyncConfig::default());
+    let mut events = engine.subscribe();
+    let forced = chatsvc::ForcedAvailability {
+        kind: chatsvc::ForcedKind::Busy,
+        expires_at: None,
+    };
+    engine.set_own_availability(Some(forced)).await.unwrap();
+    assert_eq!(*fake.availability_puts.lock().unwrap(), vec![Some(forced)]);
+    assert_eq!(
+        engine.presence(ME).unwrap().availability,
+        Availability::Busy
+    );
+    assert!(matches!(
+        events.try_recv().unwrap(),
+        CoreEvent::PresenceStatusChanged(status) if status.availability == "Busy"
+    ));
+    assert_eq!(events.try_recv().unwrap(), CoreEvent::PresenceChanged);
+}
+
+#[tokio::test]
+async fn setting_the_own_note_forwards_the_note() {
+    let fake = Arc::new(Fake::default());
+    let engine = engine_with(&fake, SyncConfig::default());
+    engine.set_own_status_note(None).await.unwrap();
+    assert_eq!(*fake.note_puts.lock().unwrap(), vec![None]);
+}
+
+fn trouter_endpoint(endpoint_id: &str) -> chatsvc::TrouterEndpoint {
+    chatsvc::TrouterEndpoint {
+        endpoint_id: endpoint_id.to_owned(),
+        trouter_uri: "https://go-eu.trouter.teams.microsoft.com/v4/f/x/unifiedPresenceService"
+            .to_owned(),
+    }
+}
+
+#[tokio::test]
+async fn presence_subscribes_watched_users_once_the_endpoint_is_known() {
+    let fake = Arc::new(Fake::default());
+    let engine = engine_with(&fake, SyncConfig::default());
+    engine.watch_presence(&ids(&["ada", "bob"])).await.unwrap();
+    assert!(fake.presence_subscriptions.lock().unwrap().is_empty());
+    engine
+        .presence_endpoint(trouter_endpoint("e1"))
+        .await
+        .unwrap();
+    engine.watch_presence(&ids(&["bob", "cy"])).await.unwrap();
+    engine.watch_presence(&ids(&["cy"])).await.unwrap();
+    assert_eq!(
+        *fake.presence_subscriptions.lock().unwrap(),
+        vec![
+            ("e1".to_owned(), ids(&["ada", "bob"]), true),
+            ("e1".to_owned(), ids(&["cy"]), false),
+        ]
+    );
+    engine
+        .presence_endpoint(trouter_endpoint("e1"))
+        .await
+        .unwrap();
+    assert_eq!(fake.presence_subscriptions.lock().unwrap().len(), 2);
+    engine.resubscribe_presence().await.unwrap();
+    engine
+        .presence_endpoint(trouter_endpoint("e2"))
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.presence_subscriptions.lock().unwrap()[2..],
+        [
+            ("e1".to_owned(), ids(&["ada", "bob", "cy"]), true),
+            ("e2".to_owned(), ids(&["ada", "bob", "cy"]), true),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn pushed_presence_announces_changes_once() {
+    let fake = Arc::new(Fake::default());
+    let engine = engine_with(&fake, SyncConfig::default());
+    let mut events = engine.subscribe();
+    let update = |user_id: &str, availability: &str| chatsvc::PresenceUpdate {
+        user_id: user_id.to_owned(),
+        availability: availability.to_owned(),
+        activity: None,
+    };
+    let updates = vec![update("ada", "Busy"), update("bob", "Away")];
+    engine.apply_presence(&updates);
+    assert_eq!(
+        engine.presence("ada").unwrap().availability,
+        Availability::Busy
+    );
+    assert_eq!(events.try_recv().unwrap(), CoreEvent::PresenceChanged);
+    assert!(events.try_recv().is_err());
+    engine.apply_presence(&updates);
+    assert!(events.try_recv().is_err());
+}
+
+struct FakeFolders {
+    state: Mutex<Vec<ChatFolder>>,
+    channels: Vec<String>,
+    layout: Vec<TeamLayoutRecord>,
+    settings: ChatSectionSettings,
+    folders_fail: bool,
+    layout_fail: bool,
+    team_order: Mutex<Option<Vec<(String, i64)>>>,
+    calls: Mutex<Vec<String>>,
+}
+
+impl FakeFolders {
+    fn new() -> Arc<Self> {
+        let folder = |id: &str, kind, items: &[&str]| ChatFolder {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            kind,
+            expanded: true,
+            conversation_ids: ids(items),
+        };
+        Arc::new(FakeFolders {
+            state: Mutex::new(vec![
+                folder("fav", FolderKind::Favorites, &["a", "b"]),
+                folder("work", FolderKind::UserCreated, &["c"]),
+            ]),
+            channels: ids(&["ch1", "ch2"]),
+            layout: Vec::new(),
+            settings: ChatSectionSettings::default(),
+            folders_fail: false,
+            layout_fail: false,
+            team_order: Mutex::new(Some(Vec::new())),
+            calls: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl FolderSource for FakeFolders {
+    fn folders(&self) -> BoxFuture<'_, Result<Vec<ChatFolder>>> {
+        Box::pin(async {
+            if self.folders_fail {
+                return Err(Error::Folders("folders down".to_owned()));
+            }
+            Ok(self.state.lock().unwrap().clone())
+        })
+    }
+
+    fn pinned_channels(&self) -> BoxFuture<'_, Result<Vec<String>>> {
+        Box::pin(async { Ok(self.channels.clone()) })
+    }
+
+    fn team_layout(&self) -> BoxFuture<'_, Result<Vec<TeamLayoutRecord>>> {
+        Box::pin(async {
+            if self.layout_fail {
+                return Err(Error::Folders("layout down".to_owned()));
+            }
+            Ok(self.layout.clone())
+        })
+    }
+
+    fn section_settings(&self) -> BoxFuture<'_, Result<ChatSectionSettings>> {
+        Box::pin(async { Ok(self.settings) })
+    }
+
+    fn teams_order(&self) -> BoxFuture<'_, Result<Vec<(String, i64)>>> {
+        Box::pin(async {
+            self.team_order
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| Error::Folders("order down".to_owned()))
+        })
+    }
+
+    fn set_section_enabled(
+        &self,
+        section: ChatSection,
+        enabled: bool,
+    ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("section {section:?} {enabled}"));
+            Ok(())
+        })
+    }
+
+    fn set_folder_expanded<'a>(
+        &'a self,
+        folder_id: &'a str,
+        expanded: bool,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("expanded {folder_id} {expanded}"));
+            Ok(())
+        })
+    }
+
+    fn move_to_folder<'a>(
+        &'a self,
+        conversation_id: &'a str,
+        target_folder_id: &'a str,
+        _index: Option<usize>,
+    ) -> BoxFuture<'a, Result<Vec<ChatFolder>>> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("move {conversation_id} {target_folder_id}"));
+            let mut state = self.state.lock().unwrap();
+            for folder in state
+                .iter_mut()
+                .filter(|folder| folder.kind == FolderKind::UserCreated)
+            {
+                folder.conversation_ids.retain(|id| id != conversation_id);
+            }
+            state
+                .iter_mut()
+                .find(|folder| folder.id == target_folder_id)
+                .unwrap()
+                .conversation_ids
+                .push(conversation_id.to_owned());
+            Ok(state.clone())
+        })
+    }
+
+    fn remove_from_folder<'a>(
+        &'a self,
+        conversation_id: &'a str,
+        folder_id: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<ChatFolder>>> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("remove {conversation_id} {folder_id}"));
+            let mut state = self.state.lock().unwrap();
+            state
+                .iter_mut()
+                .find(|folder| folder.id == folder_id)
+                .unwrap()
+                .conversation_ids
+                .retain(|id| id != conversation_id);
+            Ok(state.clone())
+        })
+    }
+
+    fn change_folders(&self, change: FolderChange) -> BoxFuture<'_, Result<Vec<ChatFolder>>> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push(format!("{change:?}"));
+            let mut state = self.state.lock().unwrap();
+            match change {
+                FolderChange::Create { name } => state.push(ChatFolder {
+                    id: name.clone(),
+                    name,
+                    kind: FolderKind::UserCreated,
+                    expanded: true,
+                    conversation_ids: Vec::new(),
+                }),
+                FolderChange::Rename { folder_id, name } => {
+                    state
+                        .iter_mut()
+                        .find(|folder| folder.id == folder_id)
+                        .unwrap()
+                        .name = name;
+                }
+                FolderChange::Delete { folder_id } => state.retain(|folder| folder.id != folder_id),
+                FolderChange::Move {
+                    folder_id,
+                    target_folder_id,
+                } => {
+                    let source = state
+                        .iter()
+                        .position(|folder| folder.id == folder_id)
+                        .unwrap();
+                    let target = state
+                        .iter()
+                        .position(|folder| folder.id == target_folder_id)
+                        .unwrap();
+                    state.swap(source, target);
+                }
+            }
+            Ok(state.clone())
+        })
+    }
+
+    fn set_channel_pinned<'a>(
+        &'a self,
+        channel_id: &'a str,
+        pinned: bool,
+    ) -> BoxFuture<'a, Result<Vec<String>>> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("pin channel {channel_id} {pinned}"));
+            let mut channel_ids = self.channels.clone();
+            channel_ids.retain(|id| id != channel_id);
+            if pinned {
+                channel_ids.push(channel_id.to_owned());
+            }
+            Ok(channel_ids)
+        })
+    }
+
+    fn set_channel_shown<'a>(
+        &'a self,
+        target: chatsvc::ChannelTarget<'a>,
+        own_user_id: &'a str,
+        shown: bool,
+        _now_ms: i64,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push(format!(
+                "show channel {} general={} {:?} {own_user_id} {shown}",
+                target.channel_id, target.general, target.kind
+            ));
+            Ok(())
+        })
+    }
+
+    fn set_team_shown<'a>(
+        &'a self,
+        team_thread_id: &'a str,
+        shown: bool,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("show team {team_thread_id} {shown}"));
+            Ok(())
+        })
+    }
+
+    fn create_channel<'a>(
+        &'a self,
+        channel: chatsvc::NewChannel<'a>,
+        mailbox: chatsvc::Mailbox<'a>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push(format!(
+                "create {} {} {} '{}' {:?} {}@{}",
+                channel.team_thread_id,
+                channel.group_id,
+                channel.name,
+                channel.description,
+                channel.privacy,
+                mailbox.object_id,
+                mailbox.tenant_id
+            ));
+            Ok(())
+        })
+    }
+
+    fn update_channel<'a>(
+        &'a self,
+        channel: chatsvc::ExistingChannel<'a>,
+        edit: chatsvc::ChannelEdit<'a>,
+        _mailbox: chatsvc::Mailbox<'a>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push(format!(
+                "edit {} {} {:?} '{}' {:?}",
+                channel.team_thread_id,
+                channel.channel_id,
+                channel.substrate_group_id,
+                edit.name,
+                edit.description
+            ));
+            Ok(())
+        })
+    }
+
+    fn delete_channel<'a>(
+        &'a self,
+        channel: chatsvc::ExistingChannel<'a>,
+        _mailbox: chatsvc::Mailbox<'a>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push(format!(
+                "delete {} {}",
+                channel.team_thread_id, channel.channel_id
+            ));
+            Ok(())
+        })
+    }
+}
+
+fn store_alpha_team(engine: &SyncEngine<Handle>) {
+    engine
+        .store()
+        .upsert_teams(&[TeamRecord {
+            id: "alpha".into(),
+            name: "Alpha".into(),
+        }])
+        .unwrap();
+    let channel = |id: &str, name: &str, membership_type: Option<&str>| ChannelRecord {
+        id: id.into(),
+        team_id: "alpha".into(),
+        name: name.into(),
+        membership_type: membership_type.map(str::to_owned),
+        last_message_at: None,
+        unread: false,
+    };
+    engine
+        .store()
+        .upsert_channels(&[
+            channel("19:general@thread.tacv2", "General", Some("standard")),
+            channel("19:secret@thread.tacv2", "Secret", Some("private")),
+        ])
+        .unwrap();
+}
+
+#[tokio::test]
+async fn channel_pin_and_show_hide_go_through_the_source_and_cache() {
+    let fake = Arc::new(Fake::default());
+    let source = FakeFolders::new();
+    let engine = engine_with(&fake, SyncConfig::default()).with_folder_source(source.clone());
+    store_alpha_team(&engine);
+    let mut events = engine.subscribe();
+
+    engine.set_channel_pinned("ch3", true).await.unwrap();
+    assert_eq!(
+        engine.pinned_channels().unwrap(),
+        ids(&["ch1", "ch2", "ch3"])
+    );
+    assert_eq!(events.try_recv().unwrap(), CoreEvent::FoldersChanged);
+    engine.set_channel_pinned("ch1", false).await.unwrap();
+    assert_eq!(engine.pinned_channels().unwrap(), ids(&["ch2"]));
+
+    engine
+        .set_channel_shown("19:secret@thread.tacv2", false)
+        .await
+        .unwrap();
+    engine
+        .set_channel_shown("19:general@thread.tacv2", false)
+        .await
+        .unwrap();
+    engine.set_team_shown("alpha", false).await.unwrap();
+    let team = engine.store().sidebar().unwrap().teams.remove(0);
+    assert!(team.hidden);
+    assert_eq!(team.hidden_channel_ids.len(), 2);
+    let calls = source.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls[2..],
+        [
+            format!("show channel 19:secret@thread.tacv2 general=false Private {ME} false"),
+            format!("show channel 19:general@thread.tacv2 general=true Standard {ME} false"),
+            "show team 19:general@thread.tacv2 false".to_owned(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn channel_and_team_links_use_the_cached_tenant() {
+    let fake = Arc::new(Fake::default());
+    let engine = engine_with(&fake, SyncConfig::default());
+    store_alpha_team(&engine);
+    engine.store().set_meta("me_tenant_id", "tenant-1").unwrap();
+
+    assert_eq!(
+        engine.channel_link("19:secret@thread.tacv2").await.unwrap(),
+        "https://teams.cloud.microsoft/l/channel/19%3Asecret%40thread.tacv2/Secret?groupId=alpha&tenantId=tenant-1&ngc=true"
+    );
+    assert_eq!(
+        engine.team_link("alpha").await.unwrap(),
+        "https://teams.cloud.microsoft/l/team/19%3Ageneral%40thread.tacv2/conversations?groupId=alpha&tenantId=tenant-1"
+    );
+}
+
+#[tokio::test]
+async fn folder_create_rename_move_and_delete_update_the_cache() {
+    let fake = Arc::new(Fake::default());
+    let source = FakeFolders::new();
+    let engine = engine_with(&fake, SyncConfig::default()).with_folder_source(source.clone());
+    engine.refresh_folders().await.unwrap();
+    let mut events = engine.subscribe();
+    let names = |engine: &SyncEngine<_>| -> Vec<String> {
+        engine
+            .chat_folders()
+            .unwrap()
+            .into_iter()
+            .map(|folder| folder.name)
+            .collect()
+    };
+
+    engine
+        .change_folders(FolderChange::Create {
+            name: "todo".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(names(&engine), ["fav", "work", "todo"]);
+    assert_eq!(events.try_recv().unwrap(), CoreEvent::FoldersChanged);
+
+    engine
+        .change_folders(FolderChange::Rename {
+            folder_id: "todo".into(),
+            name: "later".into(),
+        })
+        .await
+        .unwrap();
+    engine
+        .change_folders(FolderChange::Move {
+            folder_id: "todo".into(),
+            target_folder_id: "work".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(names(&engine), ["fav", "later", "work"]);
+
+    engine
+        .change_folders(FolderChange::Delete {
+            folder_id: "work".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(names(&engine), ["fav", "later"]);
+    assert_eq!(source.calls.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn folders_refresh_move_and_remove_go_through_the_source_and_cache() {
+    let fake = Arc::new(Fake::default());
+    let source = FakeFolders::new();
+    let engine = engine_with(&fake, SyncConfig::default()).with_folder_source(source.clone());
+    assert!(engine.chat_folders().unwrap().is_empty());
+    let mut events = engine.subscribe();
+
+    engine.refresh_folders().await.unwrap();
+    let folders = engine.chat_folders().unwrap();
+    assert_eq!(folders.len(), 2);
+    assert_eq!(folders[0].kind, FolderKind::Favorites);
+    assert_eq!(folders[0].conversation_ids, ids(&["a", "b"]));
+    assert_eq!(engine.pinned_channels().unwrap(), ids(&["ch1", "ch2"]));
+    assert_eq!(events.try_recv().unwrap(), CoreEvent::FoldersChanged);
+
+    engine.refresh_folders().await.unwrap();
+    assert!(events.try_recv().is_err());
+
+    engine.move_to_folder("a", "work", None).await.unwrap();
+    assert_eq!(
+        engine.chat_folders().unwrap()[1].conversation_ids,
+        ids(&["c", "a"])
+    );
+    assert_eq!(events.try_recv().unwrap(), CoreEvent::FoldersChanged);
+    assert_eq!(engine.pinned_channels().unwrap(), ids(&["ch1", "ch2"]));
+
+    engine.remove_from_folder("a", "work").await.unwrap();
+    assert_eq!(
+        engine.chat_folders().unwrap()[1].conversation_ids,
+        ids(&["c"])
+    );
+    assert_eq!(
+        *source.calls.lock().unwrap(),
+        ["move a work", "remove a work"]
+    );
+}
+
+#[tokio::test]
+async fn collapse_and_section_settings_go_through_the_source() {
+    let fake = Arc::new(Fake::default());
+    let mut source = FakeFolders::new();
+    Arc::get_mut(&mut source).unwrap().settings = ChatSectionSettings {
+        muted: Some(false),
+        meeting: Some(true),
+        adaptive_rail: Some(true),
+    };
+    let engine = engine_with(&fake, SyncConfig::default()).with_folder_source(source.clone());
+    let mut events = engine.subscribe();
+    engine.refresh_folders().await.unwrap();
+    assert_eq!(events.try_recv().unwrap(), CoreEvent::FoldersChanged);
+    assert_eq!(events.try_recv().unwrap(), CoreEvent::FoldersChanged);
+    assert_eq!(
+        teams_core::stored_section_settings(engine.store()),
+        ChatSectionSettings {
+            muted: Some(false),
+            meeting: Some(true),
+            adaptive_rail: Some(true),
+        }
+    );
+
+    engine.set_folder_expanded("work", false).await.unwrap();
+    engine
+        .set_section_enabled(ChatSection::Meeting, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        *source.calls.lock().unwrap(),
+        ["expanded work false", "section Meeting false"]
+    );
+}
+
+#[tokio::test]
+async fn a_failing_folder_list_still_stores_the_team_layout_and_tabs() {
+    let fake = Arc::new(Fake::default());
+    let mut source = FakeFolders::new();
+    let source_mut = Arc::get_mut(&mut source).unwrap();
+    source_mut.folders_fail = true;
+    source_mut.layout = vec![TeamLayoutRecord {
+        rights: Default::default(),
+        team_id: "alpha".into(),
+        hidden: false,
+        channels: vec![ChannelLayoutRecord {
+            substrate_group_id: None,
+            channel_id: "alpha-general".into(),
+            general: true,
+            hidden: false,
+            tabs: vec![ChannelTabRecord {
+                tab_id: "tab-1".into(),
+                name: "Wiki".into(),
+                definition_id: "com.microsoft.teamspace.tab.wiki".into(),
+                open_url: None,
+            }],
+            notifications: Default::default(),
+        }],
+    }];
+    let engine = engine_with(&fake, SyncConfig::default()).with_folder_source(source.clone());
+
+    let error = engine.refresh_folders().await.unwrap_err();
+
+    assert!(error.to_string().contains("folders down"));
+    assert_eq!(
+        engine.store().channel_tabs("alpha-general").unwrap().len(),
+        1
+    );
+    assert!(
+        engine
+            .store()
+            .meta_time("team_layout_refreshed_at")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn both_refresh_errors_are_reported_together() {
+    let fake = Arc::new(Fake::default());
+    let mut source = FakeFolders::new();
+    let source_mut = Arc::get_mut(&mut source).unwrap();
+    source_mut.folders_fail = true;
+    source_mut.layout_fail = true;
+    let engine = engine_with(&fake, SyncConfig::default()).with_folder_source(source.clone());
+
+    let message = engine.refresh_folders().await.unwrap_err().to_string();
+
+    assert!(message.contains("folders down") && message.contains("layout down"));
+}
+
+#[tokio::test]
+async fn team_order_follows_teams_order_and_survives_a_failing_order_lookup() {
+    let fake = Arc::new(Fake::default());
+    let mut source = FakeFolders::new();
+    let team = |id: &str| TeamLayoutRecord {
+        rights: Default::default(),
+        team_id: id.into(),
+        hidden: false,
+        channels: Vec::new(),
+    };
+    Arc::get_mut(&mut source).unwrap().layout = vec![team("a"), team("b"), team("c")];
+    *source.team_order.lock().unwrap() = Some(vec![("c".to_owned(), 0), ("b".to_owned(), 1)]);
+    let engine = engine_with(
+        &fake,
+        SyncConfig {
+            team_layout_refresh_interval: Duration::zero(),
+            ..SyncConfig::default()
+        },
+    )
+    .with_folder_source(source.clone());
+    let record = |id: &str| TeamRecord {
+        id: id.into(),
+        name: id.into(),
+    };
+    engine
+        .store()
+        .upsert_teams(&[record("a"), record("b"), record("c")])
+        .unwrap();
+    let order = |engine: &SyncEngine<Handle>| -> Vec<String> {
+        let teams = engine.store().sidebar().unwrap().teams;
+        teams.into_iter().map(|entry| entry.team.id).collect()
+    };
+
+    engine.refresh_folders().await.unwrap();
+    assert_eq!(order(&engine), ["c", "b", "a"]);
+
+    *source.team_order.lock().unwrap() = None;
+    let mut events = engine.subscribe();
+    engine.refresh_folders().await.unwrap();
+    assert_eq!(order(&engine), ["c", "b", "a"]);
+    let mut reported = false;
+    while let Ok(event) = events.try_recv() {
+        reported |= matches!(event, CoreEvent::Error { .. });
+    }
+    assert!(reported);
+}
+
+#[tokio::test]
+async fn team_layout_from_teams_orders_and_hides_the_sidebar() {
+    let fake = Arc::new(Fake::default());
+    let mut source = FakeFolders::new();
+    Arc::get_mut(&mut source).unwrap().layout = vec![
+        TeamLayoutRecord {
+            rights: Default::default(),
+            team_id: "zeta".into(),
+            hidden: false,
+            channels: vec![ChannelLayoutRecord {
+                substrate_group_id: None,
+                channel_id: "zeta-old".into(),
+                general: false,
+                hidden: true,
+                tabs: Vec::new(),
+                notifications: Default::default(),
+            }],
+        },
+        TeamLayoutRecord {
+            rights: Default::default(),
+            team_id: "alpha".into(),
+            hidden: true,
+            channels: Vec::new(),
+        },
+    ];
+    let engine = engine_with(&fake, SyncConfig::default()).with_folder_source(source.clone());
+    let team = |id: &str| TeamRecord {
+        id: id.into(),
+        name: id.into(),
+    };
+    engine
+        .store()
+        .upsert_teams(&[team("alpha"), team("zeta")])
+        .unwrap();
+    let channel = |id: &str, name: &str| ChannelRecord {
+        id: id.into(),
+        team_id: "zeta".into(),
+        name: name.into(),
+        membership_type: None,
+        last_message_at: None,
+        unread: false,
+    };
+    engine
+        .store()
+        .upsert_channels(&[
+            channel("zeta-old", "Archiv"),
+            channel("zeta-general", "General"),
+        ])
+        .unwrap();
+    let mut events = engine.subscribe();
+
+    engine.refresh_folders().await.unwrap();
+
+    let teams = engine.store().sidebar().unwrap().teams;
+    let order: Vec<&str> = teams.iter().map(|entry| entry.team.id.as_str()).collect();
+    assert_eq!(order, ["zeta", "alpha"]);
+    assert!(teams[1].hidden);
+    assert_eq!(teams[0].channels[0].id, "zeta-general");
+    assert_eq!(teams[0].hidden_channel_ids, ids(&["zeta-old"]));
+    let received: Vec<CoreEvent> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+    assert!(received.contains(&CoreEvent::SidebarChanged));
+}
+
+#[tokio::test]
+async fn channel_notifications_go_to_the_service_then_the_store() {
+    let fake = Arc::new(Fake::default());
+    let engine = engine_with(&fake, SyncConfig::default());
+    engine
+        .store()
+        .upsert_teams(&[TeamRecord {
+            id: "alpha".into(),
+            name: "alpha".into(),
+        }])
+        .unwrap();
+    engine
+        .store()
+        .upsert_channels(&[ChannelRecord {
+            id: "alpha-news".into(),
+            team_id: "alpha".into(),
+            name: "News".into(),
+            membership_type: None,
+            last_message_at: None,
+            unread: false,
+        }])
+        .unwrap();
+    let mut events = engine.subscribe();
+    let banner = store::ChannelNotifications {
+        level: store::ChannelNotificationLevel::BannerAndFeed,
+        include_replies: true,
+    };
+
+    engine
+        .set_channel_notifications("alpha-news", banner)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fake.calls().last().unwrap(),
+        "channel notifications alpha-news banner true"
+    );
+    let teams = engine.store().sidebar().unwrap().teams;
+    assert_eq!(teams[0].channel_notifications("alpha-news"), banner);
+    assert_eq!(events.try_recv().unwrap(), CoreEvent::SidebarChanged);
+}
+
+#[tokio::test]
+async fn folders_without_a_source_are_unsupported() {
+    let fake = Arc::new(Fake::default());
+    let engine = engine_with(&fake, SyncConfig::default());
+    assert!(matches!(
+        engine.refresh_folders().await,
+        Err(Error::Unsupported(_))
+    ));
+    assert!(matches!(
+        engine.move_to_folder("a", "b", None).await,
+        Err(Error::Unsupported(_))
+    ));
+}
+
+const SENT_AMS_IMAGE: &str =
+    "https://de-prod.asyncgw.teams.microsoft.com/v1/objects/0-ams/views/imgpsh_fullsize";
+const HOSTED: &str =
+    "https://graph.microsoft.com/v1.0/chats/c/messages/m0001/hostedContents/h1/$value";
+
+fn message_with_image(id: u32, minute: i64, url: &str) -> Message {
+    message(
+        id,
+        minute,
+        &format!("<p>look</p><img src=\"{url}\" width=\"300\" height=\"150\">"),
+    )
+}
+
+#[tokio::test]
+async fn images_are_fetched_once_cached_and_announced() {
+    let fake = Arc::new(Fake::default());
+    fake.set_chat_messages(vec![message_with_image(1, 1, HOSTED)]);
+    let engine = chat_engine(&fake, small_pages()).await;
+    engine.fetch_newer(CHAT).await.unwrap();
+    let record = engine.open_conversation(CHAT).unwrap().remove(0);
+    let found = teams_core::images(&record);
+    assert_eq!(found.len(), 1);
+    assert_eq!((found[0].width, found[0].height), (Some(300), Some(150)));
+    assert!(found[0].id.starts_with("0-"));
+    assert!(engine.image(found[0].key()).is_none());
+
+    let mut events = engine.subscribe();
+    engine.fetch_image(&found[0]).await.unwrap();
+    engine.fetch_image(&found[0]).await.unwrap();
+    assert_eq!(fake.hosted_requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        events.try_recv().unwrap(),
+        CoreEvent::ImagesChanged {
+            keys: vec![HOSTED.to_owned()]
+        }
+    );
+    let stored = engine.image(found[0].key()).unwrap();
+    assert_eq!(stored.content_type, "image/png");
+    assert_eq!((stored.width, stored.height), (Some(40), Some(20)));
+}
+
+#[tokio::test]
+async fn gif_and_sticker_images_load_without_graph_and_keep_their_cache_key() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    let proxied = "https://de-prod.asyncgw.teams.microsoft.com/urlp/v1/url/content?url=https%3a%2f%2fstatics.teams.cdn.office.net%2fx%2fa.png";
+    let image = teams_core::ImageRef {
+        id: "x".to_owned(),
+        url: proxied.to_owned(),
+        width: None,
+        height: None,
+        alt: None,
+    };
+    engine.fetch_image(&image).await.unwrap();
+    assert_eq!(
+        *fake.external_requests.lock().unwrap(),
+        ["https://statics.teams.cdn.office.net/x/a.png"]
+    );
+    assert!(engine.image(proxied).is_some());
+}
+
+#[tokio::test]
+async fn a_failed_image_fetch_is_an_error_and_can_be_retried() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    let image = teams_core::ImageRef {
+        id: "x".to_owned(),
+        url: "https://graph.microsoft.com/v1.0/chats/broken".to_owned(),
+        width: None,
+        height: None,
+        alt: None,
+    };
+    assert!(engine.fetch_image(&image).await.is_err());
+    assert!(engine.fetch_image(&image).await.is_err());
+    assert_eq!(fake.hosted_requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn local_search_finds_cached_messages_and_titles() {
+    let fake = Arc::new(Fake::default());
+    fake.set_chat_messages(vec![
+        message(1, 1, "<p>quarterly <b>budget</b> review</p>"),
+        message(2, 2, "<p>lunch?</p>"),
+    ]);
+    let engine = chat_engine(&fake, small_pages()).await;
+    engine.fetch_newer(CHAT).await.unwrap();
+    let hits = engine.search_messages("budg", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        (
+            hits[0].conversation_id.as_str(),
+            hits[0].message_id.as_str()
+        ),
+        (CHAT, "m0001")
+    );
+    assert!(hits[0].snippet.contains("\u{1}budget\u{2}"));
+    assert_eq!(
+        engine.search_messages_in(CHAT, "lunch", 10).unwrap().len(),
+        1
+    );
+    assert!(
+        engine
+            .search_messages_in("other", "lunch", 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        engine.search_conversations("plann", 10).unwrap()[0].conversation_id,
+        CHAT
+    );
+}
+
+#[tokio::test]
+async fn first_unread_is_the_first_message_from_others_after_the_read_time() {
+    let fake = Arc::new(Fake::default());
+    *fake.chats.lock().unwrap() = vec![chat(CHAT, Some("Planning"), 10, 2, "user-ada", false)];
+    fake.set_chat_messages(numbered(5));
+    let engine = engine_with(&fake, SyncConfig::default());
+    engine.refresh_sidebar().await.unwrap();
+    engine.fetch_newer(CHAT).await.unwrap();
+    assert_eq!(
+        engine.first_unread_message_id(CHAT).as_deref(),
+        Some("m0003")
+    );
+    assert!(engine.first_unread_message_id("unknown").is_none());
+    engine.mark_read(CHAT).await.unwrap();
+    assert!(engine.first_unread_message_id(CHAT).is_none());
+}
+
+#[tokio::test]
+async fn chat_reply_quotes_and_channel_reply_uses_the_thread_root() {
+    let fake = Arc::new(Fake::default());
+    fake.set_chat_messages(numbered(2));
+    let engine = chat_engine(&fake, small_pages()).await;
+    engine.fetch_newer(CHAT).await.unwrap();
+    let sent = engine
+        .reply_to(CHAT, "m0001", "answer **bold**")
+        .await
+        .unwrap();
+    assert_eq!(sent.message_id, "1727203440000");
+    assert!(fake.calls().contains(&format!("chatsvc post {CHAT}")));
+    assert!(
+        !fake
+            .calls()
+            .iter()
+            .any(|call| call.starts_with("quote_reply"))
+    );
+
+    let channel_fake = Arc::new(Fake::default());
+    let channel = channel_engine(&channel_fake).await;
+    channel.fetch_newer(CHANNEL).await.unwrap();
+    channel.reply_to(CHANNEL, "m0030", "hi").await.unwrap();
+    assert!(
+        channel_fake
+            .calls()
+            .contains(&format!("chatsvc post {CHANNEL};messageid=m0030"))
+    );
+    assert!(engine.reply_to("unknown", "m1", "x").await.is_err());
+}
+
+#[tokio::test]
+async fn can_edit_and_delete_need_an_own_live_chat_message() {
+    let fake = Arc::new(Fake::default());
+    let mut own = message(1, 1, "<p>mine</p>");
+    own.from =
+        serde_json::from_value(json!({"user": {"id": ME, "displayName": "Me Myself"}})).unwrap();
+    fake.set_chat_messages(vec![own, message(2, 2, "<p>theirs</p>")]);
+    let engine = chat_engine(&fake, small_pages()).await;
+    engine.fetch_newer(CHAT).await.unwrap();
+    let records = engine.open_conversation(CHAT).unwrap();
+    assert!(engine.can_edit(&records[0]) && engine.can_delete(&records[0]));
+    assert!(!engine.can_edit(&records[1]) && !engine.can_delete(&records[1]));
+    let mut deleted = records[0].clone();
+    deleted.deleted = true;
+    assert!(!engine.can_edit(&deleted));
+    assert!(teams_core::can_edit(&records[0], ME));
+    assert!(!teams_core::can_delete(&deleted, ME));
+}
+
+#[tokio::test]
+async fn channel_posts_and_replies_can_be_reacted_edited_and_deleted() {
+    let fake = Arc::new(Fake::default());
+    let engine = channel_engine(&fake).await;
+    engine.fetch_newer(CHANNEL).await.unwrap();
+    let reply_id = engine
+        .open_conversation(CHANNEL)
+        .unwrap()
+        .into_iter()
+        .find(|record| record.reply_to_id.is_some())
+        .unwrap()
+        .message_id;
+
+    engine.set_reaction(CHANNEL, "m0030", "like").await.unwrap();
+    engine
+        .unset_reaction(CHANNEL, &reply_id, "like")
+        .await
+        .unwrap();
+    engine
+        .edit_message(CHANNEL, &reply_id, "new **text**")
+        .await
+        .unwrap();
+    engine.edit_message(CHANNEL, "m0030", "root").await.unwrap();
+    engine
+        .soft_delete_message(CHANNEL, &reply_id)
+        .await
+        .unwrap();
+    engine.soft_delete_message(CHANNEL, "m0030").await.unwrap();
+
+    let calls = fake.calls();
+    assert!(calls.contains(&"set_reaction channel:-:m0030 like".to_owned()));
+    assert!(calls.contains(&format!("unset_reaction channel:m0030:{reply_id} like")));
+    assert!(calls.contains(&format!("edit channel:m0030:{reply_id} new <b>text</b>")));
+    assert!(calls.contains(&"edit channel:-:m0030 root".to_owned()));
+    assert!(calls.contains(&format!("soft_delete {ME} channel:m0030:{reply_id}")));
+    assert!(calls.contains(&format!("soft_delete {ME} channel:-:m0030")));
+    assert!(engine.set_reaction("unknown", "m1", "like").await.is_err());
+}
+
+#[tokio::test]
+async fn channel_messages_of_mine_are_editable_and_deletable() {
+    let fake = Arc::new(Fake::default());
+    let engine = channel_engine(&fake).await;
+    engine.fetch_newer(CHANNEL).await.unwrap();
+    let mut record = engine.open_conversation(CHANNEL).unwrap().remove(0);
+    assert!(!engine.can_edit(&record));
+    record.sender_id = Some(ME.to_owned());
+    assert!(engine.can_edit(&record) && engine.can_delete(&record));
+}
+
+#[tokio::test]
+async fn chat_mentions_become_at_tags_and_a_mentions_array() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    engine
+        .send_message_with_mentions(
+            CHAT,
+            "hi @Ada Example & co",
+            None,
+            &[MentionInput::user("user-ada", "Ada Example")],
+        )
+        .await
+        .unwrap();
+    let posts = fake.chatsvc_posts.lock().unwrap().clone();
+    assert!(posts[0].1.contains("Ada Example</span>"), "{}", posts[0].1);
+    assert!(posts[0].1.ends_with(" &amp; co"), "{}", posts[0].1);
+    let mentions: serde_json::Value =
+        serde_json::from_str(posts[0].3["mentions"].as_str().unwrap()).unwrap();
+    assert_eq!(mentions.as_array().unwrap().len(), 1);
+    assert_eq!(mentions[0]["mri"], "8:orgid:user-ada");
+    assert!(
+        engine
+            .send_message_with_mentions(CHAT, "@Squad", None, &[MentionInput::team("t", "Squad")])
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn channel_mentions_cover_users_channel_and_team_on_post_reply_and_edit() {
+    let fake = Arc::new(Fake::default());
+    let engine = channel_engine(&fake).await;
+    engine.fetch_newer(CHANNEL).await.unwrap();
+    let everyone = [
+        MentionInput::user("user-ada", "Ada Example"),
+        MentionInput::channel(CHANNEL, "General"),
+        MentionInput::team("team-1", "Squad"),
+    ];
+    let text = "@Ada Example @General @Squad";
+    engine
+        .post_to_channel_with_mentions(CHANNEL, text, None, &everyone)
+        .await
+        .unwrap();
+    engine
+        .reply_to_with_mentions(CHANNEL, "m0030", text, &everyone)
+        .await
+        .unwrap();
+    engine
+        .edit_message_with_mentions(CHANNEL, "m0030", text, &everyone)
+        .await
+        .unwrap();
+    for mentions in fake.mentions_sent.lock().unwrap().iter() {
+        assert_eq!(mentions.len(), 3);
+        assert_eq!(
+            mentions
+                .iter()
+                .map(|mention| mention.id)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert!(matches!(mentions[1].target, MentionTarget::Channel { .. }));
+        assert!(matches!(mentions[2].target, MentionTarget::Team { .. }));
+    }
+    assert_eq!(fake.mentions_sent.lock().unwrap().len(), 3);
+}
+
+fn directory_user(id: &str, name: &str) -> User {
+    serde_json::from_value(
+        json!({"id": id, "displayName": name, "mail": format!("{id}@example.test")}),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn people_candidates_list_members_first_then_the_directory_without_duplicates() {
+    let fake = Arc::new(Fake::default());
+    *fake.directory_users.lock().unwrap() = vec![
+        directory_user("user-me", "Me Myself"),
+        directory_user("user-ada", "Ada Example"),
+        directory_user("user-adam", "Adam Directory"),
+    ];
+    let engine = chat_engine(&fake, small_pages()).await;
+
+    let all = engine.mention_candidates(CHAT, "", 10).await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert!(matches!(&all[0], MentionCandidate::Everyone { chat_id } if chat_id == CHAT));
+    assert_eq!(
+        all[0].to_mention(),
+        MentionInput::everyone(CHAT, "Everyone")
+    );
+    assert_eq!(all[1].display_name(), "Ada Example");
+    assert!(!fake.calls().iter().any(|call| call.starts_with("search")));
+
+    let found = engine.mention_candidates(CHAT, "@ada", 10).await.unwrap();
+    let names: Vec<&str> = found
+        .iter()
+        .map(|candidate| candidate.display_name())
+        .collect();
+    assert_eq!(names, ["Ada Example", "Adam Directory"]);
+    assert!(
+        matches!(&found[0], MentionCandidate::Person(person) if person.source == PersonSource::Member)
+    );
+    assert!(
+        matches!(&found[1], MentionCandidate::Person(person) if person.source == PersonSource::Directory)
+    );
+
+    engine.mention_candidates(CHAT, "ada", 10).await.unwrap();
+    engine.search_people("ADA").await.unwrap();
+    let searches = fake
+        .calls()
+        .into_iter()
+        .filter(|call| call.starts_with("search"))
+        .count();
+    assert_eq!(searches, 1);
+
+    assert_eq!(
+        engine
+            .mention_candidates(CHAT, "ada", 1)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(engine.mention_candidates("unknown", "a", 5).await.is_err());
+}
+
+#[tokio::test]
+async fn channel_candidates_offer_recent_senders_the_channel_and_its_team() {
+    let fake = Arc::new(Fake::default());
+    let engine = channel_engine(&fake).await;
+    engine.fetch_newer(CHANNEL).await.unwrap();
+    let all = engine.mention_candidates(CHANNEL, "", 10).await.unwrap();
+    assert_eq!(all.len(), 4);
+    assert!(matches!(&all[0], MentionCandidate::Person(person) if person.user_id == "user-ada"));
+    assert!(
+        matches!(&all[1], MentionCandidate::Channel { channel_id, .. } if channel_id == CHANNEL)
+    );
+    assert!(matches!(&all[2], MentionCandidate::Team { team_id, .. } if team_id == "team-1"));
+    assert!(
+        matches!(&all[3], MentionCandidate::Tag { tag_id, member_count: Some(4), .. } if tag_id == "tag-design")
+    );
+    let design = engine
+        .mention_candidates(CHANNEL, "desi", 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        design[0].to_mention(),
+        MentionInput::tag("tag-design", "Designers")
+    );
+    engine.mention_candidates(CHANNEL, "", 10).await.unwrap();
+    let tag_loads = fake
+        .calls()
+        .into_iter()
+        .filter(|call| call.starts_with("tags"))
+        .count();
+    assert_eq!(tag_loads, 1);
+    let squad = engine.mention_candidates(CHANNEL, "squ", 10).await.unwrap();
+    assert_eq!(squad[0].to_mention(), MentionInput::team("team-1", "Squad"));
+}
+
+#[tokio::test]
+async fn images_land_as_lru_files_and_are_served_by_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let fake = Arc::new(Fake::default());
+    *fake.chats.lock().unwrap() = vec![chat(CHAT, Some("Planning"), 5, 5, ME, false)];
+    let engine = engine_with(&fake, small_pages())
+        .with_image_dir(directory.path(), 1024 * 1024)
+        .unwrap();
+    engine.refresh_sidebar().await.unwrap();
+    let image = teams_core::ImageRef {
+        id: "h1".to_owned(),
+        url: HOSTED.to_owned(),
+        width: None,
+        height: None,
+        alt: None,
+    };
+    assert!(engine.image_path(&image).is_none());
+    let mut events = engine.subscribe();
+    let path = engine.fetch_image(&image).await.unwrap().unwrap();
+    assert_eq!(path.extension().unwrap(), "png");
+    assert!(path.starts_with(directory.path()));
+    assert_eq!(engine.image_path(&image), Some(path.clone()));
+    assert_eq!(engine.fetch_image(&image).await.unwrap(), Some(path));
+    assert_eq!(fake.hosted_requests.lock().unwrap().len(), 1);
+    assert!(matches!(
+        events.try_recv().unwrap(),
+        CoreEvent::ImagesChanged { .. }
+    ));
+    let stored = engine.image(HOSTED).unwrap();
+    assert_eq!((stored.width, stored.height), (Some(40), Some(20)));
+    assert!(engine.store().image(HOSTED).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_read_chat_has_no_first_unread_message() {
+    let fake = Arc::new(Fake::default());
+    *fake.chats.lock().unwrap() = vec![chat(CHAT, Some("Planning"), 10, 10, "user-ada", false)];
+    fake.set_chat_messages(numbered(5));
+    let engine = engine_with(&fake, SyncConfig::default());
+    engine.refresh_sidebar().await.unwrap();
+    engine.fetch_newer(CHAT).await.unwrap();
+    assert!(engine.first_unread_message_id(CHAT).is_none());
+}
+
+fn millis(minute: i64) -> i64 {
+    (base() + Duration::minutes(minute)).timestamp_millis()
+}
+
+fn horizon_of(user: &str, read_minute: i64, at_minute: i64) -> chatsvc::MemberHorizon {
+    chatsvc::receipts::parse_horizon(
+        &format!("8:orgid:{user}"),
+        &format!(
+            "{};{};6638000000000000001",
+            millis(read_minute),
+            millis(at_minute)
+        ),
+    )
+    .unwrap()
+}
+
+fn own_message(id: u32, minute: i64) -> Message {
+    serde_json::from_value(json!({
+        "id": format!("m{id:04}"),
+        "messageType": "message",
+        "createdDateTime": (base() + Duration::minutes(minute)).to_rfc3339(),
+        "from": {"user": {"id": ME, "displayName": "Me Myself"}},
+        "body": {"contentType": "html", "content": "<p>mine</p>"},
+    }))
+    .unwrap()
+}
+
+fn group_chat(id: &str) -> Chat {
+    serde_json::from_value(json!({
+        "id": id,
+        "topic": "Planning",
+        "chatType": "group",
+        "lastUpdatedDateTime": base().to_rfc3339(),
+        "members": [
+            {"userId": ME, "displayName": "Me Myself"},
+            {"userId": "user-ada", "displayName": "Ada Example"},
+            {"userId": "user-bob", "displayName": "Bob Example"},
+            {"userId": "user-cy", "displayName": "Cy Example"}
+        ],
+        "viewpoint": {"lastMessageReadDateTime": base().to_rfc3339(), "isHidden": false},
+    }))
+    .unwrap()
+}
+
+async fn receipt_engine(fake: &Arc<Fake>, chats: Vec<Chat>) -> SyncEngine<Handle> {
+    *fake.chats.lock().unwrap() = chats;
+    fake.set_chat_messages(vec![
+        own_message(1, 1),
+        message(2, 2, "<p>theirs</p>"),
+        own_message(3, 3),
+    ]);
+    let engine = engine_with(fake, small_pages())
+        .with_receipt_debounce(std::time::Duration::from_millis(60));
+    engine.refresh_sidebar().await.unwrap();
+    engine.fetch_newer(CHAT).await.unwrap();
+    engine
+}
+
+fn one_on_one() -> Chat {
+    chat(CHAT, None, 5, 5, ME, false)
+}
+
+#[tokio::test]
+async fn one_on_one_read_up_to_horizon() {
+    let fake = Arc::new(Fake::default());
+    let engine = receipt_engine(&fake, vec![one_on_one()]).await;
+    *fake.horizons.lock().unwrap() =
+        vec![horizon_of("user-me", 3, 3), horizon_of("user-ada", 2, 9)];
+    let mut events = engine.subscribe();
+    engine.refresh_receipts(CHAT).await.unwrap();
+    assert_eq!(
+        events.try_recv().unwrap(),
+        CoreEvent::ReceiptsChanged {
+            conversation_id: CHAT.into()
+        }
+    );
+    assert_eq!(
+        engine.receipt_state(CHAT, "m0001"),
+        teams_core::ReceiptState::Read {
+            readers: vec![teams_core::ReceiptReader {
+                name: "Ada Example".into(),
+                at: base() + Duration::minutes(9),
+            }],
+            total_others: 1,
+        }
+    );
+    assert_eq!(
+        engine.receipt_state(CHAT, "m0003"),
+        teams_core::ReceiptState::Sent
+    );
+    assert_eq!(
+        engine.receipt_state(CHAT, "m0002"),
+        teams_core::ReceiptState::Unknown
+    );
+    assert_eq!(
+        engine.receipt_state(CHAT, "missing"),
+        teams_core::ReceiptState::Unknown
+    );
+}
+
+#[tokio::test]
+async fn stored_horizons_show_receipts_after_a_restart_before_any_refresh() {
+    let fake = Arc::new(Fake::default());
+    let engine = receipt_engine(&fake, vec![one_on_one()]).await;
+    *fake.horizons.lock().unwrap() =
+        vec![horizon_of("user-me", 3, 3), horizon_of("user-ada", 2, 9)];
+    engine.refresh_receipts(CHAT).await.unwrap();
+    let restarted =
+        SyncEngine::with_config(Handle(fake.clone()), engine.store().clone(), small_pages());
+    fake.horizons.lock().unwrap().clear();
+
+    assert!(matches!(
+        restarted.receipt_state(CHAT, "m0001"),
+        teams_core::ReceiptState::Read { .. }
+    ));
+    assert_eq!(
+        restarted.receipt_state(CHAT, "m0003"),
+        teams_core::ReceiptState::Sent
+    );
+}
+
+#[tokio::test]
+async fn horizon_equal_to_creation_time_counts_as_read() {
+    let fake = Arc::new(Fake::default());
+    let engine = receipt_engine(&fake, vec![one_on_one()]).await;
+    *fake.horizons.lock().unwrap() = vec![horizon_of("user-ada", 3, 3)];
+    engine.refresh_receipts(CHAT).await.unwrap();
+    assert!(matches!(
+        engine.receipt_state(CHAT, "m0003"),
+        teams_core::ReceiptState::Read { .. }
+    ));
+}
+
+#[tokio::test]
+async fn nobody_read_means_sent() {
+    let fake = Arc::new(Fake::default());
+    let engine = receipt_engine(&fake, vec![one_on_one()]).await;
+    *fake.horizons.lock().unwrap() =
+        vec![horizon_of("user-me", 3, 3), horizon_of("user-ada", 0, 0)];
+    engine.refresh_receipts(CHAT).await.unwrap();
+    assert_eq!(
+        engine.receipt_state(CHAT, "m0001"),
+        teams_core::ReceiptState::Sent
+    );
+    assert_eq!(
+        engine.receipt_state(CHAT, "m0003"),
+        teams_core::ReceiptState::Sent
+    );
+}
+
+#[tokio::test]
+async fn group_partial_read_lists_who_and_total() {
+    let fake = Arc::new(Fake::default());
+    let engine = receipt_engine(&fake, vec![group_chat(CHAT)]).await;
+    *fake.horizons.lock().unwrap() = vec![
+        horizon_of("user-me", 3, 3),
+        horizon_of("user-cy", 3, 8),
+        horizon_of("user-ada", 1, 6),
+        horizon_of("user-bob", 0, 0),
+    ];
+    engine.refresh_receipts(CHAT).await.unwrap();
+    let names = |state: teams_core::ReceiptState| match state {
+        teams_core::ReceiptState::Read {
+            readers,
+            total_others,
+        } => (
+            readers
+                .into_iter()
+                .map(|reader| reader.name)
+                .collect::<Vec<_>>(),
+            total_others,
+        ),
+        other => panic!("expected read, got {other:?}"),
+    };
+    assert_eq!(
+        names(engine.receipt_state(CHAT, "m0001")),
+        (vec!["Ada Example".to_owned(), "Cy Example".to_owned()], 3)
+    );
+    assert_eq!(
+        names(engine.receipt_state(CHAT, "m0003")),
+        (vec!["Cy Example".to_owned()], 3)
+    );
+}
+
+fn meeting_chat() -> Chat {
+    let mut chat = one_on_one();
+    chat.chat_type = "meeting".into();
+    chat
+}
+
+#[tokio::test]
+async fn meeting_chats_without_horizons_mark_own_messages_sent() {
+    let fake = Arc::new(Fake::default());
+    let engine = receipt_engine(&fake, vec![meeting_chat()]).await;
+    engine.refresh_receipts(CHAT).await.unwrap();
+    assert_eq!(
+        engine.receipt_state(CHAT, "m0001"),
+        teams_core::ReceiptState::Sent
+    );
+    assert_eq!(
+        engine.receipt_state(CHAT, "m0002"),
+        teams_core::ReceiptState::Unknown
+    );
+}
+
+#[tokio::test]
+async fn meeting_chats_take_their_system_events_from_chatsvc() {
+    let fake = Arc::new(Fake::default());
+    *fake.thread_activities.lock().unwrap() = vec![chatsvc::ThreadActivity {
+        message_id: "activity-1".into(),
+        created_at: base(),
+        initiator_id: Some(ME.into()),
+        kind: chatsvc::ThreadActivityKind::TopicUpdated {
+            topic: "Tree service".into(),
+        },
+    }];
+    let engine = receipt_engine(&fake, vec![meeting_chat()]).await;
+    let records = engine.open_conversation(CHAT).unwrap();
+    let event = records
+        .iter()
+        .find(|record| record.message_id == "activity-1")
+        .and_then(teams_core::roster_event::roster_event)
+        .expect("meeting event stored");
+    assert_eq!(
+        event.change,
+        teams_core::roster_event::RosterChange::MeetingNamed
+    );
+    assert_eq!(records.len(), 4);
+}
+
+#[tokio::test]
+async fn disabled_receipts_are_unknown() {
+    let fake = Arc::new(Fake::default());
+    let engine = receipt_engine(&fake, vec![one_on_one()]).await;
+    engine.refresh_receipts(CHAT).await.unwrap();
+    assert_eq!(
+        engine.receipt_state(CHAT, "m0001"),
+        teams_core::ReceiptState::Unknown
+    );
+    *fake.horizons.lock().unwrap() = vec![horizon_of("user-me", 3, 3)];
+    engine.refresh_receipts(CHAT).await.unwrap();
+    assert_eq!(
+        engine.receipt_state(CHAT, "m0001"),
+        teams_core::ReceiptState::Unknown
+    );
+}
+
+#[tokio::test]
+async fn disabling_after_reading_clears_the_state_and_announces() {
+    let fake = Arc::new(Fake::default());
+    let engine = receipt_engine(&fake, vec![one_on_one()]).await;
+    *fake.horizons.lock().unwrap() = vec![horizon_of("user-ada", 3, 3)];
+    engine.refresh_receipts(CHAT).await.unwrap();
+    let mut events = engine.subscribe();
+    fake.horizons.lock().unwrap().clear();
+    engine.refresh_receipts(CHAT).await.unwrap();
+    assert_eq!(
+        events.try_recv().unwrap(),
+        CoreEvent::ReceiptsChanged {
+            conversation_id: CHAT.into()
+        }
+    );
+    assert_eq!(
+        engine.receipt_state(CHAT, "m0001"),
+        teams_core::ReceiptState::Unknown
+    );
+}
+
+#[tokio::test]
+async fn unchanged_horizons_announce_nothing() {
+    let fake = Arc::new(Fake::default());
+    let engine = receipt_engine(&fake, vec![one_on_one()]).await;
+    *fake.horizons.lock().unwrap() = vec![horizon_of("user-ada", 3, 3)];
+    engine.refresh_receipts(CHAT).await.unwrap();
+    let mut events = engine.subscribe();
+    engine.refresh_receipts(CHAT).await.unwrap();
+    assert!(events.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn channels_and_deleted_messages_have_no_state() {
+    let fake = Arc::new(Fake::default());
+    let engine = receipt_engine(&fake, vec![one_on_one()]).await;
+    *fake.horizons.lock().unwrap() = vec![horizon_of("user-ada", 3, 3)];
+    engine.refresh_receipts(CHAT).await.unwrap();
+    let mut deleted = engine.open_conversation(CHAT).unwrap().remove(0);
+    deleted.deleted = true;
+    assert_eq!(
+        engine.receipt_state_for(&deleted),
+        teams_core::ReceiptState::Unknown
+    );
+    engine.refresh_receipts(CHANNEL).await.unwrap_err();
+    assert_eq!(*fake.horizon_calls.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn read_event_burst_triggers_one_fetch() {
+    let fake = Arc::new(Fake::default());
+    let engine = receipt_engine(&fake, vec![one_on_one()]).await;
+    *fake.horizons.lock().unwrap() = vec![horizon_of("user-ada", 1, 4)];
+    engine.refresh_receipts(CHAT).await.unwrap();
+    let before = *fake.horizon_calls.lock().unwrap();
+    *fake.horizons.lock().unwrap() = vec![horizon_of("user-ada", 3, 7)];
+    let event = read_event(Some(CHAT));
+    let started = std::time::Instant::now();
+    tokio::join!(
+        engine.handle_receipt_event(&event),
+        engine.handle_receipt_event(&event),
+        engine.handle_receipt_event(&event),
+    );
+    assert!(started.elapsed() >= std::time::Duration::from_millis(60));
+    assert_eq!(*fake.horizon_calls.lock().unwrap(), before + 1);
+    assert!(matches!(
+        engine.receipt_state(CHAT, "m0003"),
+        teams_core::ReceiptState::Read { .. }
+    ));
+}
+
+fn read_event(conversation_id: Option<&str>) -> chatsvc::MessageEvent {
+    chatsvc::MessageEvent {
+        resource_type: "NewMessage".into(),
+        kind: chatsvc::EventKind::ReadReceipt,
+        conversation_id: conversation_id.map(str::to_owned),
+        message_id: None,
+        received_at: base(),
+    }
+}
+
+#[tokio::test]
+async fn events_for_other_kinds_or_unopened_chats_do_nothing() {
+    let fake = Arc::new(Fake::default());
+    let engine = receipt_engine(&fake, vec![one_on_one()]).await;
+    let mut typing = read_event(Some(CHAT));
+    typing.kind = chatsvc::EventKind::Typing;
+    engine.handle_receipt_event(&typing).await;
+    engine.handle_receipt_event(&read_event(Some(CHAT))).await;
+    engine.handle_receipt_event(&read_event(None)).await;
+    assert_eq!(*fake.horizon_calls.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn reconnect_refetches_known_chats_only() {
+    let fake = Arc::new(Fake::default());
+    let engine = receipt_engine(&fake, vec![one_on_one()]).await;
+    let status = |kind| chatsvc::StatusEvent {
+        kind,
+        detail: String::new(),
+    };
+    engine
+        .handle_receipt_status(&status(chatsvc::StatusKind::Connected))
+        .await;
+    assert_eq!(*fake.horizon_calls.lock().unwrap(), 0);
+    *fake.horizons.lock().unwrap() = vec![horizon_of("user-ada", 1, 4)];
+    engine.refresh_receipts(CHAT).await.unwrap();
+    engine
+        .handle_receipt_status(&status(chatsvc::StatusKind::Disconnected))
+        .await;
+    assert_eq!(*fake.horizon_calls.lock().unwrap(), 1);
+    *fake.horizons.lock().unwrap() = vec![horizon_of("user-ada", 3, 7)];
+    let mut events = engine.subscribe();
+    engine
+        .handle_receipt_status(&status(chatsvc::StatusKind::MessageLoss))
+        .await;
+    assert_eq!(*fake.horizon_calls.lock().unwrap(), 2);
+    assert!(matches!(
+        events.try_recv().unwrap(),
+        CoreEvent::ReceiptsChanged { .. }
+    ));
+}
+
+const BOT_GUID: &str = "0000aaaa-0000-0000-0000-000000000001";
+
+fn chat_app(app_id: &str, name: &str, bot_ids: &[&str]) -> chatsvc::ChatApp {
+    chatsvc::ChatApp {
+        app_id: app_id.to_owned(),
+        name: name.to_owned(),
+        bot_ids: bot_ids.iter().map(|bot| (*bot).to_owned()).collect(),
+        small_image_url: None,
+        accent_color: None,
+        web_application_resource: None,
+    }
+}
+
+fn bot_message(application_id: &str) -> Message {
+    serde_json::from_value(json!({
+        "id": "m0001",
+        "messageType": "message",
+        "createdDateTime": base().to_rfc3339(),
+        "from": {"application": {"id": application_id, "displayName": "Wiki Bot"}},
+        "body": {"contentType": "html", "content": "<attachment id=\"a1\"></attachment>"},
+    }))
+    .unwrap()
+}
+
+async fn card_engine(fake: &Arc<Fake>, application_id: &str) -> SyncEngine<Handle> {
+    let engine = chat_engine(fake, small_pages()).await;
+    fake.set_chat_messages(vec![bot_message(application_id)]);
+    engine.fetch_newer(CHAT).await.unwrap();
+    engine
+}
+
+fn submit_action(data: serde_json::Value) -> teams_core::CardAction {
+    let card = json!({"body": [{"type": "TextBlock", "text": "x"}], "actions": [
+        {"type": "Action.Submit", "title": "Go", "data": data}
+    ]});
+    teams_core::AdaptiveCard::parse(&card.to_string())
+        .unwrap()
+        .actions
+        .remove(0)
+}
+
+#[tokio::test]
+async fn card_submit_invokes_the_matching_bot_and_caches_the_apps() {
+    let fake = Arc::new(Fake::default());
+    *fake.apps.lock().unwrap() = vec![
+        chat_app(
+            "app-other",
+            "Other",
+            &["0000bbbb-0000-0000-0000-000000000002"],
+        ),
+        chat_app("app-wiki", "Wiki", &[BOT_GUID]),
+    ];
+    let engine = card_engine(&fake, BOT_GUID).await;
+    let action = submit_action(json!({"type": "unwatch"}));
+
+    let first = engine.card_action(CHAT, "m0001", &action).await.unwrap();
+    let second = engine.card_action(CHAT, "m0001", &action).await.unwrap();
+
+    assert_eq!(first, teams_core::CardActionOutcome::Sent);
+    assert_eq!(second, first);
+    assert_eq!(*fake.app_calls.lock().unwrap(), 1);
+    let invokes = fake.invokes.lock().unwrap();
+    assert_eq!(invokes[0].app_id, "app-wiki");
+    assert_eq!(invokes[0].bot_id, BOT_GUID);
+    assert_eq!(invokes[0].name, "messageback");
+    assert_eq!(invokes[0].value, json!({"type": "unwatch"}));
+    assert_eq!(invokes[0].server_message_id, "m0001");
+    assert_eq!(invokes[0].conversation_id, CHAT);
+    assert_eq!(invokes[0].display_name, "Me Myself");
+}
+
+#[tokio::test]
+async fn card_action_falls_back_to_the_only_bot_app() {
+    let fake = Arc::new(Fake::default());
+    *fake.apps.lock().unwrap() = vec![
+        chat_app("app-tabs", "Tabs", &[]),
+        chat_app("app-wiki", "Wiki", &[BOT_GUID]),
+    ];
+    let engine = card_engine(&fake, "unrelated-id").await;
+    engine
+        .card_action(CHAT, "m0001", &submit_action(json!({})))
+        .await
+        .unwrap();
+    let invokes = fake.invokes.lock().unwrap();
+    assert_eq!(invokes[0].app_id, "app-wiki");
+    assert_eq!(invokes[0].bot_id, BOT_GUID);
+}
+
+#[tokio::test]
+async fn card_action_with_several_unmatched_bot_apps_is_an_error() {
+    let fake = Arc::new(Fake::default());
+    *fake.apps.lock().unwrap() = vec![
+        chat_app("app-one", "One", &["bot-1"]),
+        chat_app("app-two", "Two", &["bot-2"]),
+    ];
+    let engine = card_engine(&fake, "unrelated-id").await;
+    let outcome = engine
+        .card_action(CHAT, "m0001", &submit_action(json!({})))
+        .await;
+    assert!(outcome.is_err());
+    assert!(fake.invokes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn card_answers_map_to_outcomes() {
+    use chatsvc::{InvokeResponse, TaskContent, TaskContinue, TaskResponse};
+    use teams_core::{CardActionOutcome, TaskDialog, TaskDialogKind};
+
+    let fake = Arc::new(Fake::default());
+    *fake.apps.lock().unwrap() = vec![chat_app("app-wiki", "Wiki", &[BOT_GUID])];
+    let engine = card_engine(&fake, BOT_GUID).await;
+    let action = submit_action(json!({"msteams": {"type": "task/fetch"}}));
+    let answers = [
+        (
+            InvokeResponse::Card(json!({"type": "AdaptiveCard"})),
+            CardActionOutcome::ReplaceCard(json!({"type": "AdaptiveCard"}).to_string()),
+        ),
+        (
+            InvokeResponse::Message("Saved".into()),
+            CardActionOutcome::Message("Saved".into()),
+        ),
+        (
+            InvokeResponse::Task(TaskResponse::Message("Done".into())),
+            CardActionOutcome::Message("Done".into()),
+        ),
+        (
+            InvokeResponse::Failed {
+                status_code: 500,
+                message: "Broken".into(),
+            },
+            CardActionOutcome::Failed("The app answered 500: Broken".into()),
+        ),
+        (
+            InvokeResponse::Task(TaskResponse::Continue(TaskContinue {
+                title: Some("Settings".into()),
+                width: None,
+                height: Some(300),
+                content: TaskContent::Url {
+                    url: "https://bot.example/task".into(),
+                    fallback_url: None,
+                },
+            })),
+            CardActionOutcome::Dialog(TaskDialog {
+                title: Some("Settings".into()),
+                width: 520,
+                height: 300,
+                kind: TaskDialogKind::Url {
+                    url: "https://bot.example/task".into(),
+                    fallback_url: "https://bot.example/task".into(),
+                },
+            }),
+        ),
+        (
+            InvokeResponse::Task(TaskResponse::Continue(TaskContinue {
+                title: None,
+                width: Some(600),
+                height: Some(400),
+                content: TaskContent::Card(json!({"type": "AdaptiveCard"})),
+            })),
+            CardActionOutcome::Dialog(TaskDialog {
+                title: None,
+                width: 600,
+                height: 400,
+                kind: TaskDialogKind::Card(json!({"type": "AdaptiveCard"}).to_string()),
+            }),
+        ),
+    ];
+    for (answer, expected) in answers {
+        *fake.invoke_answer.lock().unwrap() = Some(answer);
+        assert_eq!(
+            engine.card_action(CHAT, "m0001", &action).await.unwrap(),
+            expected
+        );
+    }
+    assert_eq!(fake.invokes.lock().unwrap()[0].name, "task/fetch");
+}
+
+#[tokio::test]
+async fn task_submit_wraps_the_data_for_the_dialog() {
+    let fake = Arc::new(Fake::default());
+    *fake.apps.lock().unwrap() = vec![chat_app("app-wiki", "Wiki", &[BOT_GUID])];
+    let engine = card_engine(&fake, BOT_GUID).await;
+    engine
+        .task_submit(CHAT, "m0001", json!({"choice": "a"}))
+        .await
+        .unwrap();
+    let invokes = fake.invokes.lock().unwrap();
+    assert_eq!(invokes[0].name, "task/submit");
+    assert_eq!(
+        invokes[0].value,
+        json!({"data": {"choice": "a"}, "context": {"theme": "dark"}})
+    );
+}
+
+#[tokio::test]
+async fn dialog_identity_names_the_user_and_the_tenant() {
+    let fake = Arc::new(Fake::default());
+    let engine = card_engine(&fake, BOT_GUID).await;
+    let identity = engine.dialog_identity(CHAT).await.unwrap();
+    assert_eq!(identity.user_id, ME);
+    assert_eq!(identity.display_name, "Me Myself");
+    assert_eq!(identity.tenant_id, "tenant-1");
+}
+
+#[tokio::test]
+async fn card_actions_without_a_payload_are_rejected() {
+    let fake = Arc::new(Fake::default());
+    let engine = card_engine(&fake, BOT_GUID).await;
+    let card = json!({"body": [{"type": "TextBlock", "text": "x"}], "actions": [
+        {"type": "Action.OpenUrl", "title": "Open", "url": "https://example.com"}
+    ]});
+    let action = teams_core::AdaptiveCard::parse(&card.to_string())
+        .unwrap()
+        .actions
+        .remove(0);
+    assert!(engine.card_action(CHAT, "m0001", &action).await.is_err());
+}
+
+#[tokio::test]
+async fn bot_messages_remember_their_application() {
+    let fake = Arc::new(Fake::default());
+    let engine = card_engine(&fake, BOT_GUID).await;
+    let record = engine.open_conversation(CHAT).unwrap().remove(0);
+    assert_eq!(record.sender_application_id.as_deref(), Some(BOT_GUID));
+    assert_eq!(record.sender_id, None);
+}
+
+const PREVIEW_LINKS: &str =
+    r#"[{"url":"https://a.example/x","preview":{"title":"Example"},"previewenabled":true}]"#;
+
+#[tokio::test]
+async fn links_from_the_chat_service_survive_the_next_graph_sync() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    fake.set_chat_messages(vec![message(
+        1,
+        1,
+        "<p><a href=\"https://a.example/x\">link</a></p>",
+    )]);
+    *fake.link_pages.lock().unwrap() = vec![chatsvc::MessageLinks {
+        message_id: "m0001".into(),
+        links_json: PREVIEW_LINKS.into(),
+    }];
+
+    let delta = engine.fetch_newer(CHAT).await.unwrap();
+    assert_eq!(delta.added[0].links_json, PREVIEW_LINKS);
+    assert_eq!(
+        engine.open_conversation(CHAT).unwrap()[0].links_json,
+        PREVIEW_LINKS
+    );
+    assert_eq!(*fake.link_page_calls.lock().unwrap(), [CHAT]);
+
+    let again = engine.fetch_newer(CHAT).await.unwrap();
+    assert!(again.is_empty());
+    assert_eq!(
+        engine.open_conversation(CHAT).unwrap()[0].links_json,
+        PREVIEW_LINKS
+    );
+}
+
+#[tokio::test]
+async fn messages_without_anchors_do_not_ask_the_chat_service() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    fake.set_chat_messages(vec![message(1, 1, "<p>plain</p>")]);
+    engine.fetch_newer(CHAT).await.unwrap();
+    assert!(fake.link_page_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_failing_chat_service_leaves_no_preview() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    fake.set_chat_messages(vec![message(1, 1, "<a href=\"https://a.example\">x</a>")]);
+    let delta = engine.fetch_newer(CHAT).await.unwrap();
+    assert_eq!(delta.added[0].links_json, "[]");
+}
+
+#[tokio::test]
+async fn attaching_a_preview_puts_the_links_and_keeps_them_locally() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    let sent = engine
+        .send_message_with_mentions(CHAT, "see https://a.example/x", None, &[])
+        .await
+        .unwrap();
+    let preview = engine
+        .link_preview_for("https://a.example/x")
+        .await
+        .unwrap()
+        .unwrap();
+
+    engine
+        .attach_link_preview(CHAT, &sent.message_id, &preview)
+        .await
+        .unwrap();
+
+    let put = fake.links_put.lock().unwrap().clone();
+    assert_eq!(put.len(), 1);
+    assert_eq!(put[0].0, sent.message_id);
+    assert!(put[0].1.contains("\"itemid\":\"0\""));
+    let stored = engine
+        .store()
+        .messages_by_id(CHAT, std::slice::from_ref(&sent.message_id))
+        .unwrap();
+    assert_eq!(stored[&sent.message_id].links_json, put[0].1);
+}
+
+#[tokio::test]
+async fn link_infos_are_fetched_once_per_url_and_internal_links_never() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    for _ in 0..2 {
+        engine
+            .link_preview_for("https://a.example/x")
+            .await
+            .unwrap();
+    }
+    assert!(
+        engine
+            .link_preview_for("https://contoso.sharepoint.com/x")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(*fake.link_info_calls.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn schedule_message_resolves_the_inner_thread_id() {
+    let fake = Arc::new(Fake::default());
+    *fake.teams.lock().unwrap() =
+        vec![serde_json::from_value(json!({"id": "team-1", "displayName": "Squad"})).unwrap()];
+    *fake.chats.lock().unwrap() = vec![chat(CHAT, Some("Planning"), 5, 5, ME, false)];
+    let engine = engine_with(&fake, small_pages());
+    engine.refresh_sidebar().await.unwrap();
+    let send_at = base() + Duration::days(1);
+
+    let draft = engine
+        .schedule_message(CHAT, None, "<p>a</p>", send_at)
+        .await
+        .unwrap();
+    assert_eq!(draft.id, "d1");
+    engine
+        .schedule_message(CHANNEL, None, "<p>b</p>", send_at)
+        .await
+        .unwrap();
+    engine
+        .schedule_message(CHANNEL, Some("m0030"), "<p>c</p>", send_at)
+        .await
+        .unwrap();
+
+    let created = fake.scheduled.lock().unwrap().clone();
+    let thread_ids: Vec<&str> = created.iter().map(|entry| entry.0.as_str()).collect();
+    assert_eq!(
+        thread_ids,
+        [CHAT, CHANNEL, "19:channel@thread.tacv2;messageid=m0030"]
+    );
+    assert_eq!(created[0].3, "Me Myself");
+}
+
+#[tokio::test]
+async fn schedule_message_rejects_notes_and_chat_threads() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    let send_at = base();
+    assert!(matches!(
+        engine
+            .schedule_message(teams_core::NOTES_CHAT_ID, None, "<p>a</p>", send_at)
+            .await,
+        Err(Error::Unsupported(_))
+    ));
+    assert!(matches!(
+        engine
+            .schedule_message(CHAT, Some("m1"), "<p>a</p>", send_at)
+            .await,
+        Err(Error::Unsupported(_))
+    ));
+    assert!(fake.scheduled.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn mark_unread_from_a_message_backs_up_one_millisecond() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    let created_at = base() + Duration::minutes(2);
+    engine.mark_unread_from(CHAT, created_at).await.unwrap();
+    assert!(fake.calls().last().unwrap().starts_with(&format!(
+        "read bookmark {CHAT} {};",
+        created_at.timestamp_millis() - 1
+    )));
+}
+
+#[tokio::test]
+async fn forward_converts_the_comment_and_fetches_the_target() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    fake.set_chat_messages(vec![message(1, 1, "<p>one</p>")]);
+    let ids = vec!["m0001".to_owned(), "m0002".to_owned()];
+    let result = engine
+        .forward_messages("19:source@thread.v2", CHAT, &ids, "**fyi**")
+        .await
+        .unwrap();
+    assert_eq!(result.message_id, "99");
+    assert_eq!(
+        fake.calls().last().unwrap(),
+        &format!(
+            "forward 19:source@thread.v2 {CHAT} m0001,m0002 {}",
+            teams_core::markdown_to_html("**fyi**")
+        )
+    );
+    assert_eq!(engine.open_conversation(CHAT).unwrap().len(), 1);
+    engine
+        .forward_messages("19:source@thread.v2", CHAT, &ids, "")
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.calls().last().unwrap(),
+        &format!("forward 19:source@thread.v2 {CHAT} m0001,m0002 ")
+    );
+}
+
+#[tokio::test]
+async fn save_uses_the_message_id_as_root_in_chats() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    engine.set_saved(CHAT, "5", None, true).await.unwrap();
+    assert_eq!(
+        fake.calls().last().unwrap(),
+        &format!("save {CHAT} 5 5 true")
+    );
+    engine
+        .set_saved(CHANNEL, "7", Some("3"), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.calls().last().unwrap(),
+        &format!("save {CHANNEL} 3 7 false")
+    );
+}
+
+#[tokio::test]
+async fn post_follow_writes_as_the_signed_in_user() {
+    let fake = Arc::new(Fake::default());
+    let engine = channel_engine(&fake).await;
+    engine.set_post_followed(CHANNEL, "3", false).await.unwrap();
+    assert_eq!(
+        fake.calls().last().unwrap(),
+        &format!("follow {ME} {CHANNEL} 3 false")
+    );
+}
+
+#[tokio::test]
+async fn pinning_announces_in_chats() {
+    let fake = Arc::new(Fake::default());
+    let engine = channel_engine(&fake).await;
+    *fake.chats.lock().unwrap() = vec![chat(CHAT, Some("Planning"), 5, 5, ME, false)];
+    engine.refresh_sidebar().await.unwrap();
+    let mut events = engine.subscribe();
+    engine.pin_message(CHAT, "5").await.unwrap();
+    assert_eq!(
+        events.try_recv().unwrap(),
+        CoreEvent::PinsChanged {
+            conversation_id: CHAT.to_owned()
+        }
+    );
+    engine
+        .unpin_message(CHAT, "5", Some("folder-1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        fake.calls().last().unwrap(),
+        &format!("unpin {CHAT} 5 Some(\"folder-1\")")
+    );
+}
+
+#[tokio::test]
+async fn channel_pins_use_the_post_pin_routes_of_the_team_thread() {
+    let fake = Arc::new(Fake::default());
+    let engine = channel_engine(&fake).await;
+    engine.fetch_newer(CHANNEL).await.unwrap();
+    let pins = engine.chat_pins(CHANNEL).await.unwrap();
+    assert_eq!(pins[0].message_id, "30");
+    assert_eq!(
+        fake.calls().last().unwrap(),
+        &format!("channel pins {CHANNEL} {CHANNEL}")
+    );
+    let mut events = engine.subscribe();
+    engine.pin_message(CHANNEL, "30").await.unwrap();
+    assert_eq!(
+        fake.calls().last().unwrap(),
+        &format!("post pin {CHANNEL} {CHANNEL} 30 true")
+    );
+    assert_eq!(
+        events.try_recv().unwrap(),
+        CoreEvent::PinsChanged {
+            conversation_id: CHANNEL.to_owned()
+        }
+    );
+    engine.unpin_message(CHANNEL, "30", None).await.unwrap();
+    assert_eq!(
+        fake.calls().last().unwrap(),
+        &format!("post pin {CHANNEL} {CHANNEL} 30 false")
+    );
+}
+
+#[tokio::test]
+async fn channel_mentions_follow_the_activity_feed_and_mark_all_as_read() {
+    let fake = Arc::new(Fake::default());
+    fake.read_states.lock().unwrap().push((
+        CHANNEL.to_owned(),
+        chatsvc::ReadHorizon {
+            consumed_until_ms: 5,
+            last_message_ms: 9,
+            last_message_from: Some("8:orgid:user-ada".to_owned()),
+            ..chatsvc::ReadHorizon::default()
+        },
+    ));
+    let mention = |activity_id: &str, subtype: &str| chatsvc::ActivityItem {
+        message_id: activity_id.to_owned(),
+        activity_id: activity_id.to_owned(),
+        activity_type: "mention".to_owned(),
+        activity_subtype: subtype.to_owned(),
+        source_thread_id: CHANNEL.to_owned(),
+        timestamp_ms: 8,
+        version_ms: 8,
+        ..chatsvc::ActivityItem::default()
+    };
+    fake.activity_feed.lock().unwrap().items = vec![mention("1", "person"), mention("2", "team")];
+    let engine = channel_engine(&fake).await;
+    engine.refresh_sidebar().await.unwrap();
+    let mentions = engine.store().sidebar().unwrap().teams[0].channel_mentions(CHANNEL);
+    assert_eq!((mentions.personal, mentions.team), (1, 1));
+
+    engine.mark_all_channels_read().await.unwrap();
+
+    assert_eq!(fake.calls().last().unwrap(), "mark all channels read");
+    assert!(!engine.store().channel(CHANNEL).unwrap().unwrap().unread);
+    assert!(
+        engine.store().sidebar().unwrap().teams[0]
+            .mentions
+            .is_empty()
+    );
+    engine.refresh_sidebar().await.unwrap();
+    assert!(!engine.store().channel(CHANNEL).unwrap().unwrap().unread);
+    assert!(
+        engine.store().sidebar().unwrap().teams[0]
+            .mentions
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn activity_feed_is_stored_and_marked_read_like_teams() {
+    let fake = Arc::new(Fake::default());
+    let engine = channel_engine(&fake).await;
+    let mut events = engine.subscribe();
+    *fake.activity_feed.lock().unwrap() = chatsvc::ActivitySnapshot {
+        items: vec![chatsvc::ActivityItem {
+            message_id: "1791368000001".to_owned(),
+            activity_type: "reactionInChat".to_owned(),
+            source_thread_id: CHAT.to_owned(),
+            timestamp_ms: 20,
+            version_ms: 20,
+            ..chatsvc::ActivityItem::default()
+        }],
+        horizons: chatsvc::ActivityHorizons {
+            seen_ms: 10,
+            bookmark_ms: 5,
+        },
+    };
+    engine.refresh_sidebar().await.unwrap();
+    assert!(
+        std::iter::from_fn(|| events.try_recv().ok())
+            .any(|event| event == CoreEvent::ActivityChanged)
+    );
+    let stored = teams_core::stored_activity_feed(engine.store()).unwrap();
+    assert!(stored.counts_for_bell(&stored.items[0]));
+
+    engine.mark_activity_read("1791368000001").await.unwrap();
+    assert_eq!(fake.calls().last().unwrap(), "activity read 1791368000001");
+    let stored = teams_core::stored_activity_feed(engine.store()).unwrap();
+    assert!(stored.is_read(&stored.items[0]));
+    engine.refresh_sidebar().await.unwrap();
+    let stored = teams_core::stored_activity_feed(engine.store()).unwrap();
+    assert!(
+        stored.is_read(&stored.items[0]),
+        "a fetch from before the PUT keeps the local mark"
+    );
+
+    stored_feed_unread(&fake, &engine).await;
+    engine.mark_all_activity_read().await.unwrap();
+    assert_eq!(fake.calls().last().unwrap(), "activity all read");
+    let stored = teams_core::stored_activity_feed(engine.store()).unwrap();
+    assert!(stored.is_read(&stored.items[0]));
+}
+
+async fn stored_feed_unread(fake: &Arc<Fake>, engine: &SyncEngine<Handle>) {
+    fake.activity_feed.lock().unwrap().items[0].read_flag = true;
+    engine.refresh_sidebar().await.unwrap();
+    fake.activity_feed.lock().unwrap().items[0].read_flag = false;
+    engine.refresh_sidebar().await.unwrap();
+    let stored = teams_core::stored_activity_feed(engine.store()).unwrap();
+    assert!(!stored.is_read(&stored.items[0]));
+}
+
+#[tokio::test]
+async fn pin_events_become_core_events() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    let mut events = engine.subscribe();
+    let mut event = read_event(Some(CHAT));
+    engine.handle_pin_event(&event);
+    assert!(events.try_recv().is_err());
+    event.kind = chatsvc::EventKind::PinsChanged;
+    engine.handle_pin_event(&event);
+    assert_eq!(
+        events.try_recv().unwrap(),
+        CoreEvent::PinsChanged {
+            conversation_id: CHAT.to_owned()
+        }
+    );
+}
+
+#[tokio::test]
+async fn message_links_resolve_chat_notes_and_channel() {
+    let fake = Arc::new(Fake::default());
+    let engine = channel_engine(&fake).await;
+    *fake.chats.lock().unwrap() = vec![chat(CHAT, Some("Planning"), 5, 5, ME, false)];
+    engine.refresh_sidebar().await.unwrap();
+    assert_eq!(
+        engine.message_link(CHAT, "5").await.unwrap(),
+        teams_core::chat_message_link(CHAT, "5", None)
+    );
+    engine.fetch_newer(CHANNEL).await.unwrap();
+    let root = engine.open_conversation(CHANNEL).unwrap()[0].clone();
+    assert_eq!(
+        engine
+            .message_link(CHANNEL, &root.message_id)
+            .await
+            .unwrap(),
+        teams_core::channel_message_link(&teams_core::ChannelLinkInput {
+            tenant_id: "tenant-1".into(),
+            group_id: "team-1".into(),
+            channel_id: CHANNEL.into(),
+            team_name: "Squad".into(),
+            channel_name: "General".into(),
+            root_id: root.message_id.clone(),
+            message_id: root.message_id.clone(),
+            created_ms: root.created_at.timestamp_millis(),
+        })
+    );
+}
+
+#[tokio::test]
+async fn chat_translation_goes_out_in_batches_of_thirty() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    fake.set_chat_messages(vec![message(1, 1, "<p>eins</p>")]);
+    engine.fetch_newer(CHAT).await.unwrap();
+    let ids: Vec<String> = (0..31).map(|index| format!("m{index:04}")).collect();
+    let translations = engine
+        .translate_messages(CHAT, &ids, "en", &teams_core::TranslationTrigger::OnDemand)
+        .await
+        .unwrap();
+    assert_eq!(translations.len(), 31);
+    assert_eq!(
+        *fake.translate_calls.lock().unwrap(),
+        [format!("chat {CHAT} en 30"), format!("chat {CHAT} en 1")]
+    );
+}
+
+#[tokio::test]
+async fn channel_translation_groups_messages_by_thread_root() {
+    let fake = Arc::new(Fake::default());
+    let engine = channel_engine(&fake).await;
+    engine.fetch_newer(CHANNEL).await.unwrap();
+    let root_id = engine.open_conversation(CHANNEL).unwrap()[0]
+        .message_id
+        .clone();
+    let translations = engine
+        .translate_messages(
+            CHANNEL,
+            std::slice::from_ref(&root_id),
+            "fr",
+            &teams_core::TranslationTrigger::OnDemand,
+        )
+        .await
+        .unwrap();
+    assert_eq!(translations.len(), 1);
+    assert_eq!(
+        *fake.translate_calls.lock().unwrap(),
+        [format!("channel team-1 {CHANNEL} {root_id} fr 1")]
+    );
+}
+
+#[tokio::test]
+async fn translating_in_an_unknown_conversation_fails() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    let outcome = engine
+        .translate_messages(
+            "19:nope@thread.v2",
+            &["m1".to_owned()],
+            "en",
+            &teams_core::TranslationTrigger::OnDemand,
+        )
+        .await;
+    assert!(matches!(
+        outcome,
+        Err(teams_core::Error::UnknownConversation(_))
+    ));
+}
+
+#[tokio::test]
+async fn load_window_ingests_found_messages_oldest_first_and_keeps_cursors() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    fake.set_chat_messages(vec![message(3, 3, "<p>c</p>"), message(1, 1, "<p>a</p>")]);
+    *fake.window_answer.lock().unwrap() = Some(chatsvc::MessageWindow {
+        message_ids: vec!["m0003".into(), "m0002".into(), "m0001".into()],
+        older_cursor: Some("100".into()),
+        newer_cursor: None,
+    });
+
+    let page = engine.load_window(CHAT, "m0003").await.unwrap();
+
+    let ids: Vec<&str> = page
+        .records
+        .iter()
+        .map(|record| record.message_id.as_str())
+        .collect();
+    assert_eq!(ids, ["m0001", "m0003"]);
+    assert_eq!(page.oldest, Some(base() + Duration::minutes(1)));
+    assert_eq!(page.newest, Some(base() + Duration::minutes(3)));
+    assert_eq!(page.older_cursor.as_deref(), Some("100"));
+    assert_eq!(page.newer_cursor, None);
+    assert_eq!(engine.store().message_count(CHAT).unwrap(), 2);
+    assert_eq!(
+        *fake.window_requests.lock().unwrap(),
+        [("m0003".to_owned(), chatsvc::WindowDirection::Bidirectional)]
+    );
+}
+
+#[tokio::test]
+async fn fetch_chat_message_does_not_store_the_message() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, small_pages()).await;
+    fake.set_chat_messages(vec![message(7, 7, "<p>pinned</p>")]);
+
+    let record = engine
+        .fetch_chat_message(CHAT, "m0007")
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(record.message_id, "m0007");
+    assert_eq!(engine.store().message_count(CHAT).unwrap(), 0);
+}
+
+fn forwarded_message(id: &str, minute: i64) -> Message {
+    let content = json!({
+        "originalMessageId": "orig-1",
+        "originalMessageContent": "<p>original words</p>",
+        "originalConversationId": "19:origin@thread.v2",
+        "originalSentDateTime": base().to_rfc3339(),
+        "originalMessageSender": {"user": {"id": "user-cleo", "displayName": null}},
+    });
+    serde_json::from_value(json!({
+        "id": id,
+        "messageType": "message",
+        "createdDateTime": (base() + Duration::minutes(minute)).to_rfc3339(),
+        "from": {"user": {"id": ME, "displayName": null}},
+        "body": {"contentType": "html", "content": "<attachment id=\"orig-1\"></attachment>"},
+        "attachments": [{
+            "id": "orig-1",
+            "contentType": "forwardedMessageReference",
+            "content": content.to_string(),
+        }],
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_forward_cached_without_its_content_is_read_again_once() {
+    let fake = Arc::new(Fake::default());
+    *fake.chats.lock().unwrap() = vec![chat(CHAT, Some("Planning"), 5, 5, ME, false)];
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let engine = SyncEngine::with_config(Handle(fake.clone()), store.clone(), small_pages());
+    engine.refresh_sidebar().await.unwrap();
+    let mut messages = numbered(11);
+    messages.push(forwarded_message("m0000", 0));
+    fake.set_chat_messages(messages);
+    let mut stale = teams_core::message_record(CHAT, &forwarded_message("m0000", 0)).unwrap();
+    stale.attachments_json = r#"[{"content_type":"forwardedMessageReference","name":null,"url":null,"text":null,"size":null,"quote":null,"id":"orig-1","content":null}]"#.to_owned();
+    store.upsert_messages(&[stale]).unwrap();
+
+    engine.fetch_newer(CHAT).await.unwrap();
+
+    let healed = store
+        .messages_by_id(CHAT, &["m0000".to_owned()])
+        .unwrap()
+        .remove("m0000")
+        .unwrap();
+    assert_eq!(teams_core::forwarded_texts(&healed), ["original words"]);
+    let reads = |fake: &Fake| {
+        fake.calls()
+            .iter()
+            .filter(|call| *call == "chat_message m0000")
+            .count()
+    };
+    assert_eq!(reads(&fake), 1);
+    engine.fetch_newer(CHAT).await.unwrap();
+    assert_eq!(reads(&fake), 1);
+}
+
+#[tokio::test]
+async fn server_search_is_anchored_to_my_user_and_tenant() {
+    let fake = Arc::new(Fake::default());
+    let engine = chat_engine(&fake, SyncConfig::default()).await;
+    let search_session = substrate_search::SearchSession::new();
+    engine
+        .server_suggestions(&search_session, "ada")
+        .await
+        .unwrap();
+    engine
+        .server_suggestions(&search_session, "adam")
+        .await
+        .unwrap();
+    let identities = fake.search_identities.lock().unwrap().clone();
+    let expected = substrate_search::SearchIdentity {
+        user_id: ME.to_owned(),
+        tenant_id: "tenant-1".to_owned(),
+    };
+    assert_eq!(identities, [expected.clone(), expected]);
+}
+
+const STALE_FORWARD: &str = r#"[{"content_type":"forwardedMessageReference","name":null,"url":null,"text":null,"size":null,"quote":null,"id":"orig-1","content":null}]"#;
+
+fn stale_forward(conversation_id: &str, message_id: &str, minute: i64) -> store::MessageRecord {
+    let mut stale =
+        teams_core::message_record(conversation_id, &forwarded_message(message_id, minute))
+            .unwrap();
+    stale.attachments_json = STALE_FORWARD.to_owned();
+    stale
+}
+
+fn forwarded_message_without_original(id: &str, minute: i64) -> Message {
+    let mut message = forwarded_message(id, minute);
+    message.attachments[0].content = None;
+    message
+}
+
+fn forward_state(
+    store: &Store,
+    conversation_id: &str,
+    message_id: &str,
+) -> teams_core::ForwardState {
+    let record = store
+        .messages_by_id(conversation_id, &[message_id.to_owned()])
+        .unwrap()
+        .remove(message_id)
+        .unwrap();
+    teams_core::forwards(&record)[0].state
+}
+
+#[tokio::test]
+async fn a_forward_graph_returns_without_its_original_is_not_read_again() {
+    let fake = Arc::new(Fake::default());
+    *fake.chats.lock().unwrap() = vec![chat(CHAT, Some("Planning"), 5, 5, ME, false)];
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let engine = SyncEngine::with_config(Handle(fake.clone()), store.clone(), small_pages());
+    engine.refresh_sidebar().await.unwrap();
+    let mut messages = numbered(11);
+    messages.push(forwarded_message_without_original("m0000", 0));
+    fake.set_chat_messages(messages);
+    store
+        .upsert_messages(&[stale_forward(CHAT, "m0000", 0)])
+        .unwrap();
+    assert_eq!(
+        forward_state(&store, CHAT, "m0000"),
+        teams_core::ForwardState::Loading
+    );
+
+    engine.fetch_newer(CHAT).await.unwrap();
+
+    assert_eq!(
+        forward_state(&store, CHAT, "m0000"),
+        teams_core::ForwardState::Unavailable
+    );
+    let next_session = SyncEngine::with_config(Handle(fake.clone()), store.clone(), small_pages());
+    next_session.fetch_newer(CHAT).await.unwrap();
+    let reads = fake
+        .calls()
+        .iter()
+        .filter(|call| *call == "chat_message m0000")
+        .count();
+    assert_eq!(reads, 1);
+}
+
+#[tokio::test]
+async fn the_background_heal_reads_the_newest_chat_first_and_skips_healthy_chats() {
+    const OLDER: &str = "19:older@thread.v2";
+    const HEALTHY: &str = "19:healthy@thread.v2";
+    let fake = Arc::new(Fake::default());
+    *fake.chats.lock().unwrap() = vec![
+        chat(OLDER, Some("Older"), 2, 2, ME, false),
+        chat(CHAT, Some("Newer"), 9, 9, ME, false),
+        chat(HEALTHY, Some("Healthy"), 12, 12, ME, false),
+    ];
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let engine = SyncEngine::with_config(Handle(fake.clone()), store.clone(), small_pages());
+    engine.refresh_sidebar().await.unwrap();
+    fake.set_chat_messages(vec![
+        forwarded_message("f-older", 1),
+        forwarded_message("f-newer", 8),
+    ]);
+    let healthy = teams_core::message_record(HEALTHY, &forwarded_message("f-healthy", 11)).unwrap();
+    store
+        .upsert_messages(&[
+            stale_forward(OLDER, "f-older", 1),
+            stale_forward(CHAT, "f-newer", 8),
+            healthy,
+        ])
+        .unwrap();
+    let mut events = engine.subscribe();
+
+    engine.heal_all_forwards(std::time::Duration::ZERO).await;
+
+    let reads: Vec<String> = fake
+        .calls()
+        .into_iter()
+        .filter(|call| call.starts_with("chat_message "))
+        .collect();
+    assert_eq!(reads, ["chat_message f-newer", "chat_message f-older"]);
+    assert_eq!(
+        forward_state(&store, OLDER, "f-older"),
+        teams_core::ForwardState::Ready
+    );
+    let mut changed = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let CoreEvent::MessagesChanged { conversation_id } = event {
+            changed.push(conversation_id);
+        }
+    }
+    assert_eq!(changed, [CHAT, OLDER]);
+}
+
+fn own_note(id: u32, minute: i64, body: &str) -> Message {
+    serde_json::from_value(json!({
+        "id": format!("m{id:04}"),
+        "messageType": "message",
+        "createdDateTime": (base() + Duration::minutes(minute)).to_rfc3339(),
+        "from": {"user": {"id": ME, "displayName": "Me Myself"}},
+        "body": {"contentType": "html", "content": body},
+    }))
+    .unwrap()
+}
+
+fn list_notes_chat(fake: &Fake, last_minute: i64) {
+    let last_message_ms = (base() + Duration::minutes(last_minute)).timestamp_millis();
+    *fake.read_states.lock().unwrap() = vec![(
+        NOTES_CHAT_ID.to_owned(),
+        chatsvc::ReadHorizon {
+            consumed_until_ms: last_message_ms,
+            last_message_ms,
+            last_message_from: Some(format!("8:orgid:{ME}")),
+            ..chatsvc::ReadHorizon::default()
+        },
+    )];
+}
+
+#[tokio::test]
+async fn the_notes_chat_comes_from_chatsvc_with_its_newest_message_sorted_by_time() {
+    let fake = Arc::new(Fake::default());
+    *fake.chats.lock().unwrap() = vec![
+        chat("19:old@thread.v2", Some("Old"), 5, 5, "user-ada", false),
+        chat("19:new@thread.v2", Some("New"), 50, 50, "user-ada", false),
+    ];
+    list_notes_chat(&fake, 20);
+    fake.set_chat_messages(vec![
+        own_note(1, 10, "<p>first</p>"),
+        own_note(2, 20, "<p>plan</p>"),
+    ]);
+    let engine = engine_with(&fake, small_pages());
+
+    engine.refresh_sidebar().await.unwrap();
+
+    let sidebar = engine.sidebar().unwrap();
+    let order: Vec<&str> = sidebar.chats.iter().map(|chat| chat.id.as_str()).collect();
+    assert_eq!(
+        order,
+        ["19:new@thread.v2", NOTES_CHAT_ID, "19:old@thread.v2"]
+    );
+    let notes = &sidebar.chats[1];
+    assert_eq!(notes.title, "Me Myself (You)");
+    assert_eq!(notes.kind, "oneOnOne");
+    assert_eq!(notes.last_message_preview.as_deref(), Some("plan"));
+    assert_eq!(notes.last_message_sender_id.as_deref(), Some(ME));
+    assert!(!notes.unread);
+    assert_eq!(notes.members.len(), 1);
+    assert_eq!(notes.members[0].user_id.as_deref(), Some(ME));
+    assert_eq!(engine.open_conversation(NOTES_CHAT_ID).unwrap().len(), 2);
+    assert_eq!(*fake.single_chat_calls.lock().unwrap(), 0);
+
+    let message_reads = *fake.chat_calls.lock().unwrap();
+    engine.refresh_sidebar_full().await.unwrap();
+    let notes = engine.store().chat(NOTES_CHAT_ID).unwrap().unwrap();
+    assert_eq!(notes.last_message_preview.as_deref(), Some("plan"));
+    assert_eq!(*fake.chat_calls.lock().unwrap(), message_reads);
+}
+
+#[tokio::test]
+async fn a_new_note_refreshes_the_line_and_an_unlisted_notes_chat_leaves_the_sidebar() {
+    let fake = Arc::new(Fake::default());
+    *fake.notes_placeholder.lock().unwrap() = true;
+    list_notes_chat(&fake, 20);
+    fake.set_chat_messages(vec![own_note(1, 20, "<p>plan</p>")]);
+    let engine = engine_with(&fake, small_pages());
+    engine.refresh_sidebar().await.unwrap();
+
+    list_notes_chat(&fake, 30);
+    fake.set_chat_messages(vec![
+        own_note(1, 20, "<p>plan</p>"),
+        own_note(2, 30, "<p>later</p>"),
+    ]);
+    engine.refresh_sidebar().await.unwrap();
+    let notes = engine.store().chat(NOTES_CHAT_ID).unwrap().unwrap();
+    assert_eq!(notes.last_message_preview.as_deref(), Some("later"));
+
+    fake.read_states.lock().unwrap().clear();
+    engine.refresh_sidebar().await.unwrap();
+    let placeholder = engine.store().chat(NOTES_CHAT_ID).unwrap().unwrap();
+    assert_eq!(placeholder.title, "Me Myself (You)");
+    assert_eq!(placeholder.last_message_at, None);
+    assert_eq!(placeholder.last_message_preview, None);
+
+    fake.hidden_states
+        .lock()
+        .unwrap()
+        .push((NOTES_CHAT_ID.to_owned(), true));
+    engine.refresh_sidebar().await.unwrap();
+    assert!(engine.store().chat(NOTES_CHAT_ID).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn marking_an_own_note_unread_sets_the_chatsvc_bookmark_and_reading_clears_it() {
+    let fake = Arc::new(Fake::default());
+    *fake.chats.lock().unwrap() = vec![chat(CHAT, Some("Planning"), 5, 5, ME, false)];
+    list_notes_chat(&fake, 20);
+    fake.set_chat_messages(vec![own_note(1, 20, "<p>plan</p>")]);
+    let engine = engine_with(&fake, small_pages());
+    engine.refresh_sidebar().await.unwrap();
+
+    engine.mark_unread(NOTES_CHAT_ID).await.unwrap();
+    engine.mark_read(NOTES_CHAT_ID).await.unwrap();
+
+    let arrived_ms = (base() + Duration::minutes(20)).timestamp_millis();
+    let calls = fake.calls();
+    let bookmarks: Vec<&String> = calls
+        .iter()
+        .filter(|call| call.starts_with("read bookmark "))
+        .collect();
+    assert_eq!(bookmarks.len(), 2, "{calls:?}");
+    let marked = bookmarks[0]
+        .strip_prefix("read bookmark 48:notes ")
+        .unwrap();
+    let fields: Vec<&str> = marked.split(';').collect();
+    assert_eq!(fields[0], (arrived_ms - 1).to_string());
+    assert_eq!(fields[2], "m0001");
+    let cleared = bookmarks[1]
+        .strip_prefix("read bookmark 48:notes ")
+        .unwrap();
+    assert!(
+        cleared.starts_with("0;") && cleared.ends_with(";0"),
+        "{cleared}"
+    );
+    assert!(
+        !calls.iter().any(|call| call.starts_with("mark_unread")),
+        "{calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn hiding_the_notes_chat_writes_the_chatsvc_hide_time_and_undo_clears_it() {
+    let fake = Arc::new(Fake::default());
+    list_notes_chat(&fake, 20);
+    fake.set_chat_messages(vec![own_note(1, 20, "<p>plan</p>")]);
+    let engine = engine_with(&fake, small_pages());
+    engine.refresh_sidebar().await.unwrap();
+
+    engine.hide_chat(NOTES_CHAT_ID).await.unwrap();
+    assert!(engine.store().chat(NOTES_CHAT_ID).unwrap().is_none());
+    engine.unhide_chat(NOTES_CHAT_ID).await.unwrap();
+
+    let calls = fake.calls();
+    let hides: Vec<&String> = calls
+        .iter()
+        .filter(|call| call.starts_with("hidden at ") || call.starts_with("hide"))
+        .collect();
+    assert_eq!(
+        hides,
+        ["hidden at 48:notes now", "hidden at 48:notes none"],
+        "{calls:?}"
+    );
+    assert!(engine.store().chat(NOTES_CHAT_ID).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn marking_the_notes_chat_read_takes_the_tenant_from_another_chat() {
+    let fake = Arc::new(Fake::default());
+    *fake.chats.lock().unwrap() = vec![chat(CHAT, Some("Planning"), 5, 5, ME, false)];
+    list_notes_chat(&fake, 20);
+    fake.set_chat_messages(vec![own_note(1, 20, "<p>plan</p>")]);
+    let engine = engine_with(&fake, small_pages());
+    engine.refresh_sidebar().await.unwrap();
+
+    engine.mark_read(NOTES_CHAT_ID).await.unwrap();
+
+    let calls = fake.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.starts_with(&format!("read horizon {NOTES_CHAT_ID} "))),
+        "{calls:?}"
+    );
+    let member_requests = fake.member_requests.lock().unwrap();
+    assert!(
+        !member_requests
+            .iter()
+            .any(|chat_id| chat_id == NOTES_CHAT_ID)
+    );
+}
+
+#[tokio::test]
+async fn a_quoted_chat_reply_is_written_through_chatsvc_in_the_teams_shape() {
+    let fake = Arc::new(Fake::default());
+    fake.set_chat_messages(numbered(2));
+    let engine = chat_engine(&fake, small_pages()).await;
+    engine.fetch_newer(CHAT).await.unwrap();
+    let extras = MessageExtras {
+        importance: Some("high"),
+        ..MessageExtras::default()
+    };
+    let sent = engine
+        .reply_to_with_extras(
+            CHAT,
+            "m0001",
+            "<p>thanks @Ada Example</p>",
+            &[MentionInput::user("user-ada", "Ada Example")],
+            &extras,
+        )
+        .await
+        .unwrap();
+    let (conversation_id, html, display_name, properties) =
+        fake.chatsvc_posts.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(conversation_id, CHAT);
+    assert_eq!(display_name, "Me Myself");
+    let time = (base() + Duration::minutes(1)).timestamp_millis();
+    let quote = format!(
+        "<blockquote itemscope=\"\" itemtype=\"http://schema.skype.com/Reply\" itemid=\"m0001\"><strong itemprop=\"mri\" itemid=\"8:orgid:user-ada\">Ada Example</strong><span itemprop=\"time\" itemid=\"{time}\"></span><p itemprop=\"preview\">n1</p></blockquote>"
+    );
+    assert_eq!(
+        html,
+        format!(
+            "{quote}<p>thanks <span itemscope=\"\" itemtype=\"http://schema.skype.com/Mention\" itemid=\"0\">Ada Example</span></p>"
+        )
+    );
+    let mentions = json!([{
+        "@type": "http://schema.skype.com/Mention",
+        "itemid": "0",
+        "mri": "8:orgid:user-ada",
+        "mentionType": "person",
+        "displayName": "Ada Example",
+    }]);
+    let quoted = json!([{"messageId": "m0001", "sender": "8:orgid:user-ada", "time": time}]);
+    assert_eq!(
+        properties,
+        json!({
+            "importance": "high",
+            "links": "[]",
+            "mentions": mentions.to_string(),
+            "onbehalfof": null,
+            "files": "[]",
+            "qtdMsgs": quoted.to_string(),
+            "formatVariant": "TEAMS",
+        })
+    );
+    assert_eq!(sent.message_id, "1727203440000");
+    assert_eq!(sent.reply_to_id, None);
+    assert_eq!(sent.importance, store::MessageImportance::High);
+    assert!(sent.body_html.starts_with(&quote));
+    assert!(
+        !fake
+            .calls()
+            .iter()
+            .any(|call| call.starts_with("quote_reply"))
+    );
+}
+
+#[tokio::test]
+async fn a_quoted_chat_reply_with_an_image_goes_through_chatsvc() {
+    let fake = Arc::new(Fake::default());
+    fake.set_chat_messages(numbered(2));
+    let engine = chat_engine(&fake, small_pages()).await;
+    engine.fetch_newer(CHAT).await.unwrap();
+    let extras = MessageExtras {
+        images: vec![HostedImage {
+            content_type: "image/png".into(),
+            bytes: Arc::new(vec![9]),
+        }],
+        ..MessageExtras::default()
+    };
+    engine
+        .reply_to_with_extras(CHAT, "m0001", "look", &[], &extras)
+        .await
+        .unwrap();
+    let posts = fake.chatsvc_posts.lock().unwrap();
+    assert!(posts[0].1.starts_with("<blockquote"), "{}", posts[0].1);
+    assert!(posts[0].1.contains("0-ams"));
+}
+
+#[tokio::test]
+async fn a_reply_to_an_unknown_message_is_sent_without_a_quote() {
+    let fake = Arc::new(Fake::default());
+    fake.set_chat_messages(numbered(2));
+    let engine = chat_engine(&fake, small_pages()).await;
+    engine.fetch_newer(CHAT).await.unwrap();
+    engine.reply_to(CHAT, "m7777", "hi").await.unwrap();
+    assert_eq!(fake.chatsvc_posts.lock().unwrap()[0].1, "hi");
+}
+
+#[tokio::test]
+async fn a_quoted_channel_reply_is_written_through_chatsvc_in_the_teams_quote_shape() {
+    let fake = Arc::new(Fake::default());
+    let engine = channel_engine(&fake).await;
+    engine.fetch_newer(CHANNEL).await.unwrap();
+    let sent = engine
+        .reply_to_with_mentions(CHANNEL, "m0030", "answer", &[])
+        .await
+        .unwrap();
+    assert!(!fake.calls().contains(&"reply to m0030".to_owned()));
+    let (conversation_id, html, display_name, properties) =
+        fake.chatsvc_posts.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(conversation_id, format!("{CHANNEL};messageid=m0030"));
+    assert_eq!(display_name, "Me Myself");
+    let time = (base() + Duration::minutes(30)).timestamp_millis();
+    let quote = format!(
+        "<blockquote itemscope=\"\" itemtype=\"http://schema.skype.com/Reply\" itemid=\"m0030\"><strong itemprop=\"mri\" itemid=\"8:orgid:user-ada\">Ada Example</strong><span itemprop=\"time\" itemid=\"{time}\"></span><p itemprop=\"preview\">root</p></blockquote>"
+    );
+    assert_eq!(html, format!("{quote}answer"));
+    let quoted: serde_json::Value =
+        serde_json::from_str(properties["qtdMsgs"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        quoted,
+        json!([{"messageId": "m0030", "sender": "8:orgid:user-ada", "time": time}])
+    );
+    assert_eq!(sent.message_id, "1727203440000");
+    assert_eq!(sent.reply_to_id.as_deref(), Some("m0030"));
+    assert!(sent.body_html.starts_with(&quote));
+}
+
+#[tokio::test]
+async fn create_channel_sends_the_team_thread_and_own_mailbox_then_refreshes() {
+    let fake = Arc::new(Fake::default());
+    let source = FakeFolders::new();
+    let engine = engine_with(&fake, SyncConfig::default()).with_folder_source(source.clone());
+    store_alpha_team(&engine);
+    engine.store().set_meta("me_tenant_id", "tenant-1").unwrap();
+    let mut events = engine.subscribe();
+
+    engine
+        .create_channel("alpha", "  Planning ", " Roadmap ", ChannelPrivacy::Private)
+        .await
+        .unwrap();
+    let calls = source.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls[0],
+        format!("create 19:general@thread.tacv2 alpha Planning 'Roadmap' Private {ME}@tenant-1")
+    );
+    assert!(
+        std::iter::from_fn(|| events.try_recv().ok())
+            .any(|event| event == CoreEvent::SidebarChanged)
+    );
+    assert!(
+        engine
+            .create_channel("alpha", "   ", "", ChannelPrivacy::Standard)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn edit_channel_sends_the_trimmed_name_and_keeps_an_unloaded_description() {
+    let fake = Arc::new(Fake::default());
+    let source = FakeFolders::new();
+    let engine = engine_with(&fake, SyncConfig::default()).with_folder_source(source.clone());
+    store_alpha_team(&engine);
+    engine.store().set_meta("me_tenant_id", "tenant-1").unwrap();
+
+    engine
+        .edit_channel("19:secret@thread.tacv2", " Renamed ", None)
+        .await
+        .unwrap();
+    let calls = source.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls[0],
+        "edit 19:general@thread.tacv2 19:secret@thread.tacv2 None 'Renamed' None"
+    );
+    let renamed = engine
+        .store()
+        .channel("19:secret@thread.tacv2")
+        .unwrap()
+        .unwrap();
+    assert_eq!(renamed.name, "Renamed");
+    assert!(
+        engine
+            .edit_channel("19:secret@thread.tacv2", "  ", None)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_deleted_channel_stays_gone_while_graph_still_lists_it() {
+    let fake = Arc::new(Fake::default());
+    *fake.teams.lock().unwrap() =
+        vec![serde_json::from_value(json!({"id": "team-1", "displayName": "Squad"})).unwrap()];
+    let source = FakeFolders::new();
+    let engine = engine_with(&fake, SyncConfig::default()).with_folder_source(source.clone());
+    engine.store().set_meta("me_tenant_id", "tenant-1").unwrap();
+    engine.refresh_sidebar_full().await.unwrap();
+    assert!(engine.store().channel(CHANNEL).unwrap().is_some());
+
+    engine.delete_channel(CHANNEL).await.unwrap();
+    assert_eq!(
+        source.calls.lock().unwrap().last().unwrap(),
+        &format!("delete {CHANNEL} {CHANNEL}")
+    );
+    assert!(engine.store().channel(CHANNEL).unwrap().is_none());
+    engine.refresh_sidebar_full().await.unwrap();
+    assert!(engine.store().channel(CHANNEL).unwrap().is_none());
+}
