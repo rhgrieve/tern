@@ -122,7 +122,12 @@ impl Window {
                     }
                 }
             });
-            sidebar.connect_enter(later(|window| window.composer.focus()));
+            sidebar.connect_enter(later(|window| {
+                if !window.is_free() {
+                    window.split.set_show_content(true);
+                    window.composer.focus();
+                }
+            }));
             let search = gtk::Button::builder()
                 .icon_name("system-search-symbolic")
                 .tooltip_text("Search (Ctrl+K)")

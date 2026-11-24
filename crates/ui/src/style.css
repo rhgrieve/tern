@@ -30,7 +30,9 @@
 .loading { background: var(--popover-bg-color); border-radius: 99px; padding: 4px 14px; margin-top: 8px; box-shadow: 0 1px 6px alpha(black, 0.2); font-size: 0.9em; }
 .about { background: alpha(currentColor, 0.06); border-radius: 10px; padding: 4px 6px 4px 12px; margin: 4px 4px 0 4px; }
 .message.own .heading { color: var(--accent-color); }
-.chat { padding: 8px 6px; }
+/* What is in a row fills it, so that clicks anywhere on it arrive. */
+.chats > row { padding: 0; }
+.chat { padding: 8px 14px; }
 .chat.unread .title { font-weight: 700; }
 .chat.muted { opacity: 0.6; }
 .unread-dot { min-width: 9px; min-height: 9px; border-radius: 99px; background: var(--accent-bg-color); }

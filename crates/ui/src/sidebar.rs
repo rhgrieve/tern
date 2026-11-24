@@ -132,6 +132,9 @@ impl Sidebar {
         let factory = gtk::SignalListItemFactory::new();
         let twice = Chosen::default();
         let clicked = twice.clone();
+        let wanted: Rc<RefCell<Option<String>>> = Rc::default();
+        let chosen: Rc<dyn Fn(&str)> = Rc::new(chosen);
+        let (marked, again) = (wanted.clone(), chosen.clone());
         factory.connect_setup(move |_, cell| {
             if let Some(cell) = cell.downcast_ref::<gtk::ListItem>() {
                 let widgets = build();
@@ -145,6 +148,30 @@ impl Sidebar {
                         if let (2, Some(row), Some(run)) = (count, row, run) {
                             let id = row.borrow::<ChatRow>().id.clone();
                             run(&id);
+                        }
+                    }
+                });
+                // The selection says nothing when it stays, but in a narrow window the row that is
+                // selected already leads back to its conversation.
+                let stays = Rc::new(std::cell::Cell::new(false));
+                let id = {
+                    let cell = cell.downgrade();
+                    move || {
+                        let item = cell.upgrade().and_then(|cell| cell.item());
+                        let row = item.and_downcast::<BoxedAnyObject>()?;
+                        let id = row.borrow::<ChatRow>().id.clone();
+                        Some(id)
+                    }
+                };
+                click.connect_pressed({
+                    let (id, stays, marked) = (id.clone(), stays.clone(), marked.clone());
+                    move |_, count, _, _| stays.set(count == 1 && *marked.borrow() == id())
+                });
+                click.connect_released({
+                    let again = again.clone();
+                    move |_, _, _, _| {
+                        if let Some(id) = id().filter(|_| stays.take()) {
+                            again(&id);
                         }
                     }
                 });
@@ -176,13 +203,13 @@ impl Sidebar {
             .factory(&factory)
             .build();
         view.add_css_class("navigation-sidebar");
+        view.add_css_class("chats");
         crate::row::say(&view, "Chats and channels");
         let root = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
             .child(&view)
             .build();
-        let wanted: Rc<RefCell<Option<String>>> = Rc::default();
         let quiet = Rc::new(std::cell::Cell::new(false));
         selection.connect_selected_item_notify({
             let (wanted, quiet) = (wanted.clone(), quiet.clone());
