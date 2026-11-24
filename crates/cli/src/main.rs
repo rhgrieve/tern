@@ -54,6 +54,10 @@ enum Cmd {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// List the files shared in a chat, newest first
+    Files { chat: String },
+    /// Get a file by its number in `files`, from the cache or Teams, and print where it is
+    Get { chat: String, number: usize },
     /// Send a message; waits for a connection if there is none
     Send { chat: String, text: String },
     /// What the background service is doing
@@ -476,6 +480,70 @@ async fn search(query: &str, limit: usize) -> Outcome {
     Ok(())
 }
 
+/// The files in a chat's cached messages, newest first: message, index in it, name.
+fn shared_files(
+    store: &store::Store,
+    id: &str,
+) -> Result<Vec<(store::MessageRecord, usize, String)>, String> {
+    let messages = store.messages(id, None, 500).map_err(text)?;
+    let mut all = Vec::new();
+    for message in messages
+        .into_iter()
+        .rev()
+        .filter(|message| !message.deleted)
+    {
+        let files = teams_core::files(&message).into_iter().filter(|file| {
+            file.kind != teams_core::FileKind::Loop && file.open_url.starts_with("https://")
+        });
+        for (index, file) in files.enumerate() {
+            all.push((message.clone(), index, file.name));
+        }
+    }
+    Ok(all)
+}
+
+async fn list_files(chat: &str) -> Outcome {
+    let store = cache().await?;
+    let id = chat_id(&store, chat)?;
+    let files = shared_files(&store, &id)?;
+    if files.is_empty() {
+        return Err("No files in the cached messages of this chat.".into());
+    }
+    for (number, (message, _, name)) in files.iter().enumerate() {
+        println!(
+            "{:3}  {}  {} from {}",
+            number + 1,
+            local(message.created_at),
+            one_line(name),
+            one_line(message.sender_name.as_deref().unwrap_or("someone"))
+        );
+    }
+    Ok(())
+}
+
+async fn get_file(chat: &str, number: usize) -> Outcome {
+    let store = cache().await?;
+    let id = chat_id(&store, chat)?;
+    let (message, index, _) = number
+        .checked_sub(1)
+        .and_then(|at| shared_files(&store, &id).ok()?.into_iter().nth(at))
+        .ok_or("There is no file with that number.")?;
+    let request = Request::File {
+        conversation: id,
+        message: message.message_id,
+        index,
+    };
+    match tern_ipc::ask_within(&request, Duration::from_secs(30 * 60)).await {
+        Ok(Response::Path(path)) => {
+            println!("{}", path.display());
+            Ok(())
+        }
+        Ok(Response::Error(error)) => Err(error),
+        Ok(_) => Err("unexpected answer".into()),
+        Err(error) => Err(format!("The background service is not running ({error}).")),
+    }
+}
+
 async fn send(chat: &str, message: String) -> Outcome {
     let conversation = chat_id(&cache().await?, chat)?;
     match tern_ipc::ask(&Request::Send {
@@ -489,7 +557,7 @@ async fn send(chat: &str, message: String) -> Outcome {
             Ok(())
         }
         Ok(Response::Error(error)) => Err(error),
-        Ok(Response::Status(_)) => Err("unexpected answer".into()),
+        Ok(_) => Err("unexpected answer".into()),
         Err(error) => Err(format!("The background service is not running ({error}).")),
     }
 }
@@ -536,6 +604,14 @@ fn print_status(status: &Status) {
             (true, count) => format!("reading {count} conversations"),
         },
     );
+    line(
+        "Media",
+        &format!(
+            "{} pictures and files, {} MB",
+            status.media.0,
+            status.media.1 / 1_000_000
+        ),
+    );
     if status.unsent > 0 {
         line("Unsent", &status.unsent.to_string());
     }
@@ -554,7 +630,7 @@ async fn status() -> Outcome {
             Ok(())
         }
         Ok(Response::Error(error)) => Err(error),
-        Ok(Response::Done) => Err("unexpected answer".into()),
+        Ok(_) => Err("unexpected answer".into()),
         Err(error) => Err(format!("The background service is not running ({error}).")),
     }
 }
@@ -600,6 +676,8 @@ async fn main() -> ExitCode {
         Cmd::Chats { limit } => chats(limit).await,
         Cmd::Read { chat, limit } => read(&chat, limit).await,
         Cmd::Search { words, limit } => search(&words.join(" "), limit).await,
+        Cmd::Files { chat } => list_files(&chat).await,
+        Cmd::Get { chat, number } => get_file(&chat, number).await,
         Cmd::Send { chat, text } => send(&chat, text).await,
         Cmd::ProbeSync => probe_sync().await,
         Cmd::Status => status().await,

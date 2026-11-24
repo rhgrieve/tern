@@ -295,6 +295,12 @@ fn escape(text: &str) -> String {
 
 fn link(target: &Target) -> String {
     let encode = |text: &str| utf8_percent_encode(text, NON_ALPHANUMERIC).to_string();
+    if target.message.is_empty() {
+        return format!(
+            "https://teams.microsoft.com/l/chat/{}/conversations",
+            encode(&target.conversation)
+        );
+    }
     format!(
         "https://teams.microsoft.com/l/message/{}/{}?context=%7B%22contextType%22%3A%22chat%22%7D",
         encode(&target.conversation),
@@ -302,13 +308,22 @@ fn link(target: &Target) -> String {
     )
 }
 
+/// Opens Teams on the web.
+pub async fn open_teams() {
+    open_address("https://teams.microsoft.com/").await;
+}
+
 /// Opens the message in Teams on the web, until Tern has a window. Through the portal: a program
 /// started from here would share the service's restrictions and end with it.
 pub async fn open(target: &Target) {
+    open_address(&link(target)).await;
+}
+
+async fn open_address(address: &str) {
     let opened = async {
         let connection = zbus::Connection::session().await?;
         let portal = PortalProxy::new(&connection).await?;
-        portal.open_uri("", &link(target), HashMap::new()).await
+        portal.open_uri("", address, HashMap::new()).await
     };
     if let Err(error) = opened.await {
         tracing::warn!(%error, "cannot open the browser");

@@ -78,6 +78,7 @@ pub struct Session {
     tenant: Option<Arc<str>>,
     pub(crate) provider: Option<Arc<dyn TokenProvider>>,
     guard: Option<Guard>,
+    pub(crate) skype: Arc<Mutex<crate::skype::Held>>,
     region: Option<Arc<str>>,
 }
 
@@ -100,6 +101,7 @@ impl Session {
             tenant: None,
             provider: None,
             guard: None,
+            skype: Arc::default(),
             region: None,
             transport,
             config,
@@ -124,6 +126,7 @@ impl Session {
             tenant: None,
             provider: Some(provider),
             guard: None,
+            skype: Arc::default(),
             region: None,
             transport: Arc::new(NoBrowser),
             config,
@@ -176,6 +179,7 @@ impl Session {
             native: native_http(&self.config),
             force_refresh: Arc::new(AtomicBool::new(false)),
             tenant: Some(tenant_id.to_ascii_lowercase().into()),
+            skype: Arc::default(),
             ..self.clone()
         }
     }

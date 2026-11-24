@@ -17,5 +17,6 @@ From https://github.com/danieldaeschle/rusty-teams (MIT, see `LICENSE`), commit
 | `with_client_message_id` | `chatsvc/src/messages.rs` | Every try of a queued message has the same id |
 | `open_read_only` | `store/src/store.rs` | Readers beside the daemon |
 | Recent conversation states between hourly full reads | `chatsvc/src/conversations.rs`, `core/src/{engine,remote,sidebar_sync}.rs` | Upstream reads every conversation on every refresh |
+| Skype-token downloads without a page | `session/src/skype.rs`, `chatsvc/src/ams.rs` | Most inline pictures need it |
 
-Known for later phases: pins, and AMS image uploads and downloads, still run in a page.
+Known for later phases: pins and AMS image uploads still run in a page.

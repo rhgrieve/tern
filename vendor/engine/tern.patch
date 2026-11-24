@@ -16,8 +16,8 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
  }
 diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/lib.rs vendor/engine/session/src/lib.rs
 --- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/lib.rs	2026-11-24 07:04:16.830396462 -0500
-+++ vendor/engine/session/src/lib.rs	2026-11-24 07:54:14.849520402 -0500
-@@ -4,6 +4,7 @@
++++ vendor/engine/session/src/lib.rs	2026-11-24 08:19:08.071257402 -0500
+@@ -4,9 +4,11 @@
  mod http;
  mod native;
  mod page_script;
@@ -25,7 +25,11 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
  mod request;
  mod scope;
  mod session;
-@@ -14,6 +15,7 @@
++mod skype;
+ mod transport;
+ 
+ pub use app::{App, Target, find_app_tab, has_login_tab, is_login_url};
+@@ -14,9 +16,11 @@
  pub use events::{TabChannel, TabCommand, TabControl, TabEvent, TabEvents};
  pub use native::ensure_crypto_provider;
  pub use page_script::token_acquirer_script;
@@ -33,6 +37,10 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
  pub use request::{
      ApiResponse, AugloopExchange, AugloopStage, BodyToken, Method, Request, SignalrExchange,
  };
+ pub use scope::{GRAPH, IC3, NestedApp, PRESENCE, SPACES, Scope};
+ pub use session::{DEFAULT_ENDPOINT, Session, SessionConfig, TabHold};
++pub use skype::skype_token_allowed;
+ pub use transport::{BoxFuture, CdpTransport, Diagnosis, OpenedTab, Transport};
 diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/native.rs vendor/engine/session/src/native.rs
 --- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/native.rs	2026-11-24 07:04:16.830396462 -0500
 +++ vendor/engine/session/src/native.rs	2026-11-24 07:48:40.743375454 -0500
@@ -406,7 +414,7 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
 +}
 diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/session.rs vendor/engine/session/src/session.rs
 --- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/session.rs	2026-11-24 07:04:16.830396462 -0500
-+++ vendor/engine/session/src/session.rs	2026-11-24 07:54:14.849849842 -0500
++++ vendor/engine/session/src/session.rs	2026-11-24 08:19:08.071427351 -0500
 @@ -11,6 +11,7 @@
  use crate::error::{Error, Result};
  use crate::events::TabControl;
@@ -415,27 +423,29 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
  use crate::request::{ApiResponse, Method, Outcome, Request, WireRequest, WireResult};
  use crate::scope::Scope;
  use crate::transport::{CdpTransport, Transport};
-@@ -75,6 +76,9 @@
+@@ -75,6 +76,10 @@
      force_refresh: Arc<AtomicBool>,
      native: Option<Arc<NativeHttp>>,
      tenant: Option<Arc<str>>,
 +    pub(crate) provider: Option<Arc<dyn TokenProvider>>,
 +    guard: Option<Guard>,
++    pub(crate) skype: Arc<Mutex<crate::skype::Held>>,
 +    region: Option<Arc<str>>,
  }
  
  impl Session {
-@@ -94,6 +98,9 @@
+@@ -94,6 +99,10 @@
          Ok(Session {
              native: native_http(&config),
              tenant: None,
 +            provider: None,
 +            guard: None,
++            skype: Arc::default(),
 +            region: None,
              transport,
              config,
              tabs: Arc::new(
-@@ -106,6 +113,62 @@
+@@ -106,6 +115,63 @@
          })
      }
  
@@ -450,6 +460,7 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
 +            tenant: None,
 +            provider: Some(provider),
 +            guard: None,
++            skype: Arc::default(),
 +            region: None,
 +            transport: Arc::new(NoBrowser),
 +            config,
@@ -498,7 +509,15 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
      /// The same browser session with tokens for `tenant_id`, e.g. a tenant the account is a guest in.
      /// Tokens are held apart from the home tenant's, so both can run side by side.
      pub fn in_tenant(&self, tenant_id: &str) -> Session {
-@@ -167,9 +230,11 @@
+@@ -113,6 +179,7 @@
+             native: native_http(&self.config),
+             force_refresh: Arc::new(AtomicBool::new(false)),
+             tenant: Some(tenant_id.to_ascii_lowercase().into()),
++            skype: Arc::default(),
+             ..self.clone()
+         }
+     }
+@@ -167,9 +234,11 @@
                  // A CAE-revoked token stays unexpired in the app cache, so only a refresh-token grant replaces it.
                  self.force_refresh.store(true, Ordering::SeqCst);
                  forced_here = true;
@@ -513,7 +532,7 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
              }
              let mut retry = Vec::new();
              for (&index, answer) in pending.iter().zip(answers) {
-@@ -221,6 +286,9 @@
+@@ -221,6 +290,9 @@
          requests: &[&Request],
          scope: &Scope,
      ) -> Result<Vec<ApiResponse>> {
@@ -523,7 +542,7 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
          if let Some(native) = &self.native
              && let Some(results) = native
                  .run(
-@@ -271,6 +339,52 @@
+@@ -271,6 +343,52 @@
          })
      }
  
@@ -576,7 +595,7 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
      async fn run_in_any_tab(
          &self,
          requests: &[&Request],
-@@ -367,6 +481,10 @@
+@@ -367,6 +485,10 @@
      }
  }
  
@@ -587,6 +606,171 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
  pub struct TabHold {
      transport: Arc<dyn Transport>,
      app: App,
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/skype.rs vendor/engine/session/src/skype.rs
+--- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/skype.rs	1969-12-31 19:00:00.000000000 -0500
++++ vendor/engine/session/src/skype.rs	2026-11-24 08:19:08.071125632 -0500
+@@ -0,0 +1,146 @@
++//! Tern patch: the Skype token some Teams services still take, without a page.
++
++use std::time::Duration;
++
++use serde_json::Value;
++use tokio::time::Instant;
++
++use crate::error::{Error, Result};
++use crate::request::{Method, Request};
++use crate::scope::{SPACES, Scope};
++use crate::session::Session;
++
++const AUTHZ: &str = "https://teams.cloud.microsoft/api/authsvc/v1.0/authz";
++const MARGIN: Duration = Duration::from_secs(60);
++/// Hosts that may see the token (a subdomain of one of these).
++const DOMAINS: [&str; 2] = [".asm.skype.com", ".asyncgw.teams.microsoft.com"];
++
++#[derive(Default)]
++pub(crate) struct Held(Option<(String, Instant)>);
++
++/// Whether the Skype token may be sent to `url`.
++pub fn skype_token_allowed(url: &str) -> bool {
++    let Ok(url) = url::Url::parse(url) else {
++        return false;
++    };
++    let plain = url.scheme() == "https"
++        && url.username().is_empty()
++        && url.password().is_none()
++        && url.port().is_none();
++    plain
++        && url.host_str().is_some_and(|host| {
++            DOMAINS
++                .iter()
++                .any(|domain| host.len() > domain.len() && host.ends_with(domain))
++        })
++}
++
++fn parse(answer: &Value) -> Option<(String, Duration)> {
++    let token = answer.pointer("/tokens/skypeToken")?.as_str()?;
++    let expires = answer.pointer("/tokens/expiresIn")?;
++    let seconds = expires
++        .as_u64()
++        .or_else(|| expires.as_str()?.parse().ok())?;
++    Some((token.to_owned(), Duration::from_secs(seconds)))
++}
++
++impl Session {
++    /// Whether requests go out without a browser.
++    pub fn is_native(&self) -> bool {
++        self.provider.is_some()
++    }
++
++    /// Downloads `url` with the Skype token; the answer is shaped like any binary one.
++    pub async fn skype_download(&self, url: &str) -> Result<crate::ApiResponse> {
++        if !skype_token_allowed(url) {
++            return Err(Error::TokenHostRefused {
++                resource: "Skype".into(),
++                url: url.split('?').next().unwrap_or_default().to_owned(),
++            });
++        }
++        let first = self.skype_get(url, false).await?;
++        if first.status != 401 {
++            return Ok(first);
++        }
++        self.skype_get(url, true).await
++    }
++
++    async fn skype_get(&self, url: &str, force: bool) -> Result<crate::ApiResponse> {
++        let token = self.skype_token(force).await?;
++        let headers = vec![
++            ("Authorization".to_owned(), format!("skype_token {token}")),
++            (
++                "x-ms-client-version".to_owned(),
++                "1415/1.0.0.2018090100".to_owned(),
++            ),
++        ];
++        let request = Request::anonymous_binary_get(url, headers);
++        let scope = Scope::new(SPACES, "authorization.readwrite");
++        Ok(self.once(&request, &scope).await?)
++    }
++
++    async fn skype_token(&self, force: bool) -> Result<String> {
++        let mut held = self.skype.lock().await;
++        if let Some((token, until)) = &held.0
++            && !force
++            && Instant::now() < *until
++        {
++            return Ok(token.clone());
++        }
++        let request = Request {
++            method: Method::Post,
++            ..Request::get(AUTHZ)
++        };
++        let scope = Scope::new(SPACES, "authorization.readwrite");
++        let answer = self.once(&request, &scope).await?;
++        // The answer holds the token, so it never becomes part of an error.
++        let (token, lifetime) = parse(&answer.body)
++            .filter(|_| answer.is_success())
++            .ok_or_else(|| Error::api(answer.status, AUTHZ, Value::Null))?;
++        held.0 = Some((
++            token.clone(),
++            Instant::now() + lifetime.saturating_sub(MARGIN),
++        ));
++        Ok(token)
++    }
++
++    async fn once(&self, request: &Request, scope: &Scope) -> Result<crate::ApiResponse> {
++        Ok(self.batch(std::slice::from_ref(request), scope).await?.remove(0))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::json;
++
++    #[test]
++    fn the_token_only_goes_to_teams_media_hosts() {
++        for good in [
++            "https://us-api.asm.skype.com/v1/objects/0-eus-d1/views/imgo",
++            "https://us-prod.asyncgw.teams.microsoft.com/v1/objects/x/views/imgo",
++        ] {
++            assert!(skype_token_allowed(good), "{good}");
++        }
++        for bad in [
++            "http://us-api.asm.skype.com/x",
++            "https://asm.skype.com.evil.example/x",
++            "https://evilasm.skype.com/x",
++            "https://.asm.skype.com/x",
++            "https://us-api.asm.skype.com:8443/x",
++            "https://us-api.asm.skype.com@evil.example/x",
++            "https://a@us-api.asm.skype.com/x",
++            "https://graph.microsoft.com/x",
++            "nonsense",
++        ] {
++            assert!(!skype_token_allowed(bad), "{bad}");
++        }
++    }
++
++    #[test]
++    fn reads_the_token_and_its_lifetime() {
++        let answer = json!({"tokens": {"skypeToken": "t", "expiresIn": 100}});
++        assert_eq!(parse(&answer), Some(("t".into(), Duration::from_secs(100))));
++        assert_eq!(parse(&json!({})), None);
++    }
++}
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/ams.rs vendor/engine/chatsvc/src/ams.rs
+--- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/ams.rs	2026-11-24 07:04:16.811260764 -0500
++++ vendor/engine/chatsvc/src/ams.rs	2026-11-24 08:19:08.071855701 -0500
+@@ -87,6 +87,11 @@
+ 
+     /// Reads an AMS image view such as `.../v1/objects/{id}/views/imgo` with the Skype token.
+     pub async fn download_image(&self, url: &str) -> Result<LinkImage> {
++        if self.session.is_native() {
++            let answer = self.session.skype_download(url).await?;
++            ensure_success(&answer)?;
++            return decoded_image(&answer.body);
++        }
+         let answer = self
+             .session
+             .run_with_token(
 diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/conversations.rs vendor/engine/chatsvc/src/conversations.rs
 --- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/conversations.rs	2026-11-24 07:04:16.812335646 -0500
 +++ vendor/engine/chatsvc/src/conversations.rs	2026-11-24 08:11:38.936954137 -0500

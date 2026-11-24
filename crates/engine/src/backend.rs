@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use graph::Graph;
 use session::{Guard, Method, Session};
 use store::{ChatRecord, MessageRecord, Store};
-use teams_core::{Error, Remote, SyncEngine};
+use teams_core::{Error, ImageRef, Remote, SyncEngine};
 
 /// How a failed call should be handled.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +54,7 @@ impl From<Error> for Failure {
                 Failure::Permanent(error.to_string())
             }
             (Error::UnknownConversation(_), _) => Failure::Permanent("unknown conversation".into()),
+            (Error::Io(_), _) => Failure::Permanent(error.to_string()),
             _ => Failure::Temporary(error.to_string().chars().take(200).collect()),
         }
     }
@@ -109,6 +110,18 @@ impl Teams {
         Arc::new(Teams {
             engine: SyncEngine::new(Graph::new(session), store),
         })
+    }
+
+    /// With pictures kept as files in `folder`.
+    pub fn with_pictures(
+        session: Session,
+        store: Arc<Store>,
+        folder: &std::path::Path,
+    ) -> Result<Arc<Self>, String> {
+        let engine = SyncEngine::new(Graph::new(session), store)
+            .with_image_dir(folder, crate::media::IMAGE_BYTES)
+            .map_err(|error| error.to_string())?;
+        Ok(Arc::new(Teams { engine }))
     }
 
     pub fn engine(&self) -> &SyncEngine<Graph> {
@@ -249,6 +262,33 @@ impl crate::outbox::Post for Teams {
                     && message.sender_id == me
             })
             .collect())
+    }
+}
+
+impl crate::media::Pictures for Teams {
+    fn has(&self, image: &ImageRef) -> bool {
+        self.engine.image_path(image).is_some()
+    }
+
+    async fn fetch(&self, image: &ImageRef) -> Result<(), Failure> {
+        self.engine.fetch_image(image).await?;
+        Ok(())
+    }
+
+    async fn avatars(&self, people: &[String]) -> Result<(), Failure> {
+        self.engine.fetch_avatars(people).await?;
+        Ok(())
+    }
+}
+
+impl crate::media::FileSource for Teams {
+    async fn download(
+        &self,
+        url: &str,
+        write: impl FnMut(&[u8]) -> std::io::Result<()> + Send,
+    ) -> Result<String, Failure> {
+        let shared = self.engine.download_file(url, write, |_| {}).await?;
+        Ok(shared.name)
     }
 }
 

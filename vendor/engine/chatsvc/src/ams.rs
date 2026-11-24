@@ -87,6 +87,11 @@ impl Ams {
 
     /// Reads an AMS image view such as `.../v1/objects/{id}/views/imgo` with the Skype token.
     pub async fn download_image(&self, url: &str) -> Result<LinkImage> {
+        if self.session.is_native() {
+            let answer = self.session.skype_download(url).await?;
+            ensure_success(&answer)?;
+            return decoded_image(&answer.body);
+        }
         let answer = self
             .session
             .run_with_token(

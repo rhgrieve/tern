@@ -4,6 +4,7 @@
 mod link;
 mod messages;
 mod notify;
+mod tray;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -23,7 +24,8 @@ use tokio::time::{Instant, interval, sleep_until, timeout};
 
 use link::{Link, contradicts};
 use messages::{Messages, News};
-use notify::{Action, Notifier};
+use notify::{Action, Notifier, Target};
+use tray::{Dot, Model, Pick, TrayIcon};
 
 const TICK: Duration = Duration::from_secs(15);
 const READ_BACK: Duration = Duration::from_secs(5 * 60);
@@ -32,6 +34,7 @@ const READ_AFTER_CHANGE: Duration = Duration::from_secs(20);
 const BEFORE_SLEEP: Duration = Duration::from_secs(2);
 /// Sleep may have to wait this long for a running request, so it stays below logind's limit.
 const STEP: Duration = Duration::from_secs(3);
+const PAUSE: Duration = Duration::from_secs(60 * 60);
 const RECONNECT_FIRST: Duration = Duration::from_secs(2);
 const RECONNECT_MAX: Duration = Duration::from_secs(60);
 
@@ -127,10 +130,17 @@ struct Daemon {
     messages: Option<Messages>,
     news: mpsc::UnboundedSender<News>,
     notifier: Notifier,
+    tray: TrayIcon,
+    paused_until: Option<Instant>,
 }
 
 impl Daemon {
-    fn new(broker: Arc<Broker>, news: mpsc::UnboundedSender<News>, notifier: Notifier) -> Self {
+    fn new(
+        broker: Arc<Broker>,
+        news: mpsc::UnboundedSender<News>,
+        notifier: Notifier,
+        tray: TrayIcon,
+    ) -> Self {
         let now = Instant::now();
         Daemon {
             broker,
@@ -152,6 +162,8 @@ impl Daemon {
             messages: None,
             news,
             notifier,
+            tray,
+            paused_until: None,
         }
     }
 
@@ -355,15 +367,17 @@ impl Daemon {
     }
 
     async fn news(&mut self, news: News) {
+        let paused = self.paused();
         let Some(messages) = &mut self.messages else {
             return;
         };
         match news {
             News::Arrived(arrived) => {
-                let quiet = self
-                    .shown
-                    .as_ref()
-                    .is_some_and(|(_, status)| status.availability == "DoNotDisturb");
+                let quiet = paused
+                    || self
+                        .shown
+                        .as_ref()
+                        .is_some_and(|(_, status)| status.availability == "DoNotDisturb");
                 for notice in messages.notices(&arrived) {
                     if !quiet {
                         self.notifier.show(&notice).await;
@@ -388,6 +402,74 @@ impl Daemon {
                 }
             }
         }
+    }
+
+    fn paused(&self) -> bool {
+        self.paused_until
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    /// Answers `false` to end the service.
+    async fn picked(&mut self, pick: Pick) -> bool {
+        match pick {
+            Pick::Chat(conversation) => {
+                let message = self
+                    .messages
+                    .as_ref()
+                    .and_then(|messages| messages.newest(&conversation));
+                let target = Target {
+                    conversation,
+                    message: message.unwrap_or_default(),
+                };
+                tokio::spawn(async move { notify::open(&target).await });
+            }
+            Pick::Teams => {
+                tokio::spawn(notify::open_teams());
+            }
+            Pick::Pause(pause) => {
+                self.paused_until = pause.then(|| Instant::now() + PAUSE);
+            }
+            Pick::Quit => return false,
+        }
+        true
+    }
+
+    async fn update_tray(&mut self) {
+        let shown = self
+            .shown
+            .as_ref()
+            .map(|(_, status)| status.availability.as_str());
+        let connected = self.push == "connected";
+        let dot = match (connected, shown) {
+            (false, _) => Dot::Offline,
+            (true, Some("Busy" | "BusyIdle" | "DoNotDisturb")) => Dot::Busy,
+            (true, _) if self.active() => Dot::Active,
+            (true, _) => Dot::Away,
+        };
+        let unread = self
+            .messages
+            .as_ref()
+            .map(Messages::unread)
+            .unwrap_or_default();
+        let presence = match (connected, shown) {
+            (false, _) => self.push.clone(),
+            (true, Some(shown)) => format!("Teams shows you as {shown}"),
+            (true, None) => "Connected".to_owned(),
+        };
+        let line = match unread.len() {
+            0 => presence,
+            1 => format!("{presence}, 1 unread chat"),
+            count => format!("{presence}, {count} unread chats"),
+        };
+        let paused = self.paused();
+        self.tray
+            .show(Model {
+                dot,
+                line,
+                unread,
+                paused,
+            })
+            .await;
     }
 
     /// Takes down notifications for what was read elsewhere.
@@ -472,6 +554,11 @@ impl Daemon {
             reading: sync.pending,
             unsent: self.messages.as_ref().map_or(0, Messages::unsent),
             sync_problem: sync.problem,
+            media: self
+                .messages
+                .as_ref()
+                .map(Messages::media)
+                .unwrap_or_default(),
         }
     }
 
@@ -485,6 +572,8 @@ impl Daemon {
                 },
                 None => Response::Error("not connected yet".into()),
             },
+            // Answered beside the loop, see `run`.
+            Request::File { .. } => Response::Error("not connected yet".into()),
             Request::Reload => {
                 self.leave().await;
                 self.messages = None;
@@ -509,6 +598,7 @@ impl Daemon {
         mut asked: mpsc::Receiver<Asked>,
         mut news: mpsc::UnboundedReceiver<News>,
         mut actions: mpsc::UnboundedReceiver<Action>,
+        mut picks: mpsc::UnboundedReceiver<Pick>,
     ) -> std::io::Result<()> {
         let mut sensors = Sensors::start(Config::default());
         let mut tick = interval(TICK);
@@ -516,6 +606,7 @@ impl Daemon {
         let mut terminate = signal(SignalKind::terminate())?;
         let mut interrupt = signal(SignalKind::interrupt())?;
         loop {
+            self.update_tray().await;
             let connect_at = self.connect_at;
             tokio::select! {
                 Some(event) = sensors.recv() => self.sensor(event).await,
@@ -551,7 +642,25 @@ impl Daemon {
                 }
                 Some(item) = news.recv() => self.news(item).await,
                 Some(action) = actions.recv() => self.acted(action).await,
+                Some(pick) = picks.recv() => {
+                    if !self.picked(pick).await {
+                        break;
+                    }
+                }
                 Some((request, reply)) = asked.recv() => {
+                    if let Request::File { conversation, message, index } = &request
+                        && let Some(messages) = &self.messages
+                    {
+                        // A download takes its time; nothing else waits for it.
+                        let file = messages.file(conversation, message, *index);
+                        tokio::spawn(async move {
+                            let _ = reply.send(match file.await {
+                                Ok(path) => Response::Path(path),
+                                Err(error) => Response::Error(error),
+                            });
+                        });
+                        continue;
+                    }
                     let response = self.answer(request).await;
                     let _ = reply.send(response);
                 }
@@ -599,8 +708,9 @@ async fn start() -> Result<(), String> {
     });
     let (news, news_queue) = mpsc::unbounded_channel();
     let (notifier, actions) = Notifier::start();
-    let outcome = Daemon::new(broker, news, notifier)
-        .run(asked, news_queue, actions)
+    let (tray, picks) = TrayIcon::start().await;
+    let outcome = Daemon::new(broker, news, notifier, tray)
+        .run(asked, news_queue, actions, picks)
         .await
         .map_err(|error| error.to_string());
     if let Ok(path) = tern_ipc::socket_path() {

@@ -17,6 +17,12 @@ pub enum Request {
     Status,
     /// The stored sign-in changed.
     Reload,
+    /// Downloads a file of a message, or finds its copy; answers the path.
+    File {
+        conversation: String,
+        message: String,
+        index: usize,
+    },
     /// Queues a message; it is sent in the background.
     Send {
         conversation: String,
@@ -45,6 +51,8 @@ pub struct Status {
     /// Messages not sent yet.
     pub unsent: usize,
     pub sync_problem: Option<String>,
+    /// Pictures and files kept, and their bytes.
+    pub media: (usize, u64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +60,7 @@ pub struct Status {
 pub enum Response {
     Status(Box<Status>),
     Done,
+    Path(std::path::PathBuf),
     Error(String),
 }
 
@@ -125,8 +134,13 @@ pub async fn respond(stream: &mut UnixStream, response: &Response) -> io::Result
 }
 
 pub async fn ask(request: &Request) -> io::Result<Response> {
+    ask_within(request, TIMEOUT).await
+}
+
+/// For requests that take long, like downloads.
+pub async fn ask_within(request: &Request, limit: Duration) -> io::Result<Response> {
     let mut stream = UnixStream::connect(socket_path()?).await?;
-    tokio::time::timeout(TIMEOUT, async {
+    tokio::time::timeout(limit, async {
         send(&mut stream, request).await?;
         line(&mut stream).await
     })

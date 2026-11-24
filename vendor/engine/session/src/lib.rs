@@ -8,6 +8,7 @@ mod provider;
 mod request;
 mod scope;
 mod session;
+mod skype;
 mod transport;
 
 pub use app::{App, Target, find_app_tab, has_login_tab, is_login_url};
@@ -21,4 +22,5 @@ pub use request::{
 };
 pub use scope::{GRAPH, IC3, NestedApp, PRESENCE, SPACES, Scope};
 pub use session::{DEFAULT_ENDPOINT, Session, SessionConfig, TabHold};
+pub use skype::skype_token_allowed;
 pub use transport::{BoxFuture, CdpTransport, Diagnosis, OpenedTab, Transport};
