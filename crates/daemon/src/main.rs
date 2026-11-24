@@ -32,7 +32,7 @@ const TICK: Duration = Duration::from_secs(15);
 const READ_BACK: Duration = Duration::from_secs(5 * 60);
 const READ_AFTER_CHANGE: Duration = Duration::from_secs(20);
 /// logind gives a delayed sleep about five seconds.
-const BEFORE_SLEEP: Duration = Duration::from_secs(2);
+const BEFORE_SLEEP: Duration = Duration::from_secs(4);
 /// Sleep may have to wait this long for a running request, so it stays below logind's limit.
 const STEP: Duration = Duration::from_secs(3);
 const PAUSE: Duration = Duration::from_secs(60 * 60);
@@ -283,10 +283,9 @@ impl Daemon {
         if let Some(online) = self.online.take() {
             online.realtime.set_activity(false);
             let online = *online;
-            let goodbye = async {
-                self.link.withdraw(&online.service).await;
-                online.realtime.stop().await;
-            };
+            // Side by side: each is worth doing even if the other hangs.
+            let goodbye =
+                async { tokio::join!(self.link.withdraw(&online.service), online.realtime.stop()) };
             if timeout(BEFORE_SLEEP, goodbye).await.is_err() {
                 tracing::warn!("leaving took too long");
             }
@@ -338,6 +337,19 @@ impl Daemon {
             Some(RealtimeEvent::Message(message)) => {
                 if let Some(messages) = &self.messages {
                     messages.event(message);
+                }
+            }
+            Some(RealtimeEvent::Typing(typing)) => {
+                let own = self
+                    .online
+                    .as_ref()
+                    .is_some_and(|online| online.object_id == typing.user_id);
+                if !own {
+                    let _ = self.changes.send(Change::Typing {
+                        conversation: typing.conversation_id,
+                        name: typing.display_name,
+                        active: typing.active,
+                    });
                 }
             }
             Some(RealtimeEvent::Status(status)) => match status.kind {
@@ -463,7 +475,11 @@ impl Daemon {
     async fn acted(&mut self, action: Action) {
         match action {
             // Not waited for: the portal may ask the user something.
-            Action::Open(target) => drop(tokio::spawn(async move { notify::open(&target).await })),
+            Action::Open(target, token) => {
+                drop(tokio::spawn(
+                    async move { notify::open(&target, token).await },
+                ));
+            }
             Action::Reply { conversation, text } => {
                 let queued = match &self.messages {
                     Some(messages) => messages.send(&conversation, &Draft::text(&text), &[]),
@@ -493,10 +509,10 @@ impl Daemon {
                     conversation,
                     message: message.unwrap_or_default(),
                 };
-                tokio::spawn(async move { notify::open(&target).await });
+                tokio::spawn(async move { notify::open(&target, None).await });
             }
-            Pick::Teams => {
-                tokio::spawn(notify::open_teams());
+            Pick::Window => {
+                tokio::spawn(notify::open_window());
             }
             Pick::Pause(pause) => {
                 self.paused_until = pause.then(|| Instant::now() + PAUSE);
@@ -674,6 +690,15 @@ impl Daemon {
     async fn answer(&mut self, request: Request) -> Response {
         match request {
             Request::Status => Response::Status(Box::new(self.status(true).await)),
+            Request::Typing {
+                conversation,
+                active,
+            } => {
+                if let Some(messages) = &self.messages {
+                    messages.typing(conversation, active);
+                }
+                Response::Done
+            }
             Request::MarkRead { conversation } => {
                 if let Some(messages) = &self.messages {
                     messages.mark_read(conversation);

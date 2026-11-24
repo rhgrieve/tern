@@ -361,6 +361,22 @@ pub fn posts(
     all
 }
 
+/// Who is writing, in a few words.
+pub fn writing(names: &[&str]) -> String {
+    let first = |name: &&str| {
+        name.split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    match names {
+        [] => String::new(),
+        [one] => format!("{} is writing…", one_line(one)),
+        [one, two] => format!("{} and {} are writing…", first(one), first(two)),
+        more => format!("{} people are writing…", more.len()),
+    }
+}
+
 /// Everything the window needs to know about a conversation.
 #[derive(Debug, Clone, Default)]
 pub struct Conversation {
@@ -686,6 +702,17 @@ mod tests {
         let can: Vec<bool> = items.iter().map(|item| item.source.is_some()).collect();
         assert_eq!(can, [true, false, false, false]);
         assert!(!items[3].sent);
+    }
+
+    #[test]
+    fn who_is_writing() {
+        assert_eq!(writing(&[]), "");
+        assert_eq!(writing(&["Ann Example"]), "Ann Example is writing…");
+        assert_eq!(
+            writing(&["Ann Example", "Bo Li"]),
+            "Ann and Bo are writing…"
+        );
+        assert_eq!(writing(&["a", "b", "c"]), "3 people are writing…");
     }
 
     #[test]

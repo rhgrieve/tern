@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=io.github.tern.Tern
+Exec=/usr/bin/tern --gapplication-service

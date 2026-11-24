@@ -233,6 +233,17 @@ impl Messages {
         });
     }
 
+    /// Tells the others. Not worth a retry.
+    pub fn typing(&self, conversation: String, active: bool) {
+        let teams = self.teams.clone();
+        tokio::spawn(async move {
+            let _ = teams
+                .engine()
+                .send_typing(&conversation, None, active)
+                .await;
+        });
+    }
+
     pub fn state(&self) -> SyncState {
         self.state.borrow().clone()
     }

@@ -8,6 +8,7 @@ use std::rc::Rc;
 use gtk4 as gtk;
 use gtk4::prelude::*;
 use gtk4::{gdk, gio, glib};
+use serde::{Deserialize, Serialize};
 
 use crate::mention::{self, Person};
 
@@ -26,7 +27,8 @@ pub enum Aim {
 }
 
 /// What was written: the text, who is mentioned in it, and what goes with it.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Written {
     pub text: String,
     pub mentions: Vec<Person>,
@@ -56,6 +58,8 @@ pub struct Composer {
     hint: gtk::Label,
     /// What was being written before an edit began.
     aside: Rc<RefCell<Written>>,
+    /// The text is being set by us.
+    filling: Rc<std::cell::Cell<bool>>,
 }
 
 impl Composer {
@@ -171,6 +175,7 @@ impl Composer {
             about_text,
             hint,
             aside: Rc::default(),
+            filling: Rc::default(),
         };
         let submit = {
             let composer = composer.clone();
@@ -293,7 +298,9 @@ impl Composer {
     fn fill(&self, written: Written) {
         self.chosen.replace(written.mentions);
         self.files.replace(written.files);
+        self.filling.set(true);
         self.text.buffer().set_text(&written.text);
+        self.filling.set(false);
         self.show_files();
         self.popover.popdown();
     }
@@ -559,6 +566,45 @@ impl Composer {
         self.fill(draft);
     }
 
+    /// Everything being written, in every conversation.
+    pub fn all(&self) -> HashMap<String, Written> {
+        let mut all = self.drafts.borrow().clone();
+        let Some(id) = self.open.borrow().clone() else {
+            return all;
+        };
+        // During an edit, what was put aside is what counts.
+        let editing = matches!(*self.aim.borrow(), Aim::Edit { .. });
+        let written = if editing {
+            self.aside.borrow().clone()
+        } else {
+            self.written()
+        };
+        if written == Written::default() {
+            all.remove(&id);
+        } else {
+            all.insert(id, written);
+        }
+        all
+    }
+
+    /// Starts over with these drafts, e.g. for another account.
+    pub fn set_all(&self, drafts: HashMap<String, Written>) {
+        self.cancel();
+        self.open.replace(None);
+        self.fill(Written::default());
+        self.drafts.replace(drafts);
+    }
+
+    /// Calls `changed` whenever the user changes the text: not when a draft is put in.
+    pub fn connect_changed(&self, changed: impl Fn(&str) + 'static) {
+        let composer = self.clone();
+        self.text.buffer().connect_changed(move |_| {
+            if !composer.filling.get() {
+                changed(&composer.raw());
+            }
+        });
+    }
+
     /// Gives back what could not be sent. Whatever is being written by then stays, after it.
     pub fn give_back(&self, id: &str, unsent: Written) {
         let join = |older: Written, newer: Written| {
@@ -811,6 +857,34 @@ mod tests {
         assert_eq!(composer.raw(), "being edited");
         composer.cancel();
         assert_eq!(composer.written().text, "again\nolder");
+        composer.open("c3");
+        // Putting in a draft is not writing.
+        let changes = Rc::new(std::cell::Cell::new(0));
+        composer.connect_changed({
+            let changes = changes.clone();
+            move |_| changes.set(changes.get() + 1)
+        });
+        composer.open("c5");
+        composer.open("c6");
+        composer.open("c5");
+        assert_eq!(changes.get(), 0);
+        write("by hand");
+        assert!(changes.get() > 0);
+        write("");
+        // All of it can be kept and given back.
+        composer.open("c7");
+        write("seven");
+        composer.edit("m9", "an edit is no draft");
+        let all = composer.all();
+        assert_eq!(all["c7"], plain("seven"));
+        assert!(
+            !all.values()
+                .any(|written| written.text.contains("no draft"))
+        );
+        composer.set_all(HashMap::from([("c8".to_owned(), plain("eight"))]));
+        assert_eq!(composer.raw(), "");
+        composer.open("c8");
+        assert_eq!(composer.written(), plain("eight"));
         composer.open("c3");
         // Files put aside by an edit come back after it, and do not go with it.
         composer.attach([PathBuf::from("/x/b.txt")]);

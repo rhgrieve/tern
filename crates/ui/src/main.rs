@@ -176,6 +176,23 @@ fn measure(app: &adw::Application, window: &Rc<Window>) {
     });
 }
 
+type Shown = Rc<RefCell<Option<Rc<Window>>>>;
+
+/// The window, opened if it is not.
+fn window(app: &adw::Application, shown: &Shown, options: &Options) -> Rc<Window> {
+    let open = shown
+        .borrow()
+        .clone()
+        .filter(|window| window.window.is_visible());
+    let window = open.unwrap_or_else(|| {
+        let window = start(app, options);
+        shown.replace(Some(window.clone()));
+        window
+    });
+    window.window.present();
+    window
+}
+
 fn main() -> glib::ExitCode {
     let options = options();
     let flags = if options.demo || options.measure {
@@ -187,13 +204,27 @@ fn main() -> glib::ExitCode {
         .application_id(APP)
         .flags(flags)
         .build();
-    let window: Rc<RefCell<Option<Rc<Window>>>> = Rc::default();
-    app.connect_activate(move |app| {
-        let mut window = window.borrow_mut();
-        match window.as_ref().filter(|window| window.window.is_visible()) {
-            Some(window) => window.window.present(),
-            None => *window = Some(start(app, &options)),
+    let shown: Shown = Rc::default();
+    app.connect_activate({
+        let (shown, options) = (shown.clone(), options.clone());
+        move |app| drop(window(app, &shown, &options))
+    });
+    // Notifications and the tray open conversations through this.
+    let open = gio::SimpleAction::new("open", Some(glib::VariantTy::STRING));
+    open.connect_activate({
+        let (app, shown) = (app.downgrade(), shown.clone());
+        move |_, id| {
+            let id = id
+                .and_then(|id| id.get::<String>())
+                .filter(|id| !id.is_empty());
+            if let (Some(app), Some(id)) = (app.upgrade(), id) {
+                window(&app, &shown, &options).open(&id);
+            }
         }
     });
-    app.run_with_args::<&str>(&[])
+    app.add_action(&open);
+    // Started by D-Bus, for one of the above.
+    let service = std::env::args().find(|argument| argument == "--gapplication-service");
+    let arguments: Vec<String> = std::iter::once("tern".to_owned()).chain(service).collect();
+    app.run_with_args(&arguments)
 }

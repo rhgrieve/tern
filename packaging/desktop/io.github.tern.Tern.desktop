@@ -6,4 +6,5 @@ Exec=tern
 Icon=io.github.tern.Tern
 Categories=Network;InstantMessaging;GTK;
 StartupNotify=true
+DBusActivatable=true
 StartupWMClass=io.github.tern.Tern

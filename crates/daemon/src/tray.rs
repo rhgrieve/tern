@@ -29,7 +29,7 @@ pub struct Model {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pick {
     Chat(String),
-    Teams,
+    Window,
     Pause(bool),
     Quit,
 }
@@ -150,7 +150,7 @@ impl Tray for Item {
     fn activate(&mut self, _x: i32, _y: i32) {
         match self.model.unread.first() {
             Some((id, _)) => self.pick(Pick::Chat(id.clone())),
-            None => self.pick(Pick::Teams),
+            None => self.pick(Pick::Window),
         }
     }
     fn menu(&self) -> Vec<MenuItem<Self>> {
@@ -174,7 +174,7 @@ impl Tray for Item {
         } else {
             entry("Pause notifications for 1 hour".into(), Pick::Pause(true))
         });
-        menu.push(entry("Open Teams".into(), Pick::Teams));
+        menu.push(entry("Open Tern".into(), Pick::Window));
         menu.push(entry("Quit until next login".into(), Pick::Quit));
         menu
     }
@@ -266,7 +266,7 @@ mod tests {
         item.activate(0, 0);
         item.model.unread = vec![("new".into(), "N".into()), ("old".into(), "O".into())];
         item.activate(0, 0);
-        assert_eq!(queue.try_recv(), Ok(Pick::Teams));
+        assert_eq!(queue.try_recv(), Ok(Pick::Window));
         assert_eq!(queue.try_recv(), Ok(Pick::Chat("new".into())));
     }
 }

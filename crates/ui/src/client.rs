@@ -112,7 +112,10 @@ async fn answer(request: Request, news: mpsc::UnboundedSender<News>) {
         return;
     }
     // Nobody asked for these in so many words.
-    if !matches!(request, Request::MarkRead { .. } | Request::Look { .. }) {
+    if !matches!(
+        request,
+        Request::MarkRead { .. } | Request::Look { .. } | Request::Typing { .. }
+    ) {
         let _ = news.send(News::Refused(refusal));
     }
 }

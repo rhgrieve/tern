@@ -19,6 +19,11 @@ pub enum Request {
     Reload,
     /// Follow changes: answered with one `Event` per line until the connection ends.
     Watch,
+    /// The user is writing in a conversation, or stopped.
+    Typing {
+        conversation: String,
+        active: bool,
+    },
     /// The user has seen a conversation.
     MarkRead {
         conversation: String,
@@ -95,6 +100,12 @@ pub enum Event {
     },
     Pictures,
     Faces,
+    /// Someone started or stopped writing.
+    Typing {
+        conversation: String,
+        name: String,
+        active: bool,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

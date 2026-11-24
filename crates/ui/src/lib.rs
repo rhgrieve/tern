@@ -4,6 +4,7 @@ pub mod art;
 pub mod client;
 pub mod composer;
 pub mod demo;
+pub mod drafts;
 pub mod history;
 pub mod list;
 pub mod mention;

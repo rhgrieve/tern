@@ -34,6 +34,8 @@ trait Notifications {
     #[zbus(signal)]
     fn action_invoked(&self, id: u32, action_key: String) -> zbus::Result<()>;
     #[zbus(signal)]
+    fn activation_token(&self, id: u32, token: String) -> zbus::Result<()>;
+    #[zbus(signal)]
     fn notification_closed(&self, id: u32, reason: u32) -> zbus::Result<()>;
     #[zbus(signal)]
     fn notification_replied(&self, id: u32, text: String) -> zbus::Result<()>;
@@ -54,6 +56,24 @@ trait Portal {
     ) -> zbus::Result<zbus::OwnedObjectPath>;
 }
 
+/// Tern's window. D-Bus starts it when it is not running, outside this service.
+const WINDOW: &str = "io.github.tern.Tern";
+
+#[zbus::proxy(
+    interface = "org.freedesktop.Application",
+    default_service = "io.github.tern.Tern",
+    default_path = "/io/github/tern/Tern"
+)]
+trait Application {
+    fn activate(&self, platform_data: HashMap<&str, Variant<'_>>) -> zbus::Result<()>;
+    fn activate_action(
+        &self,
+        action_name: &str,
+        parameter: Vec<Variant<'_>>,
+        platform_data: HashMap<&str, Variant<'_>>,
+    ) -> zbus::Result<()>;
+}
+
 const OPEN: &str = "default";
 const REPLY: &str = "inline-reply";
 
@@ -65,8 +85,12 @@ pub struct Target {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
-    Open(Target),
-    Reply { conversation: String, text: String },
+    /// With the desktop's permission to take the focus, if it gave one.
+    Open(Target, Option<String>),
+    Reply {
+        conversation: String,
+        text: String,
+    },
 }
 
 struct Shown {
@@ -235,12 +259,18 @@ async fn connect(
     let mut invoked = proxy.receive_action_invoked().await?;
     let mut replied = proxy.receive_notification_replied().await?;
     let mut closed = proxy.receive_notification_closed().await?;
+    let mut tokens = proxy.receive_activation_token().await?;
     tokio::spawn(async move {
+        // Sent just before the action it is for.
+        let mut token: Option<(u32, String)> = None;
         loop {
             // Signals name every application's notifications; only ours are in `open`.
             let action = tokio::select! {
                 Some(signal) = invoked.next() => match signal.args() {
-                    Ok(args) if args.action_key == OPEN => take(&open, args.id).map(Action::Open),
+                    Ok(args) if args.action_key == OPEN => {
+                        let given = token.take().filter(|(id, _)| *id == args.id).map(|(_, token)| token);
+                        take(&open, args.id).map(|target| Action::Open(target, given))
+                    }
                     _ => None,
                 },
                 Some(signal) = replied.next() => match signal.args() {
@@ -250,6 +280,12 @@ async fn connect(
                     }),
                     Err(_) => None,
                 },
+                Some(signal) = tokens.next() => {
+                    if let Ok(args) = signal.args() {
+                        token = Some((args.id, args.token.clone()));
+                    }
+                    None
+                }
                 Some(signal) = closed.next() => {
                     if let Ok(args) = signal.args() {
                         // An answer can follow its notification's close.
@@ -308,15 +344,42 @@ fn link(target: &Target) -> String {
     )
 }
 
-/// Opens Teams on the web.
-pub async fn open_teams() {
-    open_address("https://teams.microsoft.com/").await;
+fn platform(token: Option<&str>) -> HashMap<&str, Variant<'_>> {
+    token
+        .map(|token| ("activation-token", Variant::from(token)))
+        .into_iter()
+        .collect()
 }
 
-/// Opens the message in Teams on the web, until Tern has a window. Through the portal: a program
-/// started from here would share the service's restrictions and end with it.
-pub async fn open(target: &Target) {
-    open_address(&link(target)).await;
+/// Opens Tern's window, or Teams on the web where there is none.
+pub async fn open_window() {
+    let shown = async {
+        let connection = zbus::Connection::session().await?;
+        ApplicationProxy::new(&connection)
+            .await?
+            .activate(platform(None))
+            .await
+    };
+    if let Err(error) = shown.await {
+        tracing::info!(%error, window = WINDOW, "no window; opening Teams on the web");
+        open_address("https://teams.microsoft.com/").await;
+    }
+}
+
+/// Opens a conversation in Tern's window, or in Teams on the web.
+pub async fn open(target: &Target, token: Option<String>) {
+    let shown = async {
+        let connection = zbus::Connection::session().await?;
+        let parameter = vec![Variant::from(target.conversation.as_str())];
+        ApplicationProxy::new(&connection)
+            .await?
+            .activate_action("open", parameter, platform(token.as_deref()))
+            .await
+    };
+    if let Err(error) = shown.await {
+        tracing::info!(%error, window = WINDOW, "no window; opening Teams on the web");
+        open_address(&link(target)).await;
+    }
 }
 
 async fn open_address(address: &str) {

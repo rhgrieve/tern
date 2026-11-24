@@ -1,8 +1,10 @@
 //! The main window.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gtk4 as gtk;
 use gtk4::prelude::*;
@@ -21,7 +23,7 @@ use crate::model::{self, Conversation, Filter, OUTGOING};
 use crate::row::Item;
 use crate::sidebar::Sidebar;
 use crate::tools::{Tool, Tools};
-use crate::{art, mention, palette};
+use crate::{art, drafts, mention, palette};
 
 const CHATS: usize = 400;
 
@@ -34,6 +36,10 @@ struct State {
     thread: Option<String>,
     channel: bool,
     history: History,
+    /// Who is writing in the open conversation, and since when we know.
+    typing: Vec<(String, Instant)>,
+    /// When the others were last told that the user is writing.
+    told: Option<Instant>,
     filter: Filter,
 }
 
@@ -48,6 +54,9 @@ pub struct Window {
     toasts: adw::ToastOverlay,
     pages: gtk::Stack,
     back: gtk::Button,
+    writing: gtk::Label,
+    /// The drafts as they were last saved.
+    saved: RefCell<HashMap<String, Written>>,
     /// Shown while older messages are fetched.
     loading: gtk::Box,
     tools: RefCell<Option<Rc<Tools>>>,
@@ -58,6 +67,11 @@ pub struct Window {
     open_turn: Cell<u64>,
     demo: bool,
 }
+
+/// Someone who stopped without saying so is taken off after this.
+const TYPING: Duration = Duration::from_secs(12);
+/// How often the others are told.
+const TELL: Duration = Duration::from_secs(8);
 
 /// What a key does.
 type Run = fn(&Rc<Window>);
@@ -197,8 +211,20 @@ impl Window {
                 .maximum_size(980)
                 .child(&composer.root)
                 .build();
+            let writing = gtk::Label::builder()
+                .xalign(0.0)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .build();
+            writing.add_css_class("caption");
+            writing.add_css_class("dim-label");
+            writing.add_css_class("writing");
+            let writing_clamp = adw::Clamp::builder()
+                .maximum_size(980)
+                .child(&writing)
+                .build();
             let talk = gtk::Box::new(gtk::Orientation::Vertical, 0);
             talk.append(&clamp);
+            talk.append(&writing_clamp);
             talk.append(&write);
             talk.add_controller(drop);
             let pages = gtk::Stack::new();
@@ -296,6 +322,32 @@ impl Window {
                 }
             });
             window.add_action(&react);
+            window.connect_close_request({
+                let save = later(Window::save_drafts);
+                move |_| {
+                    save();
+                    glib::Propagation::Proceed
+                }
+            });
+            glib::timeout_add_local(Duration::from_secs(2), {
+                let weak = weak.clone();
+                move || match weak.upgrade() {
+                    Some(window) => {
+                        window.save_drafts();
+                        window.show_typing();
+                        glib::ControlFlow::Continue
+                    }
+                    None => glib::ControlFlow::Break,
+                }
+            });
+            composer.connect_changed({
+                let weak = weak.clone();
+                move |text| {
+                    if let Some(window) = weak.upgrade() {
+                        window.tell_typing(!text.trim().is_empty());
+                    }
+                }
+            });
             window.connect_is_active_notify({
                 let seen = later(Window::seen);
                 move |_| seen()
@@ -316,6 +368,8 @@ impl Window {
                 toasts,
                 pages,
                 back,
+                writing,
+                saved: RefCell::default(),
                 loading,
                 tools: RefCell::default(),
                 client,
@@ -428,6 +482,77 @@ impl Window {
         }
     }
 
+    fn save_drafts(self: &Rc<Self>) {
+        let path = self
+            .state
+            .borrow()
+            .account
+            .as_deref()
+            .and_then(drafts::path);
+        let Some(path) = path.filter(|_| !self.demo) else {
+            return;
+        };
+        let all = self.composer.all();
+        if *self.saved.borrow() == all {
+            return;
+        }
+        match drafts::save(&path, &all) {
+            Ok(()) => drop(self.saved.replace(all)),
+            Err(error) => eprintln!("tern: drafts could not be saved: {error}"),
+        }
+    }
+
+    fn typing(self: &Rc<Self>, conversation: &str, name: &str, active: bool) {
+        {
+            let mut state = self.state.borrow_mut();
+            if state.open.as_deref() != Some(conversation) {
+                return;
+            }
+            state.typing.retain(|(known, _)| known != name);
+            if active && !name.trim().is_empty() {
+                state.typing.push((name.to_owned(), Instant::now()));
+            }
+        }
+        self.show_typing();
+    }
+
+    fn show_typing(self: &Rc<Self>) {
+        let mut state = self.state.borrow_mut();
+        state.typing.retain(|(_, since)| since.elapsed() < TYPING);
+        let names: Vec<&str> = state.typing.iter().map(|(name, _)| name.as_str()).collect();
+        let text = crate::model::writing(&names);
+        if self.writing.text() != text {
+            self.writing.set_text(&text);
+        }
+    }
+
+    /// Tells the others, now and then while writing and once when done.
+    fn tell_typing(self: &Rc<Self>, active: bool) {
+        let conversation = {
+            let mut state = self.state.borrow_mut();
+            // In channels nobody is told, as in threads.
+            if self.demo || state.channel || state.thread.is_some() {
+                return;
+            }
+            let due = match (active, state.told) {
+                (true, Some(at)) => at.elapsed() >= TELL,
+                (true, None) => true,
+                (false, told) => told.is_some(),
+            };
+            if !due {
+                return;
+            }
+            state.told = active.then(Instant::now);
+            state.open.clone()
+        };
+        if let Some(conversation) = conversation.filter(|_| self.window.is_active()) {
+            self.client.ask(Request::Typing {
+                conversation,
+                active,
+            });
+        }
+    }
+
     fn react(self: &Rc<Self>, message: &str, emoji: &str, on: bool) {
         let Some(conversation) = self.state.borrow().open.clone() else {
             return;
@@ -515,6 +640,15 @@ impl Window {
             .as_deref()
             .and_then(|account| tern_engine::database_path(account).ok())
             .map(|path| path.with_file_name("media").join("pictures"));
+        // Those of the account before, if any, go to its own file.
+        self.save_drafts();
+        let drafts = account
+            .as_deref()
+            .and_then(drafts::path)
+            .map(|path| drafts::load(&path))
+            .unwrap_or_default();
+        self.saved.replace(drafts.clone());
+        self.composer.set_all(drafts);
         art::set_source(store.clone(), pictures, self.window.scale_factor());
         let filter = self.state.borrow().filter;
         *self.state.borrow_mut() = State {
@@ -579,6 +713,13 @@ impl Window {
             News::Event(Event::Faces) => {
                 art::forget_faces();
                 self.sidebar.reload_faces();
+            }
+            News::Event(Event::Typing {
+                conversation,
+                name,
+                active,
+            }) => {
+                self.typing(&conversation, &name, active);
             }
             News::Older { conversation, done } => self.older_came(&conversation, done),
             News::Gone => {
@@ -651,6 +792,8 @@ impl Window {
                 state.thread = None;
                 state.channel = false;
                 state.history = History::new();
+                state.typing.clear();
+                state.told = None;
             }
             already
         };
@@ -735,7 +878,7 @@ impl Window {
         self.seen();
         // Once the new rows have their place: more may be wanted still.
         let weak = Rc::downgrade(self);
-        glib::timeout_add_local_once(std::time::Duration::from_millis(120), move || {
+        glib::timeout_add_local_once(Duration::from_millis(120), move || {
             if let Some(window) = weak.upgrade() {
                 window.want_older();
             }
@@ -862,10 +1005,11 @@ impl Window {
         if matches!(aim, Aim::Edit { .. }) {
             return;
         }
+        self.state.borrow_mut().told = None;
         self.list.to_end();
         // It is in the outbox within moments.
         let weak = Rc::downgrade(self);
-        glib::timeout_add_local_once(std::time::Duration::from_millis(80), move || {
+        glib::timeout_add_local_once(Duration::from_millis(80), move || {
             if let Some(window) = weak.upgrade() {
                 window.read_open();
             }
@@ -927,7 +1071,7 @@ impl Window {
             glib::ControlFlow::Continue
         });
         while !done.get() {
-            glib::timeout_future(std::time::Duration::from_millis(20)).await;
+            glib::timeout_future(Duration::from_millis(20)).await;
         }
         gaps.take()
     }

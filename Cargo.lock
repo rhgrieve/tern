@@ -3108,6 +3108,7 @@ dependencies = [
  "chrono",
  "gtk4",
  "libadwaita",
+ "serde",
  "serde_json",
  "store",
  "teams-core",

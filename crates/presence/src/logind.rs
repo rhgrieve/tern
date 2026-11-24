@@ -15,6 +15,8 @@ trait Manager {
     fn inhibit(&self, what: &str, who: &str, why: &str, mode: &str) -> zbus::Result<OwnedFd>;
     #[zbus(signal)]
     fn prepare_for_sleep(&self, start: bool) -> zbus::Result<()>;
+    #[zbus(signal)]
+    fn prepare_for_shutdown(&self, start: bool) -> zbus::Result<()>;
 }
 
 #[zbus::proxy(
@@ -42,7 +44,7 @@ pub(crate) enum Signal {
     Ready,
     Locked(bool),
     Foreground(bool),
-    /// Sleep waits until the guard is dropped (logind allows a few seconds).
+    /// Sleep, or shutdown, waits until the guard is dropped (logind allows a few seconds).
     Sleep(SleepGuard),
     Resume,
 }
@@ -55,7 +57,7 @@ pub struct SleepGuard {
 
 async fn inhibit(manager: &ManagerProxy<'_>) -> Option<OwnedFd> {
     manager
-        .inhibit("sleep", "Tern", "Show as away in Teams", "delay")
+        .inhibit("sleep:shutdown", "Tern", "Show as away in Teams", "delay")
         .await
         .inspect_err(|error| tracing::warn!(%error, "sleep will not wait for the away status"))
         .ok()
@@ -97,6 +99,7 @@ pub(crate) async fn run(output: UnboundedSender<Signal>) -> zbus::Result<()> {
         .build()
         .await?;
     let mut sleeps = manager.receive_prepare_for_sleep().await?;
+    let mut shutdowns = manager.receive_prepare_for_shutdown().await?;
     let mut hints = session.receive_locked_hint_changed().await;
     let mut actives = session.receive_active_changed().await;
     let mut guard = inhibit(&manager).await;
@@ -107,6 +110,15 @@ pub(crate) async fn run(output: UnboundedSender<Signal>) -> zbus::Result<()> {
         let signal = tokio::select! {
             Some(sleep) = sleeps.next() => {
                 if sleep.args()?.start {
+                    Signal::Sleep(SleepGuard { _lock: guard.take() })
+                } else {
+                    guard = inhibit(&manager).await;
+                    Signal::Resume
+                }
+            }
+            // Like sleep: the network is still there, which it may not be when we are stopped.
+            Some(shutdown) = shutdowns.next() => {
+                if shutdown.args()?.start {
                     Signal::Sleep(SleepGuard { _lock: guard.take() })
                 } else {
                     guard = inhibit(&manager).await;
