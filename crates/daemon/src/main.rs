@@ -466,7 +466,7 @@ impl Daemon {
             Action::Open(target) => drop(tokio::spawn(async move { notify::open(&target).await })),
             Action::Reply { conversation, text } => {
                 let queued = match &self.messages {
-                    Some(messages) => messages.send(&conversation, &Draft::text(&text)),
+                    Some(messages) => messages.send(&conversation, &Draft::text(&text), &[]),
                     None => Err("not signed in".into()),
                 };
                 if let Err(error) = queued {
@@ -555,6 +555,22 @@ impl Daemon {
             let _ = self.changes.send(Change::Status {
                 status: Box::new(status),
             });
+        }
+    }
+
+    fn settle(
+        &self,
+        act: impl FnOnce(&tern_engine::Outbox<Teams>) -> Result<(), String>,
+    ) -> Response {
+        let Some(messages) = &self.messages else {
+            return Response::Error("not connected yet".into());
+        };
+        match act(messages.outbox()) {
+            Ok(()) => {
+                let _ = self.changes.send(Change::Chats);
+                Response::Done
+            }
+            Err(error) => Response::Error(error),
         }
     }
 
@@ -673,6 +689,8 @@ impl Daemon {
                 thread,
                 post,
                 subject,
+                mentions,
+                files,
             } => {
                 let draft = Draft {
                     markdown: text,
@@ -680,9 +698,11 @@ impl Daemon {
                     thread,
                     post,
                     subject,
+                    mentions,
+                    files: Vec::new(),
                 };
                 match &self.messages {
-                    Some(messages) => match messages.send(&conversation, &draft) {
+                    Some(messages) => match messages.send(&conversation, &draft, &files) {
                         Ok(()) => {
                             // It shows as being sent at once.
                             let _ = self.changes.send(Change::Messages { conversation });
@@ -693,6 +713,8 @@ impl Daemon {
                     None => Response::Error("not connected yet".into()),
                 }
             }
+            Request::Retry { id } => self.settle(|outbox| outbox.retry(&id)),
+            Request::Discard { id } => self.settle(|outbox| outbox.discard(&id)),
             // Answered beside the loop, see `run`.
             Request::File { .. }
             | Request::React { .. }

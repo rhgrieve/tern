@@ -9,6 +9,8 @@ use teams_core::{
 use crate::rich::{self, Block};
 use crate::row::{Item, Reaction};
 
+/// Starts the id of a message that is not sent yet.
+pub const OUTGOING: &str = "outgoing-";
 /// Messages of one person this close together are shown as one.
 const JOIN: chrono::Duration = chrono::Duration::minutes(5);
 
@@ -204,16 +206,21 @@ pub fn items(
             .then(|| crate::source::markdown(&teams_core::message_spans(message)))
             .flatten(),
             sent: !message.deleted && !event,
+            failed: false,
         });
         before = Some((message, event));
     }
     for waiting in outgoing {
-        let payload: Option<String> = serde_json::from_str::<serde_json::Value>(&waiting.payload)
-            .ok()
-            .and_then(|payload| payload["markdown"].as_str().map(str::to_owned));
-        let Some(markdown) = payload else { continue };
+        let Ok(draft) = serde_json::from_str::<tern_engine::Draft>(&waiting.payload) else {
+            continue;
+        };
+        let mut blocks = rich::blocks(&html_to_spans(&markdown_to_html(&draft.markdown)));
+        for file in &draft.files {
+            blocks.push(Block::Text(format!("📎 {}", rich::escape(&file.name))));
+        }
         items.push(Item {
-            id: format!("outgoing-{}", waiting.id),
+            id: format!("{OUTGOING}{}", waiting.id),
+            failed: waiting.state == OutboxState::Failed,
             sender: my_name.to_owned(),
             sender_id: me.map(str::to_owned),
             time: waiting
@@ -221,7 +228,7 @@ pub fn items(
                 .with_timezone(&Local)
                 .format("%H:%M")
                 .to_string(),
-            blocks: rich::blocks(&html_to_spans(&markdown_to_html(&markdown))),
+            blocks,
             own: true,
             note: Some(match waiting.state {
                 OutboxState::Sending => "Sending…".to_owned(),

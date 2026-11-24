@@ -34,6 +34,8 @@ pub struct Item {
     pub source: Option<String>,
     /// The service knows this message: it can be answered and reacted to.
     pub sent: bool,
+    /// It could not be sent.
+    pub failed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

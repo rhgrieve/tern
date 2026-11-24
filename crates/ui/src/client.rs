@@ -15,6 +15,11 @@ pub enum News {
         conversation: String,
         done: bool,
     },
+    /// The daemon did not take a message or an edit; what was written must not be lost.
+    Unsent {
+        request: Box<Request>,
+        reason: String,
+    },
     /// A request was refused.
     Refused(String),
 }
@@ -91,9 +96,21 @@ async fn answer(request: Request, news: mpsc::UnboundedSender<News>) {
     }
     let refusal = match outcome {
         Ok(Response::Error(error)) => error,
-        Ok(_) => return,
+        Ok(_) => {
+            if let Request::Send { files, .. } = &request {
+                crate::composer::forget_pasted(files);
+            }
+            return;
+        }
         Err(_) => "the background service is not running".to_owned(),
     };
+    if matches!(request, Request::Send { .. } | Request::Edit { .. }) {
+        let _ = news.send(News::Unsent {
+            request: Box::new(request),
+            reason: refusal,
+        });
+        return;
+    }
     // Nobody asked for these in so many words.
     if !matches!(request, Request::MarkRead { .. } | Request::Look { .. }) {
         let _ = news.send(News::Refused(refusal));

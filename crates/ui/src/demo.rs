@@ -85,6 +85,29 @@ pub fn store() -> Store {
     }
     let _ = store.upsert_messages(&messages);
     channel(&store);
+    let unsent = |id: &str, state, payload: &str, error: Option<&str>| store::OutboxRecord {
+        id: id.into(),
+        conversation_id: "c3".into(),
+        target: store::OutboxTarget::Flat,
+        thread_root_id: None,
+        payload: payload.into(),
+        images: vec![],
+        state,
+        last_error: error.map(str::to_owned),
+        created_at: now,
+    };
+    let _ = store.put_outbox(&unsent(
+        "1",
+        store::OutboxState::Failed,
+        r#"{"markdown":"Here is the plan","tried":true,"files":[{"name":"plan.pdf","path":"/x/plan.pdf"}]}"#,
+        Some("HTTP 403"),
+    ));
+    let _ = store.put_outbox(&unsent(
+        "2",
+        store::OutboxState::Sending,
+        r#"{"markdown":"and one on its way","tried":false}"#,
+        None,
+    ));
     store
 }
 

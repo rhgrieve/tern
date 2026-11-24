@@ -152,7 +152,7 @@ pub struct Files {
 }
 
 /// A file name from a message, safe to create and to show.
-fn safe_name(name: &str) -> String {
+pub fn safe_name(name: &str) -> String {
     let clean: String = name
         .chars()
         .filter(|letter| {
@@ -185,7 +185,7 @@ fn safe_name(name: &str) -> String {
     }
 }
 
-fn private_folder(path: &Path) -> io::Result<()> {
+pub(crate) fn private_folder(path: &Path) -> io::Result<()> {
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)

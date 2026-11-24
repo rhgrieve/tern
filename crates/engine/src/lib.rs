@@ -13,5 +13,5 @@ pub use media::{
     FILE_BYTES, Files, Want, may_prefetch, people, pictures, prefetch, usage as media_usage,
 };
 pub use notice::{Notice, Rules};
-pub use outbox::{Draft, Outbox, Post, Queued};
+pub use outbox::{Attached, Draft, MAX_FILES, Outbox, Post, Queued};
 pub use sync::{Arrived, Job, Sync, SyncState};

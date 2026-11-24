@@ -6,6 +6,7 @@ pub mod composer;
 pub mod demo;
 pub mod history;
 pub mod list;
+pub mod mention;
 pub mod model;
 pub mod palette;
 pub mod rich;

@@ -19,6 +19,6 @@ From https://github.com/danieldaeschle/rusty-teams (MIT, see `LICENSE`), commit
 | `open_read_only` | `store/src/store.rs` | Readers beside the daemon |
 | An empty page of messages is followed to the next | `chatsvc/src/chat_listing.rs` | Upstream takes a quiet stretch for the start of a chat |
 | Recent conversation states between hourly full reads | `chatsvc/src/conversations.rs`, `core/src/{engine,remote,sidebar_sync}.rs` | Upstream reads every conversation on every refresh |
-| Skype-token downloads without a page | `session/src/skype.rs`, `chatsvc/src/ams.rs` | Most inline pictures need it |
+| Skype-token downloads and uploads without a page, in the account's region | `session/src/skype.rs`, `chatsvc/src/ams.rs` | Inline pictures; upstream uploads to Germany |
 
-Known for later phases: pins and AMS image uploads still run in a page.
+Known for later phases: pins still run in a page.

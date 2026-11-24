@@ -17,6 +17,9 @@ pub enum Tool {
     Copy,
     Edit,
     Delete,
+    /// For messages that could not be sent.
+    Retry,
+    Discard,
 }
 
 const QUICK: [&str; 4] = ["👍", "❤️", "😆", "😮"];
@@ -25,6 +28,9 @@ pub struct Tools {
     root: gtk::Box,
     edit: gtk::Button,
     delete: gtk::Button,
+    /// What only sent messages have, and what only failed ones have.
+    usual: RefCell<Vec<gtk::Widget>>,
+    failed: RefCell<Vec<gtk::Widget>>,
     item: RefCell<Option<Rc<Item>>>,
     /// The emoji chooser is open: the bar stays.
     held: Cell<bool>,
@@ -53,6 +59,8 @@ impl Tools {
             root: root.clone(),
             edit: edit.clone(),
             delete: delete.clone(),
+            usual: RefCell::default(),
+            failed: RefCell::default(),
             item: RefCell::default(),
             held: Cell::new(false),
         });
@@ -80,6 +88,7 @@ impl Tools {
                 move |_| run(Tool::React(emoji.to_owned()))
             });
             root.append(&quick);
+            tools.usual.borrow_mut().push(quick.upcast());
         }
         let more = button("face-smile-big-symbolic", "More reactions");
         let chooser = gtk::EmojiChooser::new();
@@ -108,6 +117,7 @@ impl Tools {
         // A popover has to leave its parent before that goes away.
         more.connect_destroy(move |_| chooser.unparent());
         root.append(&more);
+        tools.usual.borrow_mut().push(more.clone().upcast());
         let reply = button("mail-reply-sender-symbolic", "Reply");
         let copy = button("edit-copy-symbolic", "Copy");
         for (button, tool) in [
@@ -119,6 +129,15 @@ impl Tools {
             let run = run.clone();
             button.connect_clicked(move |_| run(tool.clone()));
             root.append(button);
+        }
+        tools.usual.borrow_mut().push(reply.clone().upcast());
+        let retry = button("view-refresh-symbolic", "Try again");
+        let discard = button("user-trash-symbolic", "Discard");
+        for (button, tool) in [(&retry, Tool::Retry), (&discard, Tool::Discard)] {
+            let run = run.clone();
+            button.connect_clicked(move |_| run(tool.clone()));
+            root.append(button);
+            tools.failed.borrow_mut().push(button.clone().upcast());
         }
         list.over.add_overlay(&root);
 
@@ -170,7 +189,7 @@ impl Tools {
         let Some((row, top)) = list.row_at(x, y) else {
             return self.hide();
         };
-        let Some(item) = row.item().filter(|item| item.sent) else {
+        let Some(item) = row.item().filter(|item| item.sent || item.failed) else {
             return self.hide();
         };
         if self.root.is_visible()
@@ -183,7 +202,13 @@ impl Tools {
             return;
         }
         self.edit.set_visible(item.source.is_some());
-        self.delete.set_visible(item.own);
+        self.delete.set_visible(item.own && item.sent);
+        for widget in self.usual.borrow().iter() {
+            widget.set_visible(item.sent);
+        }
+        for widget in self.failed.borrow().iter() {
+            widget.set_visible(item.failed);
+        }
         self.item.replace(Some(item));
         self.root.set_margin_top((top - 10.0).max(2.0) as i32);
         self.root.set_visible(true);

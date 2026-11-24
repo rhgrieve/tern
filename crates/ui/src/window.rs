@@ -14,14 +14,14 @@ use tern_ipc::{Event, Request, Status};
 use tokio::sync::mpsc;
 
 use crate::client::{Client, News};
-use crate::composer::{Aim, Composer};
+use crate::composer::{Aim, Composer, Written};
 use crate::history::{History, Need};
 use crate::list::MessageList;
-use crate::model::{self, Conversation, Filter};
+use crate::model::{self, Conversation, Filter, OUTGOING};
 use crate::row::Item;
 use crate::sidebar::Sidebar;
 use crate::tools::{Tool, Tools};
-use crate::{art, palette};
+use crate::{art, mention, palette};
 
 const CHATS: usize = 400;
 
@@ -177,6 +177,22 @@ impl Window {
                 },
                 later(Window::edit_last),
             );
+            let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+            drop.set_types(&[gdk::FileList::static_type(), gdk::Texture::static_type()]);
+            drop.connect_drop({
+                let composer = composer.clone();
+                move |_, value, _, _| {
+                    if let Ok(files) = value.get::<gdk::FileList>() {
+                        composer
+                            .attach(files.files().iter().filter_map(gio::prelude::FileExt::path));
+                    } else if let Ok(picture) = value.get::<gdk::Texture>() {
+                        composer.attach_picture(&picture);
+                    } else {
+                        return false;
+                    }
+                    true
+                }
+            });
             let write = adw::Clamp::builder()
                 .maximum_size(980)
                 .child(&composer.root)
@@ -184,6 +200,7 @@ impl Window {
             let talk = gtk::Box::new(gtk::Orientation::Vertical, 0);
             talk.append(&clamp);
             talk.append(&write);
+            talk.add_controller(drop);
             let pages = gtk::Stack::new();
             let nothing = adw::StatusPage::builder()
                 .icon_name("mail-unread-symbolic")
@@ -343,7 +360,26 @@ impl Window {
                 }
             }
             Tool::Delete => self.delete(item),
+            Tool::Retry | Tool::Discard => {
+                let Some(id) = item.id.strip_prefix(OUTGOING).map(str::to_owned) else {
+                    return;
+                };
+                self.client.ask(if tool == Tool::Retry {
+                    Request::Retry { id }
+                } else {
+                    Request::Discard { id }
+                });
+            }
         }
+    }
+
+    fn offer_people(self: &Rc<Self>, conversation: &str) {
+        let Some(store) = self.state.borrow().store.clone() else {
+            return;
+        };
+        let people = mention::people(&store, conversation);
+        self.composer
+            .set_people(move |typed| mention::matching(&people, typed, 8));
     }
 
     fn edit_last(self: &Rc<Self>) {
@@ -351,6 +387,44 @@ impl Window {
             && let Some(source) = &item.source
         {
             self.composer.edit(&item.id, source);
+        }
+    }
+
+    /// Gives back what was written when the daemon did not take it.
+    fn not_taken(self: &Rc<Self>, request: Request) {
+        match request {
+            Request::Send {
+                conversation,
+                text,
+                thread,
+                mentions,
+                files,
+                ..
+            } => {
+                let key = match thread {
+                    Some(post) => format!("{conversation}/{post}"),
+                    None => conversation,
+                };
+                self.composer.give_back(
+                    &key,
+                    Written {
+                        text,
+                        mentions,
+                        files,
+                    },
+                );
+            }
+            Request::Edit {
+                conversation,
+                message,
+                text,
+            } => {
+                let open = self.state.borrow().open.clone();
+                if open.as_ref() == Some(&conversation) {
+                    self.composer.edit(&message, &text);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -510,6 +584,11 @@ impl Window {
             News::Gone => {
                 self.tell("The background service is not running. You can read, but not send.")
             }
+            News::Unsent { request, reason } => {
+                self.toasts
+                    .add_toast(adw::Toast::new(&glib::markup_escape_text(&reason)));
+                self.not_taken(*request);
+            }
             News::Refused(reason) => self
                 .toasts
                 .add_toast(adw::Toast::new(&glib::markup_escape_text(&reason))),
@@ -581,6 +660,7 @@ impl Window {
             return;
         }
         self.add_tools();
+        self.offer_people(id);
         self.enter();
     }
 
@@ -750,7 +830,7 @@ impl Window {
         }
     }
 
-    fn send(self: &Rc<Self>, _key: &str, text: &str, aim: &Aim) {
+    fn send(self: &Rc<Self>, _key: &str, written: &Written, aim: &Aim) {
         let (conversation, thread, channel) = {
             let state = self.state.borrow();
             (state.open.clone(), state.thread.clone(), state.channel)
@@ -758,7 +838,7 @@ impl Window {
         let Some(conversation) = conversation else {
             return;
         };
-        let text = text.to_owned();
+        let text = written.text.clone();
         self.client.ask(match aim {
             Aim::Edit { message } => Request::Edit {
                 conversation,
@@ -775,6 +855,8 @@ impl Window {
                 post: channel && thread.is_none(),
                 thread,
                 subject: None,
+                mentions: written.mentions.clone(),
+                files: written.files.clone(),
             },
         });
         if matches!(aim, Aim::Edit { .. }) {

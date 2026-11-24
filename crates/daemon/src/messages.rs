@@ -153,7 +153,11 @@ impl Messages {
         let (jobs, job_queue) = mpsc::unbounded_channel();
         let (arrived, mut arrivals) = mpsc::unbounded_channel();
         let (sync, state) = Sync::new(teams.clone(), job_queue, arrived);
-        let outbox = Outbox::new(teams.clone(), store.clone());
+        let outbox = Outbox::new(
+            teams.clone(),
+            store.clone(),
+            &path.with_file_name("outgoing"),
+        );
         let sent = news.clone();
         let tasks = vec![
             tokio::spawn(prefetch(teams.clone(), wanted)),
@@ -205,8 +209,17 @@ impl Messages {
         self.teams.clone()
     }
 
-    pub fn send(&self, conversation: &str, draft: &Draft) -> Result<(), String> {
-        self.outbox.add(conversation, draft)
+    pub fn outbox(&self) -> &Outbox<Teams> {
+        &self.outbox
+    }
+
+    pub fn send(
+        &self,
+        conversation: &str,
+        draft: &Draft,
+        files: &[std::path::PathBuf],
+    ) -> Result<(), String> {
+        self.outbox.add(conversation, draft, files)
     }
 
     /// Marks a conversation read in Teams, which its members can see.

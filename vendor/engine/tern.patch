@@ -608,8 +608,8 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-
      app: App,
 diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/skype.rs vendor/engine/session/src/skype.rs
 --- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/skype.rs	1969-12-31 19:00:00.000000000 -0500
-+++ vendor/engine/session/src/skype.rs	2026-11-24 08:31:04.035082568 -0500
-@@ -0,0 +1,146 @@
++++ vendor/engine/session/src/skype.rs	2026-11-24 10:23:23.444498648 -0500
+@@ -0,0 +1,277 @@
 +//! Tern patch: the Skype token some Teams services still take, without a page.
 +
 +use std::time::Duration;
@@ -628,7 +628,14 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-
 +const DOMAINS: [&str; 2] = [".asm.skype.com", ".asyncgw.teams.microsoft.com"];
 +
 +#[derive(Default)]
-+pub(crate) struct Held(Option<(String, Instant)>);
++pub(crate) struct Held(Option<(Grant, Instant)>);
++
++#[derive(Clone)]
++struct Grant {
++    token: String,
++    /// Where this account's region keeps pictures, ending in a slash.
++    media: Option<String>,
++}
 +
 +/// Whether the Skype token may be sent to `url`.
 +pub fn skype_token_allowed(url: &str) -> bool {
@@ -647,13 +654,46 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-
 +        })
 +}
 +
-+fn parse(answer: &Value) -> Option<(String, Duration)> {
++fn parse(answer: &Value) -> Option<(Grant, Duration)> {
 +    let token = answer.pointer("/tokens/skypeToken")?.as_str()?;
 +    let expires = answer.pointer("/tokens/expiresIn")?;
 +    let seconds = expires
 +        .as_u64()
 +        .or_else(|| expires.as_str()?.parse().ok())?;
-+    Some((token.to_owned(), Duration::from_secs(seconds)))
++    let media = answer
++        .pointer("/regionGtms/amsV2")
++        .and_then(Value::as_str)
++        .map(|url| format!("{}/", url.trim_end_matches('/')))
++        .filter(|url| skype_token_allowed(url));
++    let grant = Grant {
++        token: token.to_owned(),
++        media,
++    };
++    Some((grant, Duration::from_secs(seconds)))
++}
++
++fn spaces() -> Scope {
++    Scope::new(SPACES, "authorization.readwrite")
++}
++
++fn media(grant: &Grant) -> Result<String> {
++    grant
++        .media
++        .clone()
++        .ok_or_else(|| Error::PageOnly("a picture upload in this region".into()))
++}
++
++fn skype_headers(grant: &Grant) -> Vec<(String, String)> {
++    vec![
++        (
++            "Authorization".to_owned(),
++            format!("skype_token {}", grant.token),
++        ),
++        (
++            "x-ms-client-version".to_owned(),
++            "1415/1.0.0.2018090100".to_owned(),
++        ),
++    ]
 +}
 +
 +impl Session {
@@ -678,7 +718,7 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-
 +    }
 +
 +    async fn skype_get(&self, url: &str, force: bool) -> Result<crate::ApiResponse> {
-+        let token = self.skype_token(force).await?;
++        let token = self.skype_grant(force).await?.token;
 +        let headers = vec![
 +            ("Authorization".to_owned(), format!("skype_token {token}")),
 +            (
@@ -691,13 +731,93 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-
 +        Ok(self.once(&request, &scope).await?)
 +    }
 +
-+    async fn skype_token(&self, force: bool) -> Result<String> {
++    /// Stores a picture that members of `conversation` can read. Answers its id and the address
++    /// of the service that has it.
++    pub async fn skype_upload(
++        &self,
++        conversation: &str,
++        name: &str,
++        bytes: &[u8],
++    ) -> Result<(Value, String)> {
++        let mut grant = self.skype_grant(false).await?;
++        let mut created = self.skype_create(&grant, conversation, name).await?;
++        if created.status == 401 {
++            grant = self.skype_grant(true).await?;
++            created = self.skype_create(&grant, conversation, name).await?;
++        }
++        let base = media(&grant)?;
++        let id = created.body["id"]
++            .as_str()
++            .filter(|_| created.is_success())
++            .filter(|id| {
++                !id.is_empty()
++                    && id
++                        .bytes()
++                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
++            })
++            .ok_or_else(|| Error::api(created.status, &base, Value::Null))?
++            .to_owned();
++        let url = format!("{base}v1/objects/{id}/content/imgpsh");
++        let mut headers = skype_headers(&grant);
++        headers.push((
++            "Content-Type".to_owned(),
++            "application/octet-stream".to_owned(),
++        ));
++        headers.push((
++            "Content-Range".to_owned(),
++            format!(
++                "bytes 0-{}/{}",
++                bytes.len().saturating_sub(1),
++                bytes.len()
++            ),
++        ));
++        let request = Request {
++            method: Method::Put,
++            headers,
++            anonymous: true,
++            body_base64: Some(
++                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes),
++            ),
++            ..Request::get(&url)
++        };
++        let stored = self.once(&request, &spaces()).await?;
++        if !stored.is_success() {
++            return Err(Error::api(stored.status, &base, Value::Null));
++        }
++        Ok((serde_json::json!({ "id": id }), base))
++    }
++
++    async fn skype_create(
++        &self,
++        grant: &Grant,
++        conversation: &str,
++        name: &str,
++    ) -> Result<crate::ApiResponse> {
++        let url = format!("{}v1/objects/", media(grant)?);
++        let mut permissions = serde_json::Map::new();
++        permissions.insert(conversation.to_owned(), serde_json::json!(["read"]));
++        let body = serde_json::json!({
++            "type": "pish/image",
++            "permissions": permissions,
++            "sharingMode": "Inline",
++            "filename": name,
++        });
++        let mut request = Request::with_body(Method::Post, &url, body);
++        request.anonymous = true;
++        request.headers = skype_headers(grant);
++        request
++            .headers
++            .push(("Accept".to_owned(), "application/json".to_owned()));
++        self.once(&request, &spaces()).await
++    }
++
++    async fn skype_grant(&self, force: bool) -> Result<Grant> {
 +        let mut held = self.skype.lock().await;
-+        if let Some((token, until)) = &held.0
++        if let Some((grant, until)) = &held.0
 +            && !force
 +            && Instant::now() < *until
 +        {
-+            return Ok(token.clone());
++            return Ok(grant.clone());
 +        }
 +        let request = Request {
 +            method: Method::Post,
@@ -706,14 +826,14 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-
 +        let scope = Scope::new(SPACES, "authorization.readwrite");
 +        let answer = self.once(&request, &scope).await?;
 +        // The answer holds the token, so it never becomes part of an error.
-+        let (token, lifetime) = parse(&answer.body)
++        let (grant, lifetime) = parse(&answer.body)
 +            .filter(|_| answer.is_success())
 +            .ok_or_else(|| Error::api(answer.status, AUTHZ, Value::Null))?;
 +        held.0 = Some((
-+            token.clone(),
++            grant.clone(),
 +            Instant::now() + lifetime.saturating_sub(MARGIN),
 +        ));
-+        Ok(token)
++        Ok(grant)
 +    }
 +
 +    async fn once(&self, request: &Request, scope: &Scope) -> Result<crate::ApiResponse> {
@@ -752,14 +872,68 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-
 +    #[test]
 +    fn reads_the_token_and_its_lifetime() {
 +        let answer = json!({"tokens": {"skypeToken": "t", "expiresIn": 100}});
-+        assert_eq!(parse(&answer), Some(("t".into(), Duration::from_secs(100))));
-+        assert_eq!(parse(&json!({})), None);
++        let (grant, lifetime) = parse(&answer).unwrap();
++        assert_eq!((grant.token.as_str(), lifetime), ("t", Duration::from_secs(100)));
++        assert_eq!(grant.media, None);
++        assert!(parse(&json!({})).is_none());
++        let region = |url: &str| {
++            let answer = json!({"tokens": {"skypeToken": "t", "expiresIn": 1}, "regionGtms": {"amsV2": url}});
++            parse(&answer).unwrap().0.media
++        };
++        assert_eq!(
++            region("https://us-prod.asyncgw.teams.microsoft.com").as_deref(),
++            Some("https://us-prod.asyncgw.teams.microsoft.com/")
++        );
++        assert_eq!(region("https://evil.example"), None, "the token stays home");
 +    }
 +}
 diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/ams.rs vendor/engine/chatsvc/src/ams.rs
 --- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/ams.rs	2026-11-24 10:17:31.887081317 -0500
-+++ vendor/engine/chatsvc/src/ams.rs	2026-11-24 08:31:04.026533713 -0500
-@@ -87,6 +87,11 @@
++++ vendor/engine/chatsvc/src/ams.rs	2026-11-24 10:23:23.445124512 -0500
+@@ -26,10 +26,18 @@
+ }
+ 
+ pub fn full_size_url(object_id: &str) -> String {
+-    format!("{AMS_BASE}v1/objects/{object_id}{FULL_SIZE_VIEW}")
++    full_size_url_at(AMS_BASE, object_id)
++}
++
++fn full_size_url_at(base: &str, object_id: &str) -> String {
++    format!("{base}v1/objects/{object_id}{FULL_SIZE_VIEW}")
+ }
+ 
+ fn uploaded_image(body: &Value) -> Result<AmsImage> {
++    uploaded_image_at(AMS_BASE, body)
++}
++
++fn uploaded_image_at(base: &str, body: &Value) -> Result<AmsImage> {
+     let object_id = body
+         .get("id")
+         .and_then(Value::as_str)
+@@ -42,7 +50,7 @@
+         .ok_or_else(|| Error::UnexpectedAnswer("ams upload has no object id".into()))?;
+     Ok(AmsImage {
+         object_id: object_id.to_owned(),
+-        url: full_size_url(object_id),
++        url: full_size_url_at(base, object_id),
+     })
+ }
+ 
+@@ -64,6 +72,13 @@
+         bytes: &[u8],
+         filename: &str,
+     ) -> Result<AmsImage> {
++        if self.session.is_native() {
++            let (body, base) = self
++                .session
++                .skype_upload(conversation_id, filename, bytes)
++                .await?;
++            return uploaded_image_at(&base, &body);
++        }
+         let arguments = json!({
+             "base": AMS_BASE,
+             "conversationId": conversation_id,
+@@ -87,6 +102,11 @@
  
      /// Reads an AMS image view such as `.../v1/objects/{id}/views/imgo` with the Skype token.
      pub async fn download_image(&self, url: &str) -> Result<LinkImage> {
@@ -773,7 +947,7 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-
              .run_with_token(
 diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/chat_listing.rs vendor/engine/chatsvc/src/chat_listing.rs
 --- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/chat_listing.rs	2026-11-24 10:17:31.888265486 -0500
-+++ vendor/engine/chatsvc/src/chat_listing.rs	2026-11-24 10:14:36.756690498 -0500
++++ vendor/engine/chatsvc/src/chat_listing.rs	2026-11-24 10:20:57.268885013 -0500
 @@ -15,6 +15,9 @@
      pub next_url: Option<String>,
  }
@@ -1241,7 +1415,7 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-
              mentions.inspect_err(|error| {
 diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/store/src/image_files.rs vendor/engine/store/src/image_files.rs
 --- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/store/src/image_files.rs	2026-11-24 10:17:31.906288534 -0500
-+++ vendor/engine/store/src/image_files.rs	2026-11-24 08:44:45.864366598 -0500
++++ vendor/engine/store/src/image_files.rs	2026-11-24 10:20:57.268885013 -0500
 @@ -16,6 +16,15 @@
      last_used: SystemTime,
  }
@@ -1260,7 +1434,7 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-
      directory: PathBuf,
 diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/store/src/lib.rs vendor/engine/store/src/lib.rs
 --- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/store/src/lib.rs	2026-11-24 10:17:31.906288534 -0500
-+++ vendor/engine/store/src/lib.rs	2026-11-24 08:44:45.866577506 -0500
++++ vendor/engine/store/src/lib.rs	2026-11-24 10:20:57.268885013 -0500
 @@ -32,7 +32,7 @@
      load_calendar_accounts, merge_caldav_metadata, merge_google_tokens, save_calendar_accounts,
  };

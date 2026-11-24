@@ -612,6 +612,8 @@ async fn send(chat: &str, message: String) -> Outcome {
         thread: None,
         post: false,
         subject: None,
+        mentions: Vec::new(),
+        files: Vec::new(),
     })
     .await
     {

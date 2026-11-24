@@ -41,6 +41,19 @@ pub enum Request {
         post: bool,
         #[serde(default)]
         subject: Option<String>,
+        /// People mentioned as `@name`, in the order of the text: id and name.
+        #[serde(default)]
+        mentions: Vec<(String, String)>,
+        /// Copied at once.
+        #[serde(default)]
+        files: Vec<PathBuf>,
+    },
+    /// Try a message again that could not be sent, or forget it.
+    Retry {
+        id: String,
+    },
+    Discard {
+        id: String,
     },
     React {
         conversation: String,

@@ -26,10 +26,18 @@ pub struct AmsImage {
 }
 
 pub fn full_size_url(object_id: &str) -> String {
-    format!("{AMS_BASE}v1/objects/{object_id}{FULL_SIZE_VIEW}")
+    full_size_url_at(AMS_BASE, object_id)
+}
+
+fn full_size_url_at(base: &str, object_id: &str) -> String {
+    format!("{base}v1/objects/{object_id}{FULL_SIZE_VIEW}")
 }
 
 fn uploaded_image(body: &Value) -> Result<AmsImage> {
+    uploaded_image_at(AMS_BASE, body)
+}
+
+fn uploaded_image_at(base: &str, body: &Value) -> Result<AmsImage> {
     let object_id = body
         .get("id")
         .and_then(Value::as_str)
@@ -42,7 +50,7 @@ fn uploaded_image(body: &Value) -> Result<AmsImage> {
         .ok_or_else(|| Error::UnexpectedAnswer("ams upload has no object id".into()))?;
     Ok(AmsImage {
         object_id: object_id.to_owned(),
-        url: full_size_url(object_id),
+        url: full_size_url_at(base, object_id),
     })
 }
 
@@ -64,6 +72,13 @@ impl Ams {
         bytes: &[u8],
         filename: &str,
     ) -> Result<AmsImage> {
+        if self.session.is_native() {
+            let (body, base) = self
+                .session
+                .skype_upload(conversation_id, filename, bytes)
+                .await?;
+            return uploaded_image_at(&base, &body);
+        }
         let arguments = json!({
             "base": AMS_BASE,
             "conversationId": conversation_id,

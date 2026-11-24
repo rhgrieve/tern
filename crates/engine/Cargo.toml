@@ -15,7 +15,7 @@ serde_json.workspace = true
 session.workspace = true
 store.workspace = true
 teams-core.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs"] }
 sha2 = "0.10"
 tracing.workspace = true
 

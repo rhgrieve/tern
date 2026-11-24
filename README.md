@@ -9,7 +9,8 @@ computer, in any app, also while you still use Teams on the web; keeps chats and
 local cache you can read and search offline; queues messages until they can be sent; and shows
 notifications you can answer. Recent pictures and faces are kept for offline use, files on request;
 a tray icon shows your status and unread chats. The window shows chats and
-channels with threads, sends, answers, edits and reacts, and searches.
+channels with threads, sends, answers, edits and reacts, mentions people,
+attaches pictures and files, and searches.
 
 | Program | What it does |
 |---|---|

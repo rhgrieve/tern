@@ -8,7 +8,9 @@ use chrono::{DateTime, Utc};
 use graph::Graph;
 use session::{Guard, Method, Session};
 use store::{ChatRecord, MessageRecord, Store};
-use teams_core::{Error, ImageRef, Remote, SyncEngine};
+use teams_core::{
+    Error, FileReference, HostedImage, ImageRef, MentionInput, MessageExtras, Remote, SyncEngine,
+};
 
 /// How a failed call should be handled.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,13 +238,44 @@ impl crate::outbox::Post for Teams {
         draft: &crate::outbox::Draft,
         client_id: &str,
     ) -> Result<String, Failure> {
-        let text = draft.markdown.as_str();
+        let mentions: Vec<MentionInput> = draft
+            .mentions
+            .iter()
+            .map(|(id, name)| MentionInput::user(id, name))
+            .collect();
+        let mut extras = MessageExtras::default();
+        for file in &draft.files {
+            if let Some(reference) = &file.reference {
+                extras.files.push(reference.clone());
+            } else if file.picture {
+                let bytes = std::fs::read(&file.path)
+                    .map_err(|error| Failure::Permanent(format!("{}: {error}", file.name)))?;
+                let content_type = crate::outbox::picture_type(&bytes)
+                    .ok_or_else(|| Failure::Permanent(format!("{} is not a picture", file.name)))?;
+                extras.images.push(HostedImage {
+                    content_type: content_type.to_owned(),
+                    bytes: Arc::new(bytes),
+                });
+            }
+        }
+        let html = teams_core::markdown_to_html(&draft.markdown);
+        let engine = &self.engine;
         let send = async {
             match (&draft.reply_to, &draft.thread, draft.post) {
-                (Some(quoted), _, _) => self.engine.reply_to(conversation, quoted, text).await,
+                (Some(quoted), _, _) => {
+                    engine
+                        .reply_to_with_extras(conversation, quoted, &html, &mentions, &extras)
+                        .await
+                }
                 (None, Some(root), _) => {
-                    self.engine
-                        .send_message(conversation, text, Some(root))
+                    engine
+                        .send_message_with_extras(
+                            conversation,
+                            &html,
+                            Some(root),
+                            &mentions,
+                            &extras,
+                        )
                         .await
                 }
                 (None, None, true) => {
@@ -250,16 +283,48 @@ impl crate::outbox::Post for Teams {
                         .subject
                         .as_deref()
                         .filter(|subject| !subject.trim().is_empty());
-                    self.engine
-                        .post_to_channel(conversation, text, subject)
+                    engine
+                        .post_to_channel_with_extras(
+                            conversation,
+                            &html,
+                            subject,
+                            &mentions,
+                            &extras,
+                        )
                         .await
                 }
-                (None, None, false) => self.engine.send_message(conversation, text, None).await,
+                (None, None, false) => {
+                    engine
+                        .send_message_with_extras(conversation, &html, None, &mentions, &extras)
+                        .await
+                }
             }
         };
         Ok(with_client_message_id(client_id.to_owned(), send)
             .await?
             .message_id)
+    }
+
+    async fn upload(
+        &self,
+        conversation: &str,
+        file: &crate::outbox::Attached,
+    ) -> Result<FileReference, Failure> {
+        let bytes = tokio::fs::read(&file.path)
+            .await
+            .map_err(|error| Failure::Permanent(format!("{}: {error}", file.name)))?;
+        let uploaded = self
+            .engine
+            .upload_attachment_file(conversation, &file.name, &bytes, |_| {})
+            .await?;
+        if let Err(error) = self.engine.share_attachment(conversation, &uploaded).await {
+            // Nobody could open it: take it back, so that the next try starts clean.
+            let _ = self.engine.discard_attachment(&uploaded).await;
+            return Err(error.into());
+        }
+        uploaded
+            .reference()
+            .ok_or_else(|| Failure::Permanent("the uploaded file has no id".into()))
     }
 
     async fn own_since(
@@ -427,6 +492,28 @@ mod tests {
             assert!(chatsvc::reaction_key(emoji).is_some(), "{emoji}");
             assert!(!chatsvc::reaction_keys(emoji).is_empty(), "{emoji}");
         }
+    }
+
+    #[test]
+    fn mentions_survive_markdown_and_odd_names() {
+        let people = [
+            ("1", "Sam O'Brien"),
+            ("2", "Zoë <Ops> & Co"),
+            ("3", "Li_Wei"),
+        ];
+        let inputs: Vec<MentionInput> = people
+            .iter()
+            .map(|(id, name)| MentionInput::user(id, name))
+            .collect();
+        let text = "**@Sam O'Brien** and @Zoë <Ops> & Co, then @Li_Wei!";
+        let (html, mentions) =
+            teams_core::apply_mentions(&teams_core::markdown_to_html(text), &inputs);
+        assert_eq!(mentions.len(), 3, "{html}");
+        assert!(!html.contains("<Ops>"), "{html}");
+        // Inside code it is text.
+        let code = teams_core::markdown_to_html("`@Sam O'Brien`");
+        let (html, _) = teams_core::apply_mentions(&code, &inputs[..1]);
+        println!("{html}");
     }
 
     #[test]
