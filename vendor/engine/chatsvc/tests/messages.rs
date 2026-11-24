@@ -1,0 +1,465 @@
+use std::collections::VecDeque;
+use std::sync::Mutex;
+use std::time::Duration;
+
+use chatsvc::messages::{ConversationRef, Messages};
+use chatsvc::{Error, Result};
+use serde_json::Value;
+use session::{ApiResponse, Method, Request};
+
+struct Mock {
+    answers: Mutex<VecDeque<u16>>,
+    requests: Mutex<Vec<Request>>,
+}
+
+impl Mock {
+    fn new(statuses: &[u16]) -> Self {
+        Mock {
+            answers: Mutex::new(statuses.iter().copied().collect()),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn requests(&self) -> Vec<Request> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl chatsvc::messages::MessageTransport for &Mock {
+    async fn send(&self, request: Request) -> Result<ApiResponse> {
+        self.requests.lock().unwrap().push(request);
+        Ok(ApiResponse {
+            status: self
+                .answers
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("mock exhausted"),
+            body: Value::Null,
+            retry_after: None,
+        })
+    }
+}
+
+fn messages(mock: &Mock) -> Messages<&Mock> {
+    Messages::with_transport(mock, "emea").with_retry_delay(Duration::ZERO)
+}
+
+const BASE: &str = "https://teams.cloud.microsoft/api/chatsvc/emea/v1/users/ME/conversations";
+
+#[tokio::test]
+async fn edit_chat_puts_the_message_object() {
+    let mock = Mock::new(&[200]);
+    messages(&mock)
+        .edit_message(&ConversationRef::chat("19:a@thread.v2"), "m1", "<p>hi</p>")
+        .await
+        .unwrap();
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, Method::Put);
+    assert_eq!(
+        requests[0].url,
+        format!("{BASE}/19%3Aa%40thread.v2/messages/m1")
+    );
+    let body = requests[0].body.as_ref().unwrap();
+    assert_eq!(body["id"], "m1");
+    assert_eq!(body["content"], "<p>hi</p>");
+    assert_eq!(body["messagetype"], "RichText/Html");
+    assert_eq!(body["contenttype"], "text");
+    assert!(
+        body["properties"]["edittime"]
+            .as_str()
+            .unwrap()
+            .parse::<i64>()
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn channel_reply_encodes_the_messageid_suffix() {
+    let mock = Mock::new(&[200]);
+    messages(&mock)
+        .edit_message(
+            &ConversationRef::channel_reply("19:c@thread.tacv2", "root1"),
+            "r1",
+            "x",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        mock.requests()[0].url,
+        format!("{BASE}/19%3Ac%40thread.tacv2%3Bmessageid%3Droot1/messages/r1")
+    );
+}
+
+#[tokio::test]
+async fn channel_root_uses_the_channel_id() {
+    let mock = Mock::new(&[200]);
+    messages(&mock)
+        .edit_message(
+            &ConversationRef::channel_root("19:c@thread.tacv2"),
+            "m1",
+            "x",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        mock.requests()[0].url,
+        format!("{BASE}/19%3Ac%40thread.tacv2/messages/m1")
+    );
+}
+
+#[tokio::test]
+async fn delete_is_soft_without_a_body() {
+    let mock = Mock::new(&[200]);
+    messages(&mock)
+        .soft_delete_message(&ConversationRef::chat("19:a@thread.v2"), "m1")
+        .await
+        .unwrap();
+    let requests = mock.requests();
+    assert_eq!(requests[0].method, Method::Delete);
+    assert_eq!(
+        requests[0].url,
+        format!("{BASE}/19%3Aa%40thread.v2/messages/m1?behavior=softDelete")
+    );
+    assert!(requests[0].body.is_none());
+}
+
+#[tokio::test]
+async fn undelete_clears_the_delete_time_property_like_teams() {
+    let mock = Mock::new(&[200]);
+    messages(&mock)
+        .undelete_message(&ConversationRef::chat("19:a@thread.v2"), "m1")
+        .await
+        .unwrap();
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, Method::Delete);
+    assert_eq!(
+        requests[0].url,
+        format!("{BASE}/19%3Aa%40thread.v2/messages/m1/properties?name=deletetime")
+    );
+    assert_eq!(
+        requests[0].body,
+        Some(serde_json::json!({"deletetime": null}))
+    );
+}
+
+#[tokio::test]
+async fn edit_retries_once_on_404() {
+    let mock = Mock::new(&[404, 200]);
+    messages(&mock)
+        .edit_message(&ConversationRef::chat("19:a"), "m1", "x")
+        .await
+        .unwrap();
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].url, requests[1].url);
+}
+
+#[tokio::test]
+async fn edit_gives_up_after_the_second_404() {
+    let mock = Mock::new(&[404, 404]);
+    let error = messages(&mock)
+        .edit_message(&ConversationRef::chat("19:a"), "m1", "x")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::Session(session::Error::Api { status: 404, .. })
+    ));
+    assert_eq!(mock.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn delete_does_not_retry_on_404() {
+    let mock = Mock::new(&[404]);
+    assert!(
+        messages(&mock)
+            .soft_delete_message(&ConversationRef::chat("19:a"), "m1")
+            .await
+            .is_err()
+    );
+    assert_eq!(mock.requests().len(), 1);
+}
+
+#[test]
+fn messages_use_the_ic3_scope() {
+    let scope = chatsvc::messages::messages_scope();
+    assert_eq!(scope.resource, session::IC3);
+    assert_eq!(scope.name, "Teams.AccessAsUser.All");
+}
+
+#[tokio::test]
+async fn set_emotion_puts_key_and_numeric_timestamp() {
+    let mock = Mock::new(&[200]);
+    messages(&mock)
+        .set_emotion(
+            &ConversationRef::chat("19:a@thread.v2"),
+            "m1",
+            "1f603_grinningfacewithbigeyes",
+        )
+        .await
+        .unwrap();
+    let requests = mock.requests();
+    assert_eq!(requests[0].method, Method::Put);
+    assert!(
+        requests[0]
+            .url
+            .ends_with("/messages/m1/properties?name=emotions")
+    );
+    let emotions = &requests[0].body.as_ref().unwrap()["emotions"];
+    assert_eq!(emotions["key"], "1f603_grinningfacewithbigeyes");
+    assert!(emotions["value"].is_number());
+}
+
+#[tokio::test]
+async fn unset_emotion_deletes_with_key_body_and_retries_a_500() {
+    let mock = Mock::new(&[500, 200]);
+    messages(&mock)
+        .unset_emotion(&ConversationRef::chat("19:a@thread.v2"), "m1", "like")
+        .await
+        .unwrap();
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].method, Method::Delete);
+    assert!(requests[1].url.ends_with("/properties?name=emotions"));
+    assert_eq!(
+        requests[1].body.as_ref().unwrap(),
+        &serde_json::json!({"emotions": {"key": "like"}})
+    );
+}
+
+#[tokio::test]
+async fn emotion_gives_up_after_the_second_500() {
+    let mock = Mock::new(&[500, 500]);
+    assert!(
+        messages(&mock)
+            .set_emotion(&ConversationRef::chat("19:a"), "m1", "like")
+            .await
+            .is_err()
+    );
+    assert_eq!(mock.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn unset_emotions_tries_every_key_and_succeeds_if_one_does() {
+    let mock = Mock::new(&[404, 200]);
+    messages(&mock)
+        .unset_emotions(&ConversationRef::chat("19:a"), "m1", &["primary", "alias"])
+        .await
+        .unwrap();
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].body.as_ref().unwrap()["emotions"]["key"],
+        "primary"
+    );
+    assert_eq!(
+        requests[1].body.as_ref().unwrap()["emotions"]["key"],
+        "alias"
+    );
+}
+
+#[tokio::test]
+async fn unset_emotions_fails_when_every_key_fails() {
+    let mock = Mock::new(&[404, 404]);
+    assert!(
+        messages(&mock)
+            .unset_emotions(&ConversationRef::chat("19:a"), "m1", &["primary", "alias"])
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn send_typing_posts_a_control_message_without_retrying() {
+    let mock = Mock::new(&[201, 201, 500]);
+    let chat = ConversationRef::chat("19:a@thread.v2");
+    messages(&mock).send_typing(&chat, true).await.unwrap();
+    messages(&mock).send_typing(&chat, false).await.unwrap();
+    assert!(messages(&mock).send_typing(&chat, true).await.is_err());
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].method, Method::Post);
+    assert_eq!(
+        requests[0].url,
+        format!("{BASE}/19%3Aa%40thread.v2/messages")
+    );
+    let start = requests[0].body.as_ref().unwrap();
+    assert_eq!(start["messagetype"], "Control/Typing");
+    assert_eq!(start["content"], "");
+    assert_eq!(start["contenttype"], "Application/Message");
+    assert_eq!(
+        requests[1].body.as_ref().unwrap()["messagetype"],
+        "Control/ClearTyping"
+    );
+}
+
+#[tokio::test]
+async fn send_typing_addresses_a_channel_reply_thread() {
+    let mock = Mock::new(&[201]);
+    messages(&mock)
+        .send_typing(
+            &ConversationRef::channel_reply("19:c@thread.tacv2", "99"),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        mock.requests()[0].url,
+        format!("{BASE}/19%3Ac%40thread.tacv2%3Bmessageid%3D99/messages")
+    );
+}
+
+#[tokio::test]
+async fn set_links_puts_the_array_as_a_string() {
+    let mock = Mock::new(&[200]);
+    let links = r#"[{"itemid":"0","url":"https://a.example"}]"#;
+    messages(&mock)
+        .set_links(&ConversationRef::chat("19:a@thread.v2"), "m1", links)
+        .await
+        .unwrap();
+    let requests = mock.requests();
+    assert_eq!(requests[0].method, Method::Put);
+    assert_eq!(
+        requests[0].url,
+        format!("{BASE}/19%3Aa%40thread.v2/messages/m1/properties?name=links")
+    );
+    assert_eq!(requests[0].body.as_ref().unwrap()["links"], links);
+}
+
+#[tokio::test]
+async fn set_links_in_a_channel_reply_targets_the_thread_conversation() {
+    let mock = Mock::new(&[200]);
+    messages(&mock)
+        .set_links(
+            &ConversationRef::channel_reply("19:c@thread.tacv2", "root1"),
+            "r1",
+            "[]",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        mock.requests()[0].url,
+        format!(
+            "{BASE}/19%3Ac%40thread.tacv2%3Bmessageid%3Droot1/messages/r1/properties?name=links"
+        )
+    );
+}
+
+#[tokio::test]
+async fn link_info_encodes_the_url_for_the_preview_service() {
+    let mock = Mock::new(&[200]);
+    messages(&mock)
+        .link_info("https://a.example/x?y=1&z=2")
+        .await
+        .unwrap();
+    assert_eq!(mock.requests()[0].method, Method::Get);
+    assert_eq!(
+        mock.requests()[0].url,
+        "https://de-prod.asyncgw.teams.microsoft.com/urlp/v1/url/info?url=https%3A%2F%2Fa.example%2Fx%3Fy%3D1%26z%3D2"
+    );
+}
+
+#[tokio::test]
+async fn link_images_outside_the_preview_service_are_refused_without_a_request() {
+    let mock = Mock::new(&[]);
+    assert!(
+        messages(&mock)
+            .link_image("https://evil.example/a.png")
+            .await
+            .is_err()
+    );
+    assert!(mock.requests().is_empty());
+}
+
+#[tokio::test]
+async fn list_message_links_asks_for_the_msnp24_view() {
+    let mock = Mock::new(&[200]);
+    messages(&mock)
+        .list_message_links(&ConversationRef::channel_root("19:c@thread.tacv2"), 50)
+        .await
+        .unwrap();
+    assert_eq!(
+        mock.requests()[0].url,
+        format!("{BASE}/19%3Ac%40thread.tacv2/messages?view=msnp24Equivalent&pageSize=50")
+    );
+}
+
+struct ArrivalMock {
+    requests: Mutex<Vec<Request>>,
+}
+
+impl chatsvc::messages::MessageTransport for &ArrivalMock {
+    async fn send(&self, request: Request) -> Result<ApiResponse> {
+        self.requests.lock().unwrap().push(request);
+        Ok(ApiResponse {
+            status: 201,
+            body: serde_json::json!({"OriginalArrivalTime": 1727203440000.0}),
+            retry_after: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn post_message_sends_rich_text_to_the_reply_thread_and_returns_the_arrival_id() {
+    let mock = ArrivalMock {
+        requests: Mutex::new(Vec::new()),
+    };
+    let properties =
+        serde_json::json!({"importance": "", "mentions": "[]", "formatVariant": "TEAMS"});
+    let message_id = Messages::with_transport(&mock, "emea")
+        .post_message(
+            &ConversationRef::channel_reply("19:c@thread.tacv2", "99"),
+            "<p>hi</p>",
+            "Daniel",
+            &properties,
+        )
+        .await
+        .unwrap();
+    assert_eq!(message_id, "1727203440000");
+    let requests = mock.requests.lock().unwrap().clone();
+    assert_eq!(requests[0].method, Method::Post);
+    assert_eq!(
+        requests[0].url,
+        format!("{BASE}/19%3Ac%40thread.tacv2%3Bmessageid%3D99/messages")
+    );
+    let body = requests[0].body.as_ref().unwrap();
+    assert_eq!(body["messagetype"], "RichText/Html");
+    assert_eq!(body["contenttype"], "text");
+    assert_eq!(body["content"], "<p>hi</p>");
+    assert_eq!(body["imdisplayname"], "Daniel");
+    assert_eq!(body["properties"], properties);
+    assert_eq!(body["amsreferences"], serde_json::json!([]));
+    let client_message_id = body["clientmessageid"].as_str().unwrap();
+    assert!((2..=19).contains(&client_message_id.len()));
+    assert!(
+        client_message_id
+            .chars()
+            .all(|character| character.is_ascii_digit())
+    );
+}
+
+#[tokio::test]
+async fn cards_go_to_the_cards_property_of_the_post() {
+    let mock = Mock::new(&[404, 200]);
+    messages(&mock)
+        .set_cards(
+            &ConversationRef::ChannelRoot {
+                channel_id: "19:c@thread.skype".into(),
+            },
+            "17",
+            "[]",
+        )
+        .await
+        .unwrap();
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].method, Method::Put);
+    assert_eq!(
+        requests[1].url,
+        format!("{BASE}/19%3Ac%40thread.skype/messages/17/properties?name=cards")
+    );
+    assert_eq!(requests[1].body.as_ref().unwrap()["cards"], "[]");
+}

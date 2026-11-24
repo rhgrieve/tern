@@ -1,0 +1,634 @@
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/error.rs vendor/engine/session/src/error.rs
+--- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/error.rs	2026-11-24 07:04:16.830396462 -0500
++++ vendor/engine/session/src/error.rs	2026-11-24 07:06:21.009761832 -0500
+@@ -21,6 +21,10 @@
+     },
+     #[error("browser protocol error: {0}")]
+     Cdp(String),
++    #[error("not available without the Teams web app: {0}")]
++    PageOnly(String),
++    #[error("no token for {resource} may be sent to {url}")]
++    TokenHostRefused { resource: String, url: String },
+     #[error("tab connection lost during a write ({0}); check whether it was sent before retrying")]
+     WriteInterrupted(String),
+ }
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/lib.rs vendor/engine/session/src/lib.rs
+--- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/lib.rs	2026-11-24 07:04:16.830396462 -0500
++++ vendor/engine/session/src/lib.rs	2026-11-24 07:06:21.009692112 -0500
+@@ -4,6 +4,7 @@
+ mod http;
+ mod native;
+ mod page_script;
++mod provider;
+ mod request;
+ mod scope;
+ mod session;
+@@ -14,6 +15,7 @@
+ pub use events::{TabChannel, TabCommand, TabControl, TabEvent, TabEvents};
+ pub use native::ensure_crypto_provider;
+ pub use page_script::token_acquirer_script;
++pub use provider::{TokenProvider, token_allowed};
+ pub use request::{
+     ApiResponse, AugloopExchange, AugloopStage, BodyToken, Method, Request, SignalrExchange,
+ };
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/native.rs vendor/engine/session/src/native.rs
+--- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/native.rs	2026-11-24 07:04:16.830396462 -0500
++++ vendor/engine/session/src/native.rs	2026-11-24 07:48:40.743375454 -0500
+@@ -8,6 +8,7 @@
+ use serde_json::{Value, json};
+ 
+ use crate::app::App;
++use crate::error::Result;
+ use crate::request::{ApiResponse, Method, Request};
+ use crate::scope::Scope;
+ use crate::session::Session;
+@@ -77,13 +78,35 @@
+         scope: &Scope,
+         force_refresh: bool,
+     ) -> Option<Vec<ApiResponse>> {
++        self.run_checked(session, requests, scope, force_refresh)
++            .await
++            .ok()
++            .flatten()
++    }
++
++    /// Like [`NativeHttp::run`], but a token failure is an error; `None` is a request only a page can make.
++    pub(crate) async fn run_checked(
++        &self,
++        session: &Session,
++        requests: &[&Request],
++        scope: &Scope,
++        force_refresh: bool,
++    ) -> Result<Option<Vec<ApiResponse>>> {
+         if !requests.iter().all(|request| eligible(request)) {
+-            return None;
++            return Ok(None);
+         }
+         let credential = if requests.iter().all(|request| request.anonymous) {
+             None
++        } else if let Some(provider) = &session.provider {
++            let token = provider
++                .token(scope, session.tenant(), force_refresh)
++                .await?;
++            Some((App::Teams, token))
+         } else {
+-            Some(self.token(session, scope, force_refresh).await?)
++            match self.token(session, scope, force_refresh).await {
++                Some(credential) => Some(credential),
++                None => return Ok(None),
++            }
+         };
+         let mut answers = Vec::with_capacity(requests.len());
+         for chunk in requests.chunks(CONCURRENCY) {
+@@ -96,7 +119,7 @@
+         if answers.iter().any(|answer| answer.status == 401) {
+             self.forget(scope);
+         }
+-        Some(answers)
++        Ok(Some(answers))
+     }
+ 
+     async fn token(
+@@ -228,7 +251,8 @@
+     }
+ }
+ 
+-const TEAMS_BEARER_PATHS: [&str; 2] = ["/api/", "/registrar/"];
++// Tern patch: "/ups/" is the regional presence service, which takes a bearer.
++const TEAMS_BEARER_PATHS: [&str; 3] = ["/api/", "/registrar/", "/ups/"];
+ 
+ /// Both rustls providers end up compiled in through dependencies, and then rustls refuses to pick one on its own.
+ pub fn ensure_crypto_provider() {
+@@ -301,6 +325,15 @@
+     }
+ 
+     #[test]
++    fn the_regional_presence_service_needs_no_page() {
++        let base = "https://teams.microsoft.com";
++        assert!(!needs_page_cookies(&format!("{base}/ups/noam/v1/me/endpoints/")));
++        assert!(!needs_page_cookies(&format!("{base}/api/csa/x")));
++        assert!(needs_page_cookies(&format!("{base}/upsell/")));
++        assert!(needs_page_cookies(&format!("{base}/v2/")));
++    }
++
++    #[test]
+     fn a_token_is_used_until_the_margin_before_it_expires() {
+         let now = SystemTime::now()
+             .duration_since(UNIX_EPOCH)
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/page_script.rs vendor/engine/session/src/page_script.rs
+--- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/page_script.rs	2026-11-24 07:04:16.830396462 -0500
++++ vendor/engine/session/src/page_script.rs	2026-11-24 07:37:57.549111843 -0500
+@@ -25,6 +25,9 @@
+ impl Session {
+     /// Opens a dedicated CDP connection to the app tab. Events of the tab arrive on the stream.
+     pub async fn subscribe(&self, app: App) -> Result<(TabControl, TabEvents)> {
++        if self.provider.is_some() {
++            return Err(Error::PageOnly("a browser tab".into()));
++        }
+         let (control, events) = self
+             .transport
+             .open(app, true)
+@@ -43,6 +46,11 @@
+         args: &Value,
+         force_refresh: bool,
+     ) -> Result<Value> {
++        if self.provider.is_some() {
++            return Err(Error::PageOnly(format!(
++                "a page script with a {scope} token"
++            )));
++        }
+         let marker_at = FETCH_SCRIPT
+             .find(TOKEN_MARKER)
+             .expect("fetch.js contains the token marker");
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/provider.rs vendor/engine/session/src/provider.rs
+--- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/provider.rs	1969-12-31 19:00:00.000000000 -0500
++++ vendor/engine/session/src/provider.rs	2026-11-24 07:37:57.554111807 -0500
+@@ -0,0 +1,213 @@
++//! Tern patch: a session without a browser. Tokens come from a [`TokenProvider`], and a bearer
++//! is only ever attached to a host that belongs to the token's audience.
++
++use url::Url;
++
++use crate::app::App;
++use crate::error::{Error, Result};
++use crate::scope::Scope;
++use crate::transport::{BoxFuture, Diagnosis, OpenedTab, Transport};
++
++/// Mints access tokens. Implementations cache and refresh; `force` asks for a new token because
++/// the service refused the current one.
++pub trait TokenProvider: Send + Sync {
++    fn token<'a>(
++        &'a self,
++        scope: &'a Scope,
++        tenant: Option<&'a str>,
++        force: bool,
++    ) -> BoxFuture<'a, Result<String>>;
++}
++
++/// Stands in for the browser: there are no tabs to open.
++pub(crate) struct NoBrowser;
++
++impl Transport for NoBrowser {
++    fn check(&self) -> BoxFuture<'_, Result<()>> {
++        Box::pin(async { Ok(()) })
++    }
++
++    fn open(&self, _app: App, _with_events: bool) -> BoxFuture<'_, Result<Option<OpenedTab>>> {
++        Box::pin(async { Ok(None) })
++    }
++
++    fn wake(&self, _app: App) -> BoxFuture<'_, Result<()>> {
++        Box::pin(async { Ok(()) })
++    }
++
++    fn diagnose(&self) -> BoxFuture<'_, Result<Diagnosis>> {
++        Box::pin(async { Ok(Diagnosis::default()) })
++    }
++}
++
++/// Domains whose hosts (the domain itself or a subdomain) may see a token for `resource`.
++/// An audience that is not listed may only be sent to its own host.
++fn audience_domains(resource: &str) -> &'static [&'static str] {
++    match resource.trim_end_matches('/') {
++        "https://graph.microsoft.com" => &["graph.microsoft.com"],
++        "https://presence.teams.microsoft.com" => &[
++            "presence.teams.microsoft.com",
++            "teams.microsoft.com",
++            "teams.cloud.microsoft",
++        ],
++        "https://ic3.teams.office.com"
++        | "https://api.spaces.skype.com"
++        | "https://chatsvcagg.teams.microsoft.com"
++        | "https://uis.teams.microsoft.com" => &[
++            "teams.microsoft.com",
++            "teams.cloud.microsoft",
++            "api.spaces.skype.com",
++            "ic3.teams.office.com",
++            "asm.skype.com",
++        ],
++        "https://outlook.office.com" => &[
++            "outlook.office.com",
++            "outlook.cloud.microsoft",
++            "substrate.office.com",
++        ],
++        "https://substrate.office.com" => &["substrate.office.com"],
++        _ => &[],
++    }
++}
++
++fn within(host: &str, domain: &str) -> bool {
++    host == domain
++        || host
++            .strip_suffix(domain)
++            .is_some_and(|rest| rest.ends_with('.'))
++}
++
++/// Whether a token for `resource` may be sent to `url`.
++pub fn token_allowed(resource: &str, url: &str) -> bool {
++    let Ok(url) = Url::parse(url) else {
++        return false;
++    };
++    let Some(host) = url.host_str() else {
++        return false;
++    };
++    if url.scheme() != "https"
++        || !url.username().is_empty()
++        || url.password().is_some()
++        || url.port().is_some_and(|port| port != 443)
++    {
++        return false;
++    }
++    let listed = audience_domains(resource);
++    if !listed.is_empty() {
++        return listed.iter().any(|domain| within(host, domain));
++    }
++    Url::parse(resource).is_ok_and(|resource| resource.host_str() == Some(host))
++}
++
++pub(crate) fn page_only(what: &str) -> Error {
++    Error::PageOnly(what.to_owned())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const GRAPH: &str = "https://graph.microsoft.com";
++    const IC3: &str = "https://ic3.teams.office.com";
++    const PRESENCE: &str = "https://presence.teams.microsoft.com";
++
++    #[test]
++    fn tokens_go_to_their_own_services() {
++        for (resource, url) in [
++            (GRAPH, "https://graph.microsoft.com/v1.0/me"),
++            (
++                IC3,
++                "https://teams.cloud.microsoft/api/chatsvc/amer/v1/users/ME",
++            ),
++            (IC3, "https://amer.ng.msg.teams.microsoft.com/v1/users/ME"),
++            (
++                PRESENCE,
++                "https://presence.teams.microsoft.com/v1/me/endpoints/",
++            ),
++            (
++                PRESENCE,
++                "https://teams.microsoft.com/ups/amer/v1/me/endpoints/",
++            ),
++            (
++                "https://contoso.sharepoint.com",
++                "https://contoso.sharepoint.com/_api/x",
++            ),
++        ] {
++            assert!(token_allowed(resource, url), "{resource} -> {url}");
++        }
++    }
++
++    struct Never;
++
++    impl TokenProvider for Never {
++        fn token<'a>(
++            &'a self,
++            _: &'a Scope,
++            _: Option<&'a str>,
++            _: bool,
++        ) -> BoxFuture<'a, Result<String>> {
++            panic!("a token was asked for");
++        }
++    }
++
++    #[tokio::test]
++    async fn a_session_refuses_foreign_hosts_before_asking_for_a_token() {
++        use crate::{Method, Request, Session, SessionConfig};
++        let session = Session::with_provider(std::sync::Arc::new(Never), SessionConfig::default());
++        let sent = session
++            .request(
++                Method::Get,
++                "https://evil.example/?x=1",
++                &Scope::graph("User.Read"),
++                None,
++            )
++            .await;
++        assert!(
++            matches!(sent, Err(Error::TokenHostRefused { url, .. }) if url == "https://evil.example/")
++        );
++        let scope = Scope::graph("User.Read");
++        let augloop = Request::augloop(
++            "https://graph.microsoft.com/x",
++            crate::AugloopExchange {
++                stages: vec![],
++                placeholder: String::new(),
++                done_marker: String::new(),
++                timeout_ms: 1,
++                keepalive_ms: 1,
++            },
++        );
++        assert!(matches!(
++            session.send(augloop, &scope).await,
++            Err(Error::PageOnly(_))
++        ));
++        assert!(matches!(
++            session
++                .run_with_token(App::Teams, &scope, "", &serde_json::json!({}), false)
++                .await,
++            Err(Error::PageOnly(_))
++        ));
++    }
++
++    #[test]
++    fn tokens_never_go_elsewhere() {
++        for (resource, url) in [
++            (GRAPH, "https://graph.microsoft.com.evil.example/v1.0/me"),
++            (GRAPH, "https://evilgraph.microsoft.com/v1.0/me"),
++            (GRAPH, "https://teams.microsoft.com/x"),
++            (GRAPH, "http://graph.microsoft.com/v1.0/me"),
++            (GRAPH, "https://graph.microsoft.com:8443/v1.0/me"),
++            (GRAPH, "https://graph.microsoft.com@evil.example/"),
++            (GRAPH, "https://user@graph.microsoft.com/"),
++            (IC3, "https://teams.microsoft.com.evil.example/"),
++            (IC3, "https://notteams.microsoft.com/"),
++            (IC3, "https://graph.microsoft.com/v1.0/me"),
++            (
++                "https://contoso.sharepoint.com",
++                "https://fabrikam.sharepoint.com/",
++            ),
++            (GRAPH, "not a url"),
++        ] {
++            assert!(!token_allowed(resource, url), "{resource} -> {url}");
++        }
++    }
++}
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/session.rs vendor/engine/session/src/session.rs
+--- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/session.rs	2026-11-24 07:04:16.830396462 -0500
++++ vendor/engine/session/src/session.rs	2026-11-24 07:06:21.016278189 -0500
+@@ -11,6 +11,7 @@
+ use crate::error::{Error, Result};
+ use crate::events::TabControl;
+ use crate::native::NativeHttp;
++use crate::provider::{NoBrowser, TokenProvider, page_only, token_allowed};
+ use crate::request::{ApiResponse, Method, Outcome, Request, WireRequest, WireResult};
+ use crate::scope::Scope;
+ use crate::transport::{CdpTransport, Transport};
+@@ -75,6 +76,7 @@
+     force_refresh: Arc<AtomicBool>,
+     native: Option<Arc<NativeHttp>>,
+     tenant: Option<Arc<str>>,
++    pub(crate) provider: Option<Arc<dyn TokenProvider>>,
+ }
+ 
+ impl Session {
+@@ -94,6 +96,7 @@
+         Ok(Session {
+             native: native_http(&config),
+             tenant: None,
++            provider: None,
+             transport,
+             config,
+             tabs: Arc::new(
+@@ -106,6 +109,44 @@
+         })
+     }
+ 
++    /// A session without a browser: every request goes out from Rust with a token from `provider`.
++    pub fn with_provider(provider: Arc<dyn TokenProvider>, config: SessionConfig) -> Self {
++        let config = SessionConfig {
++            native_http: true,
++            ..config
++        };
++        Session {
++            native: native_http(&config),
++            tenant: None,
++            provider: Some(provider),
++            transport: Arc::new(NoBrowser),
++            config,
++            tabs: Arc::new(
++                App::ALL
++                    .into_iter()
++                    .map(|app| (app, Mutex::new(None)))
++                    .collect(),
++            ),
++            force_refresh: Arc::new(AtomicBool::new(false)),
++        }
++    }
++
++    /// An access token for `scope`, from the provider or from the signed-in page.
++    pub async fn access_token(&self, scope: &Scope, force_refresh: bool) -> Result<String> {
++        if let Some(provider) = &self.provider {
++            return provider.token(scope, self.tenant(), force_refresh).await;
++        }
++        for app in App::ALL {
++            if let Value::String(token) = self
++                .run_with_token(app, scope, "return token;", &json!({}), force_refresh)
++                .await?
++            {
++                return Ok(token);
++            }
++        }
++        Err(Error::Cdp("token lookup gave no text".into()))
++    }
++
+     /// The same browser session with tokens for `tenant_id`, e.g. a tenant the account is a guest in.
+     /// Tokens are held apart from the home tenant's, so both can run side by side.
+     pub fn in_tenant(&self, tenant_id: &str) -> Session {
+@@ -167,9 +208,11 @@
+                 // A CAE-revoked token stays unexpired in the app cache, so only a refresh-token grant replaces it.
+                 self.force_refresh.store(true, Ordering::SeqCst);
+                 forced_here = true;
+-                self.reload_all().await;
+-                sleep(self.config.unauthorized_reload_wait).await;
+-                self.drop_all().await;
++                if self.provider.is_none() {
++                    self.reload_all().await;
++                    sleep(self.config.unauthorized_reload_wait).await;
++                    self.drop_all().await;
++                }
+             }
+             let mut retry = Vec::new();
+             for (&index, answer) in pending.iter().zip(answers) {
+@@ -221,6 +264,9 @@
+         requests: &[&Request],
+         scope: &Scope,
+     ) -> Result<Vec<ApiResponse>> {
++        if self.provider.is_some() {
++            return self.run_with_provider(requests, scope).await;
++        }
+         if let Some(native) = &self.native
+             && let Some(results) = native
+                 .run(
+@@ -271,6 +317,33 @@
+         })
+     }
+ 
++    async fn run_with_provider(
++        &self,
++        requests: &[&Request],
++        scope: &Scope,
++    ) -> Result<Vec<ApiResponse>> {
++        let native = self
++            .native
++            .as_ref()
++            .ok_or_else(|| page_only("no HTTP client"))?;
++        for request in requests {
++            if !request.anonymous && !token_allowed(&scope.resource, &request.url) {
++                return Err(Error::TokenHostRefused {
++                    resource: scope.resource.to_string(),
++                    url: without_query(&request.url).to_owned(),
++                });
++            }
++        }
++        let force = self.force_refresh.load(Ordering::SeqCst);
++        native
++            .run_checked(self, requests, scope, force)
++            .await?
++            .ok_or_else(|| {
++                let url = requests.first().map_or("", |request| request.url.as_str());
++                page_only(without_query(url))
++            })
++    }
++
+     async fn run_in_any_tab(
+         &self,
+         requests: &[&Request],
+@@ -367,6 +440,10 @@
+     }
+ }
+ 
++fn without_query(url: &str) -> &str {
++    url.split(['?', '#']).next().unwrap_or(url)
++}
++
+ pub struct TabHold {
+     transport: Arc<dyn Transport>,
+     app: App,
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/presence.rs vendor/engine/chatsvc/src/presence.rs
+--- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/presence.rs	2026-11-24 07:04:16.815508159 -0500
++++ vendor/engine/chatsvc/src/presence.rs	2026-11-24 07:06:29.035276028 -0500
+@@ -126,6 +126,7 @@
+ 
+ pub struct PresenceService<T: CardTransport = SessionCardTransport> {
+     transport: T,
++    base: String,
+ }
+ 
+ impl PresenceService<SessionCardTransport> {
+@@ -136,11 +137,20 @@
+ 
+ impl<T: CardTransport> PresenceService<T> {
+     pub fn with_transport(transport: T) -> Self {
+-        PresenceService { transport }
++        PresenceService {
++            transport,
++            base: BASE_URL.to_owned(),
++        }
++    }
++
++    /// The regional presence service (`regionGtms.presenceUPS` in the sign-in answer), ending in `/v1`.
++    pub fn at(mut self, base: &str) -> Self {
++        self.base = base.trim_end_matches('/').to_owned();
++        self
+     }
+ 
+     pub async fn set_availability(&self, forced: Option<&ForcedAvailability>) -> Result<()> {
+-        let url = format!("{BASE_URL}/me/forceavailability/");
++        let url = format!("{}/me/forceavailability/", self.base);
+         let request = match forced {
+             Some(forced) => Request::with_body(Method::Put, &url, availability_body(forced)),
+             None => Request {
+@@ -156,7 +166,7 @@
+         endpoint_id: &str,
+         reporting: ActivityReporting,
+     ) -> Result<()> {
+-        let url = format!("{BASE_URL}/me/endpoints/");
++        let url = format!("{}/me/endpoints/", self.base);
+         let mut request =
+             Request::with_body(Method::Put, &url, endpoint_body(endpoint_id, reporting));
+         request.headers = endpoint_headers(endpoint_id);
+@@ -164,7 +174,7 @@
+     }
+ 
+     pub async fn unregister_endpoint(&self, endpoint_id: &str) -> Result<()> {
+-        let url = format!("{BASE_URL}/me/endpoints/{endpoint_id}");
++        let url = format!("{}/me/endpoints/{endpoint_id}", self.base);
+         let mut request = Request {
+             method: Method::Delete,
+             ..Request::get(&url)
+@@ -174,7 +184,7 @@
+     }
+ 
+     pub async fn report_activity(&self, endpoint_id: &str, active: bool) -> Result<()> {
+-        let url = format!("{BASE_URL}/me/reportmyactivity/");
++        let url = format!("{}/me/reportmyactivity/", self.base);
+         let body = json!({"endpointId": endpoint_id, "isActive": active});
+         let mut request = Request::with_body(Method::Post, &url, body);
+         request.headers = endpoint_headers(endpoint_id);
+@@ -182,7 +192,7 @@
+     }
+ 
+     pub async fn set_note(&self, note: Option<&StatusNote>) -> Result<()> {
+-        let url = format!("{BASE_URL}/me/publishnote");
++        let url = format!("{}/me/publishnote", self.base);
+         let body = note.map_or_else(|| json!({"message": ""}), note_body);
+         self.send(Request::with_body(Method::Put, &url, body), &url)
+             .await
+@@ -193,7 +203,7 @@
+         &self,
+         location: Option<(WorkLocationKind, DateTime<Utc>)>,
+     ) -> Result<()> {
+-        let url = format!("{BASE_URL}/me/workLocation/");
++        let url = format!("{}/me/workLocation/", self.base);
+         let body = match location {
+             Some((kind, expires_at)) => json!({
+                 "location": kind.code(),
+@@ -207,7 +217,7 @@
+     }
+ 
+     pub async fn status(&self, user_id: &str) -> Result<PresenceStatus> {
+-        let url = format!("{BASE_URL}/presence/getpresence/");
++        let url = format!("{}/presence/getpresence/", self.base);
+         let mri = format!("{ORGID_PREFIX}{user_id}");
+         let body = json!([{ "mri": mri }]);
+         let answer = self
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/realtime/native.rs vendor/engine/chatsvc/src/realtime/native.rs
+--- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/realtime/native.rs	2026-11-24 07:04:16.816335647 -0500
++++ vendor/engine/chatsvc/src/realtime/native.rs	2026-11-24 07:07:12.531347494 -0500
+@@ -5,7 +5,7 @@
+ use futures_util::{SinkExt, StreamExt};
+ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
+ use serde_json::{Map, Value, json};
+-use session::{App, Method, Request, Session};
++use session::{Method, Request, Session};
+ use tokio::net::TcpStream;
+ use tokio::sync::{Notify, mpsc, oneshot, watch};
+ use tokio::time::{MissedTickBehavior, interval, sleep, sleep_until, timeout};
+@@ -37,7 +37,6 @@
+ const MAX_SENDER_NAME: usize = 256;
+ const MAX_RESOURCE_TYPE: usize = 64;
+ const MAX_LOSS_DETAIL: usize = 200;
+-const TOKEN_BODY: &str = "return token;";
+ 
+ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+ 
+@@ -371,21 +370,12 @@
+     }
+ 
+     pub(super) async fn token(&mut self) -> session::Result<String> {
+-        let value = self
++        let token = self
+             .session
+-            .run_with_token(
+-                App::Teams,
+-                &ic3_scope(),
+-                TOKEN_BODY,
+-                &json!({}),
+-                self.force_refresh,
+-            )
++            .access_token(&ic3_scope(), self.force_refresh)
+             .await?;
+         self.force_refresh = false;
+-        value
+-            .as_str()
+-            .map(str::to_owned)
+-            .ok_or_else(|| session::Error::Cdp("token lookup gave no text".into()))
++        Ok(token)
+     }
+ 
+     pub(super) async fn run(mut self, mut stop: oneshot::Receiver<oneshot::Sender<()>>) {

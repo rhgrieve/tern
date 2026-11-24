@@ -1,0 +1,491 @@
+//! Tern's background service. For now it does one thing: it keeps the user's Teams presence true
+//! to what they do at this computer.
+
+mod link;
+
+use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::Duration;
+
+use chatsvc::realtime::{Realtime, RealtimeConfig, RealtimeEvent, StatusKind};
+use chatsvc::{PresenceService, PresenceStatus};
+use session::{Session, SessionConfig};
+use tern_auth::{Broker, HttpEndpoint, KeyringStore};
+use tern_ipc::{Request, Response, Status};
+use tern_presence::{Config, Event, Input, Machine, Sensors, Source, State};
+use tokio::net::UnixStream;
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tokio::time::{Instant, interval, sleep_until, timeout};
+
+use link::{Link, contradicts};
+
+const TICK: Duration = Duration::from_secs(15);
+const READ_BACK: Duration = Duration::from_secs(5 * 60);
+const READ_AFTER_CHANGE: Duration = Duration::from_secs(20);
+/// logind gives a delayed sleep about five seconds.
+const BEFORE_SLEEP: Duration = Duration::from_secs(2);
+/// Sleep may have to wait this long for a running request, so it stays below logind's limit.
+const STEP: Duration = Duration::from_secs(3);
+const RECONNECT_FIRST: Duration = Duration::from_secs(2);
+const RECONNECT_MAX: Duration = Duration::from_secs(60);
+
+type Asked = (Request, oneshot::Sender<Response>);
+
+struct Online {
+    realtime: Realtime,
+    service: PresenceService,
+    object_id: String,
+}
+
+enum Connect {
+    Up(Box<Online>),
+    /// Nobody is signed in, or the user has to sign in again: waits for `Reload`.
+    NeedsUser(String),
+    Failed(String),
+}
+
+async fn connect(broker: Arc<Broker>, active: bool) -> Connect {
+    use tern_auth::Error::{Blocked, InteractionRequired, SignedOut};
+    let identity = match broker.identity().await {
+        Some(identity) => identity,
+        // The keyring may have been locked when the service started.
+        None => match broker.load().await {
+            Ok(Some(identity)) => identity,
+            Ok(None) => return Connect::NeedsUser("not signed in: run `tern-cli login`".into()),
+            Err(error) => return Connect::Failed(error.to_string()),
+        },
+    };
+    let regions = match broker.regions().await {
+        Ok(regions) => regions,
+        Err(error @ (SignedOut | InteractionRequired { .. } | Blocked(_))) => {
+            return Connect::NeedsUser(error.to_string());
+        }
+        Err(error) => return Connect::Failed(error.to_string()),
+    };
+    // Minted now, so the short steps later do not have to wait for it.
+    if let Err(error) = broker.access(session::PRESENCE, None, false).await {
+        return match error {
+            SignedOut | InteractionRequired { .. } | Blocked(_) => {
+                Connect::NeedsUser(error.to_string())
+            }
+            error => Connect::Failed(error.to_string()),
+        };
+    }
+    let session = Session::with_provider(broker, SessionConfig::default());
+    let mut service = PresenceService::new(&session);
+    if let Some(base) = &regions.presence {
+        service = service.at(base);
+    }
+    let config = RealtimeConfig {
+        host: regions.trouter_host,
+        // Discovery needs a web page; the host came with the regions.
+        discover_host: false,
+        initially_active: active,
+        native: true,
+        ..RealtimeConfig::default()
+    };
+    match Realtime::start_with(&session, config).await {
+        Ok(realtime) => Connect::Up(Box::new(Online {
+            realtime,
+            service,
+            object_id: identity.object_id,
+        })),
+        Err(error) => Connect::Failed(error.to_string()),
+    }
+}
+
+struct Daemon {
+    broker: Arc<Broker>,
+    machine: Machine,
+    changed: Instant,
+    link: Link,
+    online: Option<Box<Online>>,
+    connecting: Option<JoinHandle<Connect>>,
+    connect_at: Option<Instant>,
+    backoff: Duration,
+    push: String,
+    problem: Option<String>,
+    idle_source: Option<Source>,
+    logind: bool,
+    shown: Option<(Instant, PresenceStatus)>,
+    read_at: Instant,
+    mismatches: u32,
+}
+
+impl Daemon {
+    fn new(broker: Arc<Broker>) -> Self {
+        let now = Instant::now();
+        Daemon {
+            broker,
+            machine: Machine::default(),
+            changed: now,
+            link: Link::default(),
+            online: None,
+            connecting: None,
+            connect_at: Some(now),
+            backoff: RECONNECT_FIRST,
+            push: "offline".into(),
+            problem: None,
+            idle_source: None,
+            logind: false,
+            shown: None,
+            read_at: now + READ_BACK,
+            mismatches: 0,
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.machine.desired().active
+    }
+
+    async fn reconcile(&mut self) {
+        if let Some(online) = &self.online {
+            let desired = self.machine.desired();
+            online.realtime.set_activity(desired.active);
+            // Bounded, so a hanging request cannot hold up the next sensor event (sleep above all).
+            let step = self
+                .link
+                .reconcile(&online.service, desired, Instant::now());
+            if timeout(STEP, step).await.is_err() {
+                tracing::debug!("the presence service is slow");
+            }
+        }
+    }
+
+    async fn input(&mut self, input: Input) {
+        if let Some(state) = self.machine.apply(input) {
+            tracing::info!(?state, "user");
+            self.changed = Instant::now();
+            self.read_at = self.changed + READ_AFTER_CHANGE;
+            self.reconcile().await;
+        }
+    }
+
+    /// Starts over with a new push connection. The old one is dropped, not waited for: after sleep
+    /// or a network change it is dead and would only be noticed after a timeout.
+    fn reconnect(&mut self, after: Duration) {
+        self.online = None;
+        if let Some(task) = self.connecting.take() {
+            task.abort();
+        }
+        self.push = "connecting".into();
+        self.link.restart();
+        self.connect_at = Some(Instant::now() + after);
+    }
+
+    async fn sleep(&mut self) {
+        // Not through `input`: its own request would use up the time `leave` has.
+        self.machine.apply(Input::Sleeping(true));
+        self.changed = Instant::now();
+        self.leave().await;
+        self.connect_at = None;
+        self.push = "asleep".into();
+    }
+
+    async fn leave(&mut self) {
+        if let Some(task) = self.connecting.take() {
+            task.abort();
+        }
+        if let Some(online) = self.online.take() {
+            online.realtime.set_activity(false);
+            let online = *online;
+            let goodbye = async {
+                self.link.withdraw(&online.service).await;
+                online.realtime.stop().await;
+            };
+            if timeout(BEFORE_SLEEP, goodbye).await.is_err() {
+                tracing::warn!("leaving took too long");
+            }
+        }
+        self.link.restart();
+    }
+
+    async fn sensor(&mut self, event: Event) {
+        match event {
+            Event::Input(input) => self.input(input).await,
+            Event::Sleep(guard) => {
+                self.sleep().await;
+                drop(guard);
+            }
+            Event::Resume => {
+                self.input(Input::Sleeping(false)).await;
+                self.backoff = RECONNECT_FIRST;
+                self.reconnect(Duration::ZERO);
+            }
+            Event::NetworkUp if self.machine.state() != State::Sleeping => {
+                tracing::info!("network changed");
+                self.backoff = RECONNECT_FIRST;
+                self.reconnect(Duration::ZERO);
+            }
+            Event::NetworkUp => {}
+            Event::Ready(Source::Logind) => self.logind = true,
+            Event::Ready(source) => {
+                tracing::info!(?source, "idle detection");
+                self.idle_source = Some(source);
+            }
+            Event::Lost(Source::Logind, reason) => {
+                self.logind = false;
+                tracing::warn!(reason, "logind");
+            }
+            Event::Lost(_, reason) => {
+                self.idle_source = None;
+                tracing::warn!(reason, "no idle detection");
+            }
+        }
+    }
+
+    async fn pushed(&mut self, event: Option<RealtimeEvent>) {
+        match event {
+            None => self.reconnect(self.backoff),
+            Some(RealtimeEvent::Endpoint(endpoint)) => {
+                self.link.endpoint(endpoint.endpoint_id);
+                self.reconcile().await;
+            }
+            Some(RealtimeEvent::Status(status)) => match status.kind {
+                StatusKind::Connected => {
+                    tracing::info!("push connected");
+                    self.push = "connected".into();
+                    self.problem = None;
+                    self.backoff = RECONNECT_FIRST;
+                    self.link.connected();
+                    self.read_at = Instant::now() + READ_AFTER_CHANGE;
+                    self.reconcile().await;
+                }
+                StatusKind::Disconnected | StatusKind::Error => {
+                    tracing::info!(detail = status.detail, "push");
+                    self.push = "reconnecting".into();
+                    self.link.disconnected(Instant::now());
+                }
+                StatusKind::MessageLoss => {}
+            },
+            Some(_) => {}
+        }
+    }
+
+    fn connected(&mut self, outcome: Connect) {
+        match outcome {
+            Connect::Up(online) => self.online = Some(online),
+            Connect::NeedsUser(reason) => {
+                tracing::warn!(reason, "waiting for a sign-in");
+                self.push = "signed out".into();
+                self.problem = Some(reason);
+            }
+            Connect::Failed(reason) => {
+                tracing::warn!(reason, "could not connect");
+                self.problem = Some(reason);
+                self.connect_at = Some(Instant::now() + self.backoff);
+                self.backoff = (self.backoff * 2).min(RECONNECT_MAX);
+            }
+        }
+    }
+
+    async fn read_back(&mut self) {
+        self.read_at = Instant::now() + READ_BACK;
+        let Some(online) = &self.online else { return };
+        match timeout(STEP, online.service.status(&online.object_id)).await {
+            Ok(Ok(status)) => {
+                if contradicts(&status, self.active()) {
+                    self.mismatches += 1;
+                    tracing::warn!(
+                        shows = status.availability,
+                        times = self.mismatches,
+                        "Teams disagrees; registering again"
+                    );
+                    self.link.repair();
+                    online.realtime.resend_activity();
+                } else {
+                    self.mismatches = 0;
+                }
+                let before = self.shown.as_ref().map(|(_, shown)| &shown.availability);
+                if before != Some(&status.availability) {
+                    tracing::info!(shows = status.availability, state = ?self.machine.state(), "Teams");
+                }
+                self.shown = Some((Instant::now(), status));
+                self.reconcile().await;
+            }
+            Ok(Err(error)) => tracing::debug!(%error, "could not read presence back"),
+            Err(_) => tracing::debug!("reading presence back timed out"),
+        }
+    }
+
+    async fn status(&self) -> Status {
+        Status {
+            account: self.broker.identity().await.map(|identity| identity.name),
+            state: match self.machine.state() {
+                State::Active => "active",
+                State::Idle => "idle",
+                State::Locked => "locked",
+                State::Sleeping => "sleeping",
+                State::InCall => "in_call",
+            }
+            .into(),
+            state_for_secs: self.changed.elapsed().as_secs(),
+            idle_source: self.idle_source.map(|source| match source {
+                Source::Wayland { exact: true } => "Wayland, real input only".into(),
+                Source::Wayland { exact: false } => {
+                    "Wayland, video players count as activity".into()
+                }
+                Source::Mutter => "GNOME".into(),
+                Source::Logind => "logind".into(),
+            }),
+            lock_source: self.logind,
+            push: self.push.clone(),
+            registered: self.link.registered(),
+            teams_shows: self
+                .shown
+                .as_ref()
+                .map(|(_, status)| status.availability.clone()),
+            teams_read_secs_ago: self.shown.as_ref().map(|(at, _)| at.elapsed().as_secs()),
+            problem: self.problem.clone().or_else(|| self.link.problem.clone()),
+        }
+    }
+
+    async fn answer(&mut self, request: Request) -> Response {
+        match request {
+            Request::Status => Response::Status(Box::new(self.status().await)),
+            Request::Reload => {
+                self.leave().await;
+                self.shown = None;
+                match self.broker.load().await {
+                    Ok(_) => {
+                        self.problem = None;
+                        self.reconnect(Duration::ZERO);
+                        Response::Done
+                    }
+                    Err(error) => {
+                        self.problem = Some(error.to_string());
+                        Response::Error(error.to_string())
+                    }
+                }
+            }
+        }
+    }
+
+    async fn run(mut self, mut asked: mpsc::Receiver<Asked>) -> std::io::Result<()> {
+        let mut sensors = Sensors::start(Config::default());
+        let mut tick = interval(TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        loop {
+            let connect_at = self.connect_at;
+            tokio::select! {
+                Some(event) = sensors.recv() => self.sensor(event).await,
+                event = async {
+                    match self.online.as_mut() {
+                        Some(online) => online.realtime.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => self.pushed(event).await,
+                outcome = async {
+                    match self.connecting.as_mut() {
+                        Some(task) => task.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.connecting = None;
+                    self.connected(outcome.unwrap_or_else(|error| Connect::Failed(error.to_string())));
+                }
+                () = async {
+                    match connect_at {
+                        Some(at) => sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.connecting.is_none() => {
+                    self.connect_at = None;
+                    self.push = "connecting".into();
+                    self.connecting = Some(tokio::spawn(connect(self.broker.clone(), self.active())));
+                }
+                () = sleep_until(self.read_at) => self.read_back().await,
+                _ = tick.tick() => self.reconcile().await,
+                Some((request, reply)) = asked.recv() => {
+                    let response = self.answer(request).await;
+                    let _ = reply.send(response);
+                }
+                _ = terminate.recv() => break,
+                _ = interrupt.recv() => break,
+            }
+        }
+        tracing::info!("leaving");
+        self.leave().await;
+        Ok(())
+    }
+}
+
+async fn serve(mut stream: UnixStream, ask: mpsc::Sender<Asked>) {
+    if !tern_ipc::same_user(&stream) {
+        return;
+    }
+    let response = match tern_ipc::receive(&mut stream).await {
+        Ok(request) => {
+            let (reply, answer) = oneshot::channel();
+            if ask.send((request, reply)).await.is_err() {
+                return;
+            }
+            answer
+                .await
+                .unwrap_or_else(|_| Response::Error("no answer".into()))
+        }
+        Err(error) => Response::Error(error.to_string()),
+    };
+    let _ = tern_ipc::respond(&mut stream, &response).await;
+}
+
+async fn start() -> Result<(), String> {
+    let listener = tern_ipc::bind().await.map_err(|error| error.to_string())?;
+    let endpoint = HttpEndpoint::new().map_err(|error| error.to_string())?;
+    let broker = Broker::new(Box::new(endpoint), Box::new(KeyringStore));
+    if let Err(error) = broker.load().await {
+        tracing::warn!(%error, "could not read the stored sign-in");
+    }
+    let (ask, asked) = mpsc::channel(8);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(serve(stream, ask.clone()));
+        }
+    });
+    let outcome = Daemon::new(broker)
+        .run(asked)
+        .await
+        .map_err(|error| error.to_string());
+    if let Ok(path) = tern_ipc::socket_path() {
+        let _ = std::fs::remove_file(path);
+    }
+    outcome
+}
+
+fn main() -> ExitCode {
+    // Dependencies stay at warnings whatever is asked: their debug output can hold request headers.
+    let level = match std::env::var("TERN_LOG").as_deref() {
+        Ok("debug") => "warn,ternd=debug,tern_auth=debug,tern_presence=debug",
+        _ => "warn,ternd=info,tern_auth=info,tern_presence=info",
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(level)
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .init();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("ternd: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let outcome = runtime.block_on(start());
+    // The idle watcher blocks on the compositor; it must not hold up the exit.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    match outcome {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("ternd: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}

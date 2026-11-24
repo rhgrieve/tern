@@ -1,0 +1,36 @@
+[workspace]
+members = ["crates/*", "vendor/engine/session", "vendor/engine/chatsvc"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+clap = { version = "4", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+percent-encoding = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "process", "signal"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake"] }
+url = "2"
+uuid = { version = "1", default-features = false, features = ["v4"] }
+
+tern-auth = { path = "crates/auth" }
+tern-ipc = { path = "crates/ipc" }
+tern-presence = { path = "crates/presence" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zbus = { version = "6", default-features = false, features = ["tokio", "proxy"] }
+
+session = { path = "vendor/engine/session" }
+chatsvc = { path = "vendor/engine/chatsvc" }
+
+[profile.dev]
+debug = "line-tables-only"

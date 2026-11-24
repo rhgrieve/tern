@@ -1,0 +1,24 @@
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Session(#[from] session::Error),
+    #[error("unexpected service answer: {0}")]
+    UnexpectedAnswer(String),
+    #[error("no Favorites folder in the conversation folders")]
+    NoFavoritesFolder,
+    #[error("unknown folder {0}")]
+    UnknownFolder(String),
+    #[error("folder {0} is a system folder")]
+    SystemFolder(String),
+    #[error("pin list changed twice while writing, giving up")]
+    VersionConflict,
+    #[error("GIFs are disabled by the organization")]
+    GifsDisabled,
+    /// HTTP 403, error code 209, sub-code `AclCheckFailed`: this account is not on the thread roster.
+    #[error("no access to this chat")]
+    AccessDenied,
+    #[error("invalid event payload: {0}")]
+    Decode(String),
+}
