@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
@@ -52,6 +53,19 @@ trait Portal {
         &self,
         parent_window: &str,
         uri: &str,
+        options: HashMap<&str, Variant<'_>>,
+    ) -> zbus::Result<zbus::OwnedObjectPath>;
+}
+
+#[zbus::proxy(
+    interface = "org.freedesktop.portal.Background",
+    default_service = "org.freedesktop.portal.Desktop",
+    default_path = "/org/freedesktop/portal/desktop"
+)]
+trait Background {
+    fn request_background(
+        &self,
+        parent_window: &str,
         options: HashMap<&str, Variant<'_>>,
     ) -> zbus::Result<zbus::OwnedObjectPath>;
 }
@@ -351,10 +365,60 @@ fn platform(token: Option<&str>) -> HashMap<&str, Variant<'_>> {
         .collect()
 }
 
+/// Nobody knows how to start the window out of an image, so this does, unless it is there.
+async fn wake(connection: &zbus::Connection) -> zbus::Result<()> {
+    if tern_ipc::home() != tern_ipc::Home::AppImage {
+        return Ok(());
+    }
+    let bus = zbus::fdo::DBusProxy::new(connection).await?;
+    let there = async || bus.name_has_owner(WINDOW.try_into()?).await;
+    if there().await? {
+        return Ok(());
+    }
+    let mut window = tokio::process::Command::new(tern_ipc::program("tern"))
+        .arg("--gapplication-service")
+        .spawn()
+        .map_err(|error| zbus::Error::Failure(error.to_string()))?;
+    tokio::spawn(async move { window.wait().await });
+    for _ in 0..50 {
+        if there().await? {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(())
+}
+
+/// In a sandbox, asks the desktop to start the service at the next login.
+pub async fn at_login() {
+    if !matches!(tern_ipc::home(), tern_ipc::Home::Flatpak(_)) {
+        return;
+    }
+    let asked = async {
+        let connection = zbus::Connection::session().await?;
+        let options = HashMap::from([
+            (
+                "reason",
+                Variant::from("Keep your Teams status true and tell you about messages"),
+            ),
+            ("autostart", Variant::from(true)),
+            ("commandline", Variant::from(vec!["ternd"])),
+        ]);
+        BackgroundProxy::new(&connection)
+            .await?
+            .request_background("", options)
+            .await
+    };
+    if let Err(error) = asked.await {
+        tracing::info!(%error, "will not start by itself at the next login");
+    }
+}
+
 /// Opens Tern's window, or Teams on the web where there is none.
 pub async fn open_window() {
     let shown = async {
         let connection = zbus::Connection::session().await?;
+        wake(&connection).await?;
         ApplicationProxy::new(&connection)
             .await?
             .activate(platform(None))
@@ -370,6 +434,7 @@ pub async fn open_window() {
 pub async fn open(target: &Target, token: Option<String>) {
     let shown = async {
         let connection = zbus::Connection::session().await?;
+        wake(&connection).await?;
         let parameter = vec![Variant::from(target.conversation.as_str())];
         ApplicationProxy::new(&connection)
             .await?

@@ -677,7 +677,9 @@ fn save_picture(texture: &gdk::Texture) -> Result<PathBuf, String> {
 }
 
 fn pasted_folder() -> PathBuf {
-    glib::user_runtime_dir().join("tern").join("pasted")
+    tern_ipc::runtime_folder()
+        .unwrap_or_else(|_| glib::user_runtime_dir().join("tern"))
+        .join("pasted")
 }
 
 /// Removes pasted pictures the daemon has copied. Files the user chose are never touched.

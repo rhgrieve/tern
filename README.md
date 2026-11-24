@@ -67,27 +67,49 @@ for nothing else.
 
 ## Try it
 
-For 64-bit Intel and AMD computers with **Ubuntu 26.04, Fedora 43 or 44, or Arch** (GTK 4.16,
-libadwaita 1.8, WebKitGTK 6.0), and a keyring such as GNOME Keyring or KWallet.
+Everything is on [Releases](https://github.com/rhgrieve/tern/releases), for 64-bit Intel and AMD
+computers. You also need a keyring such as GNOME Keyring or KWallet.
 
-Download the newest `tern-…-x86_64.tar.gz` and its `.sha256` from
-[Releases](https://github.com/rhgrieve/tern/releases), then:
+| | Runs on | Service | Good for |
+|---|---|---|---|
+| **Flatpak** | Any distribution with Flatpak and Flathub | Started by the window, and at login if your desktop allows it | Most people |
+| **AppImage** | Ubuntu 26.04, Fedora 43 and 44, Arch | Started by the window; ends when you log out | Having a look |
+| **Archive** | The same | A systemd service | Keeping it |
+
+**Flatpak**
 
 ```sh
-sha256sum -c tern-*-x86_64.tar.gz.sha256
-tar xzf tern-*-x86_64.tar.gz
-cd tern-*-x86_64
-./install.sh                    # for you only, in ~/.local; a newer one updates it
-~/.local/bin/tern-cli login
+flatpak install --user --or-update ./tern-*-x86_64.flatpak
 ```
 
-Then open **Tern** from your applications. Only curious? `./bin/tern --demo` needs no account.
+**AppImage**
 
-| | |
-|---|---|
-| Is it well? | `tern-cli status` |
-| What happened? | `journalctl --user -u ternd` |
-| Remove it | `./uninstall.sh` signs out and removes it |
+```sh
+chmod +x tern-*-x86_64.AppImage
+./tern-*-x86_64.AppImage              # or with --install, to keep it like the archive
+```
+
+**Archive**
+
+```sh
+tar xzf tern-*-x86_64.tar.gz
+cd tern-*-x86_64
+./install.sh                          # for you only, in ~/.local; a newer one updates it
+```
+
+Then open **Tern** and choose *Sign In*. Only curious? `--demo` needs no account. Use one of the
+three at a time: each has its own sign-in or service, and two would both report your presence.
+
+| | Archive | AppImage | Flatpak |
+|---|---|---|---|
+| Is it well? | `tern-cli status` | `--cli status` | `flatpak run --command=tern-cli io.github.rhgrieve.Tern status` |
+| Remove it | `./uninstall.sh` | delete it | `flatpak uninstall io.github.rhgrieve.Tern` |
+
+Sign out first (`tern-cli logout`) when you remove it; `uninstall.sh` does.
+
+The AppImage and the archive use your system's GTK, libadwaita 1.8 and WebKitGTK 6.0 rather than
+bring their own: the page you type your password into should get its security updates, and keep its
+sandbox. The Flatpak gets them from the GNOME runtime.
 
 Passkeys may not work for signing in. Automatic presence needs a Wayland desktop with
 `ext-idle-notify-v1`, or GNOME. When you report a problem, please do not paste `tern-cli tail`,
@@ -137,6 +159,7 @@ Rust 1.100, and the development files of GTK 4, libadwaita 1.8 and WebKitGTK 6.0
 cargo run --release -p tern -- --demo     # no account needed
 cargo test --workspace
 cargo build --release --workspace && packaging/install.sh
+packaging/archive.sh && packaging/flatpak.sh && packaging/appimage.sh
 ```
 
 <details>

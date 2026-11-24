@@ -1,0 +1,27 @@
+#!/bin/sh
+# Tern out of one file. The window starts the service, which stays when the window is closed.
+here=$(dirname "$(readlink -f "$0")")
+# As for a Flatpak or an installed Tern: the system's own GTK, libadwaita and WebKit are used, so
+# that their security updates count.
+export APPDIR="$here"
+case "${1:-}" in
+--install)
+    exec "$here/install.sh"
+    ;;
+--uninstall)
+    exec "$here/uninstall.sh"
+    ;;
+--cli)
+    shift
+    exec "$here/bin/tern-cli" "$@"
+    ;;
+esac
+wrong=$(ldd "$here/bin/tern" "$here/bin/tern-login" 2>&1 | grep 'not found')
+if [ -n "$wrong" ]; then
+    text="Tern needs GTK 4.16, libadwaita 1.8 and WebKitGTK 6.0, which this system does not have. The Flatpak works here: https://github.com/rhgrieve/tern"
+    echo "$text" >&2
+    echo "$wrong" >&2
+    notify-send -a Tern Tern "$text" 2>/dev/null
+    exit 1
+fi
+exec "$here/bin/tern" "$@"

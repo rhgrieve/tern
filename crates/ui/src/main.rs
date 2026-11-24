@@ -7,6 +7,7 @@ use gtk4::prelude::*;
 use gtk4::{gio, glib};
 use libadwaita as adw;
 use tern_ui::desk::Desk;
+use tern_ui::service;
 use tern_ui::window::{Window, load_style, save_picture};
 
 const APP: &str = "io.github.rhgrieve.Tern";
@@ -185,6 +186,14 @@ fn main() -> glib::ExitCode {
         .flags(flags)
         .build();
     let desk = Desk::new(&app, options.demo || options.measure);
+    app.connect_startup({
+        let quiet = options.demo || options.measure;
+        move |_| {
+            if !quiet {
+                service::start();
+            }
+        }
+    });
     let started = Rc::new(Cell::new(false));
     // The options are for the first time only.
     let begin = Rc::new({

@@ -1,7 +1,7 @@
 //! The private socket between the daemon and its clients: one JSON line each way.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -144,9 +144,52 @@ pub enum Response {
     Error(String),
 }
 
-pub fn socket_path() -> io::Result<PathBuf> {
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+/// How these programs came here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Home {
+    /// systemd and D-Bus know them.
+    Installed,
+    /// One file, which knows nobody.
+    AppImage,
+    /// A sandbox; its own name.
+    Flatpak(String),
+}
+
+pub fn home() -> Home {
+    let flatpak = std::env::var("FLATPAK_ID").ok();
+    let image = std::env::var_os("APPDIR").map(PathBuf::from);
+    home_of(std::env::current_exe().ok().as_deref(), flatpak, image)
+}
+
+/// Programs started by some other sandboxed program or image inherit its variables, so those alone
+/// say nothing.
+fn home_of(program: Option<&Path>, flatpak: Option<String>, image: Option<PathBuf>) -> Home {
+    let within = |folder: &Path| program.is_some_and(|program| program.starts_with(folder));
+    match (flatpak, image) {
+        (Some(name), _) if within(Path::new("/app")) => Home::Flatpak(name),
+        (_, Some(folder)) if folder.is_absolute() && within(&folder) => Home::AppImage,
+        _ => Home::Installed,
+    }
+}
+
+/// Another of these programs.
+pub fn program(name: &str) -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .map(|path| path.with_file_name(name))
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| name.into())
+}
+
+/// What lasts until the user logs out, for all of these programs.
+pub fn runtime_folder() -> io::Result<PathBuf> {
+    let mut runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set"))?;
+    // The part that all sandboxes of the same program have in common.
+    if let Home::Flatpak(name) = home() {
+        runtime.extend(["app", &name]);
+    }
     // A development instance runs beside the installed one.
     let folder = match std::env::var("TERN_INSTANCE") {
         Ok(name) if name.bytes().all(|byte| byte.is_ascii_alphanumeric()) && !name.is_empty() => {
@@ -154,7 +197,11 @@ pub fn socket_path() -> io::Result<PathBuf> {
         }
         _ => "tern".to_owned(),
     };
-    Ok(PathBuf::from(runtime).join(folder).join("ternd.sock"))
+    Ok(runtime.join(folder))
+}
+
+pub fn socket_path() -> io::Result<PathBuf> {
+    Ok(runtime_folder()?.join("ternd.sock"))
 }
 
 /// Binds the socket. Fails when another daemon is answering on it.
@@ -248,6 +295,33 @@ pub async fn ask_within(request: &Request, limit: Duration) -> io::Result<Respon
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_programs_of_the_sandbox_or_image_itself_belong_to_it() {
+        let of = |program: &str, flatpak: Option<&str>, image: Option<&str>| {
+            home_of(
+                Some(Path::new(program)),
+                flatpak.map(str::to_owned),
+                image.map(PathBuf::from),
+            )
+        };
+        let mount = Some("/tmp/.mount_tern1");
+        assert_eq!(of("/home/a/.local/bin/tern", None, None), Home::Installed);
+        assert_eq!(
+            of("/tmp/.mount_tern1/bin/tern", None, mount),
+            Home::AppImage
+        );
+        assert_eq!(
+            of("/app/bin/tern", Some("a.b.C"), None),
+            Home::Flatpak("a.b.C".into())
+        );
+        // Started from a terminal that is an image, or a sandbox with the whole computer in it.
+        assert_eq!(of("/home/a/.local/bin/tern", None, mount), Home::Installed);
+        assert_eq!(
+            of("/home/a/.local/bin/tern", Some("a.b.C"), Some("")),
+            Home::Installed
+        );
+    }
 
     #[tokio::test]
     async fn a_request_gets_its_answer() {

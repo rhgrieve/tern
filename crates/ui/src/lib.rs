@@ -15,6 +15,7 @@ pub mod model;
 pub mod palette;
 pub mod rich;
 pub mod row;
+pub mod service;
 pub mod sidebar;
 pub mod source;
 pub mod tools;

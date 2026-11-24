@@ -37,7 +37,7 @@ jobs:
         run: |
           apt-get update -q
           apt-get install -qy --no-install-recommends \
-            ca-certificates git curl build-essential cmake clang pkg-config python3 rustup \
+            ca-certificates git curl build-essential cmake clang pkg-config python3 rustup squashfs-tools desktop-file-utils \
             libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev libgtk-4-bin \
             adwaita-icon-theme fonts-noto-core fonts-noto-color-emoji tzdata dbus >/dev/null
           rustup toolchain install "$RUST" --profile minimal -c clippy -c rustfmt
@@ -77,7 +77,10 @@ jobs:
           ADW_DISABLE_PORTAL: "1"
         run: |
           export XDG_RUNTIME_DIR=$(mktemp -d)
-          gtk4-broadwayd :9 & sleep 2
+          # Not left behind: a step ends when nobody holds its output any more.
+          gtk4-broadwayd :9 >/dev/null 2>&1 & display=$!
+          trap 'kill $display' EXIT
+          sleep 2
           # GTK wants one thread for all it does, so each test gets a process.
           for test in $(cargo test --locked -q -p tern --lib -- --ignored --list --format terse | sed -n 's/: test$//p'); do
             echo "$test"
@@ -88,12 +91,17 @@ jobs:
         run: cargo build --locked --release --workspace
 
       - name: Put it together
-        run: packaging/archive.sh
+        run: |
+          packaging/archive.sh
+          packaging/appimage.sh
+          desktop-file-validate packaging/desktop/*.desktop
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tern-x86_64
-          path: dist/*.tar.gz*
+          path: |
+            dist/*.tar.gz*
+            dist/*.AppImage*
           if-no-files-found: error
           retention-days: 14
 
@@ -131,16 +139,83 @@ jobs:
           ADW_DISABLE_PORTAL: "1"
         run: |
           export HOME=$(mktemp -d) XDG_RUNTIME_DIR=$(mktemp -d)
-          sha256sum -c ./*.sha256
+          cat ./*.sha256 | sha256sum -c
+          image=$PWD/$(echo *.AppImage)
+          chmod +x "$image"
           tar xzf ./*.tar.gz
           cd tern-*/
           ./install.sh --no-service
           "$HOME/.local/bin/tern-cli" --version
-          gtk4-broadwayd :9 & sleep 2
+          # Not left behind: a step ends when nobody holds its output any more.
+          gtk4-broadwayd :9 >/dev/null 2>&1 & display=$!
+          trap 'kill $display' EXIT
+          sleep 2
+          picture() {
+            for try in 1 2 3 4; do
+              timeout 60 "$@" --demo --open c4 --screenshot "$PWD/shot.png" || true
+              [ -s shot.png ] && break
+            done
+            test -s shot.png
+            rm shot.png
+          }
+          picture "$HOME/.local/bin/tern"
+          # Containers cannot mount it.
+          picture "$image" --appimage-extract-and-run
+          "$image" --appimage-extract-and-run --cli --version
+          ./uninstall.sh --no-service
+          test ! -e "$HOME/.local/bin/tern"
+
+  flatpak:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tern-x86_64
+          path: dist
+      - name: Install Flatpak
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -qy flatpak xvfb dbus-x11 appstream >/dev/null
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y --noninteractive flathub org.gnome.Platform//51
+      - name: Put it together
+        run: |
+          appstreamcli validate --no-net packaging/desktop/*.metainfo.xml
+          tar -C dist -xzf dist/*.tar.gz
+          packaging/flatpak.sh
+      - name: Install and start
+        env:
+          ID: io.github.rhgrieve.Tern
+        run: |
+          flatpak install --user -y --noninteractive dist/*.flatpak
+          missing=$(flatpak run --command=sh "$ID" -c 'ldd /app/bin/*' | grep 'not found' || true)
+          [ -z "$missing" ] || { echo "$missing"; exit 1; }
           for try in 1 2 3 4; do
-            timeout 60 "$HOME/.local/bin/tern" --demo --open c4 --screenshot shot.png || true
+            timeout 60 xvfb-run -a flatpak run --nosocket=wayland --socket=x11 --env=GSK_RENDERER=cairo \
+              --filesystem="$PWD" "$ID" --demo --open c4 --screenshot "$PWD/shot.png" || true
             [ -s shot.png ] && break
           done
           test -s shot.png
-          ./uninstall.sh --no-service
-          test ! -e "$HOME/.local/bin/tern"
+          # Each of these is a sandbox of its own, and they still have to find each other.
+          cat >talk.sh <<'END'
+          flatpak run --env=TERN_NO_PRESENCE=1 --command=ternd "$ID" >service.log 2>&1 & service=$!
+          for try in $(seq 20); do
+            flatpak run --command=tern-cli "$ID" status >status.log 2>&1 && break
+            sleep 1
+          done
+          cat status.log
+          kill $service
+          grep -qi 'not signed in' status.log
+          END
+          timeout 120 dbus-run-session -- bash -e talk.sh || { cat service.log; exit 1; }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tern-x86_64-flatpak
+          path: dist/*.flatpak*
+          if-no-files-found: error
+          retention-days: 14

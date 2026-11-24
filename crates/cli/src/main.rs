@@ -105,19 +105,10 @@ async fn reload_daemon() {
     }
 }
 
-/// The sign-in window, next to this program or on the path.
-fn login_program() -> std::path::PathBuf {
-    std::env::current_exe()
-        .ok()
-        .map(|path| path.with_file_name("tern-login"))
-        .filter(|path| path.exists())
-        .unwrap_or_else(|| "tern-login".into())
-}
-
 /// Shows the sign-in window and answers the redirect it ended on.
 async fn redirect_from_window(request: &SignInRequest) -> Result<String, String> {
     const HINT: &str = "Run `tern-login` by itself to see why.";
-    let mut child = Command::new(login_program())
+    let mut child = Command::new(tern_ipc::program("tern-login"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .kill_on_drop(true)

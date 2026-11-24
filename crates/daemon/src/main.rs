@@ -931,6 +931,7 @@ async fn start() -> Result<(), String> {
         }
     });
     let (news, news_queue) = mpsc::unbounded_channel();
+    tokio::spawn(notify::at_login());
     let (notifier, actions) = Notifier::start();
     let (tray, picks) = TrayIcon::start().await;
     let outcome = Daemon::new(broker, news, changes, notifier, tray)

@@ -23,7 +23,7 @@ use crate::model::{self, Conversation, Filter, OUTGOING};
 use crate::row::{Item, say};
 use crate::sidebar::Sidebar;
 use crate::tools::{Tool, Tools};
-use crate::{art, mention, palette};
+use crate::{art, mention, palette, service};
 
 const CHATS: usize = 400;
 
@@ -51,6 +51,8 @@ pub struct Window {
     composer: Composer,
     title: adw::WindowTitle,
     banner: adw::Banner,
+    /// Above the chats, which are what one sees first in a narrow window.
+    sign_in: adw::Banner,
     toasts: adw::ToastOverlay,
     pages: gtk::Stack,
     back: gtk::Button,
@@ -138,6 +140,8 @@ impl Window {
             filters.add_css_class("linked");
             filters.set_halign(gtk::Align::Center);
             filters.set_margin_bottom(6);
+            filters.set_margin_start(6);
+            filters.set_margin_end(6);
             let mut first: Option<gtk::ToggleButton> = None;
             for (name, filter) in [
                 ("Chats", Filter::Chats),
@@ -162,7 +166,17 @@ impl Window {
                 first.get_or_insert(button);
             }
             let side = adw::ToolbarView::builder().content(&sidebar.root).build();
+            let sign_in = adw::Banner::builder()
+                .title("Nobody is signed in")
+                .button_label("Sign In")
+                .margin_bottom(6)
+                .build();
+            sign_in.connect_button_clicked({
+                let sign_in = later(Window::sign_in);
+                move |_| sign_in()
+            });
             side.add_top_bar(&side_header);
+            side.add_top_bar(&sign_in);
             side.add_top_bar(&filters);
 
             // Conversation
@@ -404,6 +418,7 @@ impl Window {
                 composer,
                 title,
                 banner,
+                sign_in,
                 toasts,
                 pages,
                 back,
@@ -769,8 +784,24 @@ impl Window {
     pub fn use_cache(self: &Rc<Self>) {
         match tern_engine::accounts().into_iter().next() {
             Some(account) => self.use_account(account),
-            None => self.tell("Nobody is signed in yet. Run “tern-cli login” in a terminal."),
+            None => self.sign_in.set_revealed(true),
         }
+    }
+
+    fn sign_in(self: &Rc<Self>) {
+        self.sign_in.set_sensitive(false);
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let outcome = service::sign_in().await;
+            let Some(window) = weak.upgrade() else { return };
+            window.sign_in.set_sensitive(true);
+            // The service tells when it has used the sign-in.
+            if let Err(error) = outcome {
+                window
+                    .toasts
+                    .add_toast(adw::Toast::new(&glib::markup_escape_text(&error)));
+            }
+        });
     }
 
     fn use_account(self: &Rc<Self>, account: String) {
@@ -849,10 +880,18 @@ impl Window {
         if let Some(account) = &status.account_id {
             self.use_account(account.clone());
         }
+        let signed_out = status.push == "signed out";
+        self.sign_in.set_title(match status.account {
+            Some(_) => "Signed out of Teams",
+            None => "Nobody is signed in",
+        });
+        let nobody = status.account.is_none() && self.state.borrow().account.is_none();
+        self.sign_in.set_revealed(signed_out || nobody);
         let text = match (status.push.as_str(), &status.problem) {
             ("connected", _) => String::new(),
+            ("signed out", Some(problem)) if status.account.is_some() => problem.clone(),
+            ("signed out", _) => String::new(),
             (_, Some(problem)) => problem.clone(),
-            ("signed out", None) => "Signed out. Run “tern-cli login” in a terminal.".into(),
             _ => "Offline. Messages are sent when the connection is back.".into(),
         };
         self.tell(&text);

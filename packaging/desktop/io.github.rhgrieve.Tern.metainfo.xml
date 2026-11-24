@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.rhgrieve.Tern</id>
+  <name>Tern</name>
+  <summary>Chats and channels from Microsoft Teams</summary>
+  <developer id="io.github.rhgrieve"><name>Harrison Grieve</name></developer>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>A native Microsoft Teams client. It keeps your status true to what you do at this computer, keeps chats for reading and searching offline, and queues messages until they can be sent.</p>
+    <p>Unofficial, and not affiliated with Microsoft. It uses the undocumented services Teams itself uses, which your organization may not allow.</p>
+  </description>
+  <launchable type="desktop-id">io.github.rhgrieve.Tern.desktop</launchable>
+  <url type="homepage">https://github.com/rhgrieve/tern</url>
+  <url type="bugtracker">https://github.com/rhgrieve/tern/issues</url>
+  <screenshots>
+    <screenshot type="default"><image>https://raw.githubusercontent.com/rhgrieve/tern/main/docs/images/window-dark.png</image></screenshot>
+  </screenshots>
+  <content_rating type="oars-1.1"><content_attribute id="social-chat">intense</content_attribute></content_rating>
+  <supports><control>pointing</control><control>keyboard</control><control>touch</control></supports>
+  <requires><display_length compare="ge">340</display_length></requires>
+</component>
