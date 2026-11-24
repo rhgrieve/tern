@@ -146,6 +146,8 @@ impl Tools {
             tools.failed.borrow_mut().push(button.clone().upcast());
         }
         list.over.add_overlay(&root);
+        // The way to the end is not behind the bar.
+        list.raise_down();
 
         let motion = gtk::EventControllerMotion::new();
         motion.connect_motion({
@@ -261,7 +263,14 @@ impl Tools {
         true
     }
 
-    fn moved(&self, list: &MessageList, x: f64, y: f64) {
+    pub fn moved(&self, list: &MessageList, x: f64, y: f64) {
+        // Pointing at the button that floats over the messages is not pointing at one.
+        if list.is_on_down(x, y) {
+            if !self.held.get() {
+                self.hide();
+            }
+            return;
+        }
         if self.held.get() {
             return;
         }

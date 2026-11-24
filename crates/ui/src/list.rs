@@ -21,6 +21,8 @@ const AT_END: f64 = 48.0;
 /// newest messages, enough to fill the window, and the others follow in portions.
 const FIRST: usize = 30;
 const PORTION: usize = 10;
+/// Further from the end than this, there is a button that leads there.
+const FAR: f64 = 240.0;
 /// Further back no message is the newest of somebody.
 const MARKED: usize = 400;
 
@@ -83,6 +85,9 @@ pub struct MessageList {
     pub items: gio::ListStore,
     /// The user is at the end and wants to stay there.
     follow: Rc<Cell<bool>>,
+    down: Down,
+    /// How many messages came while the user was not at the end.
+    missed: Rc<Cell<usize>>,
     shown: Rc<RefCell<Vec<Rc<Item>>>>,
     /// Older messages of the conversation just opened, still to be added.
     rest: Rc<RefCell<Vec<Rc<Item>>>>,
@@ -204,7 +209,27 @@ impl Default for MessageList {
                 }
             }
         });
-        MessageList {
+        let missed: Rc<Cell<usize>> = Rc::default();
+        let down = Down::new();
+        over.add_overlay(&down.revealer);
+        for changed in [true, false] {
+            let (down, missed, follow) = (down.clone(), missed.clone(), follow.clone());
+            let show = move |place: &gtk::Adjustment| {
+                let left = place.upper() - place.page_size() - place.value();
+                if left <= AT_END {
+                    missed.set(0);
+                }
+                down.show(left > FAR && !follow.get(), missed.get());
+            };
+            if changed {
+                place.connect_changed(show);
+            } else {
+                place.connect_value_changed(show);
+            }
+        }
+        let list = MessageList {
+            down,
+            missed,
             whole,
             over,
             root,
@@ -214,6 +239,92 @@ impl Default for MessageList {
             shown: Rc::default(),
             rest: Rc::default(),
             opened: Rc::default(),
+        };
+        list.down.button.connect_clicked({
+            // The list holds the button.
+            let (root, view) = (list.root.downgrade(), list.view.downgrade());
+            let follow = list.follow.clone();
+            move |_| {
+                let (Some(root), Some(view)) = (root.upgrade(), view.upgrade()) else {
+                    return;
+                };
+                follow.set(true);
+                let last = view.model().map_or(0, |model| model.n_items());
+                if let Some(last) = last.checked_sub(1) {
+                    view.scroll_to(last, gtk::ListScrollFlags::NONE, None);
+                }
+                stick(&root.vadjustment());
+            }
+        });
+        list
+    }
+}
+
+/// The button that leads back to the newest message, with how many came meanwhile.
+#[derive(Clone)]
+struct Down {
+    revealer: gtk::Revealer,
+    button: gtk::Button,
+    count: gtk::Label,
+}
+
+impl Down {
+    fn new() -> Down {
+        let count = gtk::Label::new(None);
+        count.add_css_class("count");
+        count.set_visible(false);
+        let holder = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        holder.append(&count);
+        holder.append(&gtk::Image::from_icon_name("go-down-symbolic"));
+        let button = gtk::Button::builder()
+            .child(&holder)
+            .tooltip_text("Newest message (Ctrl+End)")
+            // Whoever is writing goes on writing.
+            .focus_on_click(false)
+            .build();
+        button.add_css_class("down");
+        crate::row::say(&button, "Newest message");
+        let revealer = gtk::Revealer::builder()
+            .child(&button)
+            .transition_type(gtk::RevealerTransitionType::Crossfade)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::End)
+            .margin_bottom(10)
+            .visible(false)
+            .build();
+        // Out of the way of clicks and the keyboard while it is not shown.
+        revealer.connect_child_revealed_notify(|revealer| {
+            if !revealer.reveals_child() {
+                revealer.set_visible(false);
+            }
+        });
+        Down {
+            revealer,
+            button,
+            count,
+        }
+    }
+
+    fn show(&self, show: bool, missed: usize) {
+        let new = match missed {
+            0 => String::new(),
+            1 => "1 new".to_owned(),
+            count => format!("{count} new"),
+        };
+        if self.count.text() != new {
+            self.count.set_text(&new);
+            self.count.set_visible(missed > 0);
+            let what = match missed {
+                0 => "Newest message".to_owned(),
+                _ => format!("Newest message, {new}"),
+            };
+            crate::row::say(&self.button, &what);
+        }
+        if show {
+            self.revealer.set_visible(true);
+        }
+        if self.revealer.reveals_child() != show {
+            self.revealer.set_reveal_child(show);
         }
     }
 }
@@ -246,6 +357,8 @@ impl MessageList {
         self.opened.set(self.opened.get() + 1);
         self.rest.replace(items);
         self.follow.set(true);
+        self.missed.set(0);
+        self.down.show(false, 0);
         // In one step, so that the rows there are get used again.
         self.items.splice(0, self.items.n_items(), &boxed(&newest));
         self.shown.replace(newest);
@@ -295,6 +408,7 @@ impl MessageList {
         self.rest.borrow_mut().clear();
         let items: Vec<Rc<Item>> = items.into_iter().map(Rc::new).collect();
         self.mark(&items);
+        self.count_missed(&items);
         let (start, removed, end) = crate::model::change(&self.shown.borrow(), &items);
         let new = boxed(&items[start..end]);
         if removed > 0 || !new.is_empty() {
@@ -304,6 +418,22 @@ impl MessageList {
         // Where nothing came or went, there is nowhere to go.
         if self.follow.get() && (removed > 0 || !new.is_empty()) {
             self.to_end();
+        }
+    }
+
+    /// Messages of others that come while the user looks at earlier ones.
+    fn count_missed(&self, items: &[Rc<Item>]) {
+        let newest = self.newest();
+        let Some(newest) = newest.filter(|_| !self.follow.get()) else {
+            return;
+        };
+        if let Some(at) = items.iter().rposition(|item| item.id == newest.id) {
+            let new = items[at + 1..].iter().filter(|item| !item.own).count();
+            self.missed.set(self.missed.get() + new);
+            if new > 0 {
+                self.down
+                    .show(self.down.revealer.reveals_child(), self.missed.get());
+            }
         }
     }
 
@@ -459,6 +589,21 @@ impl MessageList {
         self.follow.set(false);
         self.view
             .scroll_to(position, gtk::ListScrollFlags::NONE, None);
+    }
+
+    /// Puts the button that leads to the end above everything else.
+    pub fn raise_down(&self) {
+        self.over.remove_overlay(&self.down.revealer);
+        self.over.add_overlay(&self.down.revealer);
+    }
+
+    /// Whether a place in `over` is on that button.
+    pub fn is_on_down(&self, x: f64, y: f64) -> bool {
+        let button = &self.down.button;
+        self.down.revealer.reveals_child()
+            && button.compute_bounds(&self.over).is_some_and(|bounds| {
+                bounds.contains_point(&gtk::graphene::Point::new(x as f32, y as f32))
+            })
     }
 
     /// Stops following the newest message, as scrolling up does.
@@ -832,5 +977,94 @@ mod tests {
                 assert!((high(700) - high(340) - smaller).abs() <= 1, "{room}");
             }
         }
+    }
+
+    /// As the composer's test: needs a display.
+    #[test]
+    #[ignore = "needs a display"]
+    fn a_button_leads_back_to_the_end() {
+        gtk::init().unwrap();
+        adw::init().unwrap();
+        crate::window::load_style();
+        let list = MessageList::default();
+        let window = gtk::Window::builder()
+            .default_width(600)
+            .default_height(500)
+            .child(&list.whole)
+            .build();
+        window.present();
+        let wait = |milliseconds: u64| {
+            let end = Instant::now() + Duration::from_millis(milliseconds);
+            while Instant::now() < end {
+                glib::MainContext::default().iteration(false);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        // Frames come when they come, without somebody who looks.
+        let until = |what: &dyn Fn() -> bool| {
+            let end = Instant::now() + Duration::from_secs(8);
+            while !what() && Instant::now() < end {
+                window.queue_draw();
+                wait(30);
+            }
+            what()
+        };
+        let items = |count: usize| -> Vec<Item> {
+            (0..count)
+                .map(|at| Item {
+                    id: at.to_string(),
+                    sender: "Ann".into(),
+                    // The user's own do not count as missed.
+                    own: at == 61,
+                    sent: true,
+                    blocks: vec![Block::Text("words".into())],
+                    ..Default::default()
+                })
+                .collect()
+        };
+        list.set(items(60));
+        wait(600);
+        while !list.is_whole() {
+            wait(50);
+        }
+        // All sixty have their place.
+        let place = list.root.vadjustment();
+        assert!(until(&|| place.upper() > 3000.0));
+        wait(300);
+        let shown = || list.down.revealer.reveals_child();
+        assert!(!shown(), "there is nowhere to go");
+        // The user scrolls up.
+        list.leave_end();
+        place.set_value(place.value() - 600.0);
+        assert!(until(&shown));
+        assert!(!list.down.count.is_visible());
+        // Nothing is in front of it, whatever is under the pointer.
+        let tools = crate::tools::Tools::attach(&list, |_, _| {});
+        let middle = list
+            .down
+            .button
+            .compute_bounds(&list.over)
+            .unwrap()
+            .center();
+        let (x, y) = (f64::from(middle.x()), f64::from(middle.y()));
+        assert!(list.is_on_down(x, y) && !list.is_on_down(x, y - 100.0));
+        tools.moved(&list, x, y - 60.0);
+        tools.moved(&list, x, y);
+        let hit = list.over.pick(x, y, gtk::PickFlags::DEFAULT).unwrap();
+        assert!(hit == list.down.button || hit.is_ancestor(&list.down.button));
+        let (at, upper) = (place.value(), place.upper());
+        list.update(items(63));
+        assert_eq!(list.down.count.text(), "2 new");
+        assert!(until(&|| place.upper() > upper));
+        assert!(shown());
+        assert_eq!(place.value(), at, "what is read stays where it is");
+        list.down.button.emit_clicked();
+        assert!(until(&|| list.at_end() && !shown()));
+        assert!(list.follows() && list.missed.get() == 0);
+        // And stays there.
+        let upper = place.upper();
+        list.update(items(64));
+        assert!(until(&|| place.upper() > upper && list.at_end()));
+        assert!(!shown() && list.missed.get() == 0);
     }
 }

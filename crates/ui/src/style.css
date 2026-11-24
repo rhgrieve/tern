@@ -29,6 +29,9 @@
 .chip { background: alpha(currentColor, 0.08); border-radius: 99px; padding: 1px 8px; font-size: 0.9em; min-height: 0; font-weight: 400; }
 .chip.mine { background: alpha(var(--accent-bg-color), 0.25); box-shadow: inset 0 0 0 1px alpha(var(--accent-bg-color), 0.6); }
 .thread { padding: 2px 8px; margin-left: -8px; min-height: 0; font-size: 0.9em; color: var(--accent-color); }
+.down { background: var(--popover-bg-color); border-radius: 99px; padding: 6px 10px; min-height: 0; box-shadow: 0 1px 6px alpha(black, 0.25), 0 0 0 1px alpha(currentColor, 0.1); font-weight: 400; }
+.down:hover { background: color-mix(in srgb, var(--popover-bg-color) 92%, currentColor); }
+.down .count { color: var(--accent-color); font-weight: 600; font-size: 0.9em; }
 .tools { background: var(--popover-bg-color); border-radius: 10px; padding: 2px; box-shadow: 0 1px 6px alpha(black, 0.25), 0 0 0 1px alpha(currentColor, 0.1); }
 .tools button { min-width: 30px; min-height: 30px; padding: 0; }
 .writing { margin: 0 22px 4px 22px; min-height: 18px; }
