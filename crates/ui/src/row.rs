@@ -8,6 +8,7 @@ use gtk4::prelude::*;
 use gtk4::subclass::prelude::*;
 use libadwaita as adw;
 
+use crate::fit::Fit;
 use crate::rich::Block;
 
 /// A message, ready to show.
@@ -141,7 +142,7 @@ mod imp {
         /// building one, and a list that scrolls does little else.
         pub parts: RefCell<Vec<super::Part>>,
         pub note: gtk::Label,
-        pub reactions: gtk::Box,
+        pub reactions: adw::WrapBox,
         pub thread: gtk::Button,
         pub mark: crate::mark::Mark,
         pub item: RefCell<Option<std::rc::Rc<Item>>>,
@@ -201,8 +202,11 @@ mod imp {
             self.note.add_css_class("caption");
             self.note.add_css_class("dim-label");
             self.note.set_xalign(0.0);
+            self.note.set_wrap(true);
+            self.note.set_wrap_mode(gtk::pango::WrapMode::WordChar);
             content.append(&self.note);
-            self.reactions.set_spacing(4);
+            self.reactions.set_child_spacing(4);
+            self.reactions.set_line_spacing(4);
             content.append(&self.reactions);
             self.thread.set_halign(gtk::Align::Start);
             self.thread.add_css_class("flat");
@@ -395,7 +399,6 @@ impl Part {
                 let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
                 let frame = gtk::Button::builder()
                     .child(&holder)
-                    .halign(gtk::Align::Start)
                     .overflow(gtk::Overflow::Hidden)
                     .action_target(&"".to_variant())
                     .action_name("win.picture")
@@ -403,16 +406,17 @@ impl Part {
                 frame.add_css_class("picture");
                 frame.set_cursor_from_name(Some("zoom-in"));
                 say(&frame, "Show the picture");
+                let missing = gtk::Label::new(Some("Picture not on this computer"));
+                missing.add_css_class("dim-label");
                 let picture = gtk::Picture::builder()
                     .content_fit(gtk::ContentFit::Contain)
                     .can_shrink(true)
+                    .vexpand(true)
                     .build();
-                let missing = gtk::Label::new(Some("Picture not on this computer"));
-                missing.add_css_class("dim-label");
                 holder.append(&picture);
                 holder.append(&missing);
                 labels.push(missing);
-                frame.upcast()
+                Fit::new(&frame).upcast()
             }
             Kind::Card => {
                 let frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -497,14 +501,15 @@ impl Part {
 }
 
 impl Part {
-    fn picture(&self) -> Option<(gtk::Button, gtk::Picture)> {
-        let frame = self.root.clone().downcast::<gtk::Button>().ok()?;
+    fn picture(&self) -> Option<(Fit, gtk::Button, gtk::Picture)> {
+        let fit = self.root.clone().downcast::<Fit>().ok()?;
+        let frame = fit.child().and_downcast::<gtk::Button>()?;
         let picture = frame.child()?.first_child().and_downcast()?;
-        Some((frame, picture))
+        Some((fit, frame, picture))
     }
 
     fn set_picture(&self, url: &str) {
-        let Some((frame, picture)) = self.picture() else {
+        let Some((fit, frame, picture)) = self.picture() else {
             return;
         };
         let missing = &self.labels[0];
@@ -515,7 +520,7 @@ impl Part {
         picture.set_visible(false);
         missing.set_visible(false);
         frame.remove_css_class("missing");
-        frame.set_size_request(240, 160);
+        fit.set_size(Some((240, 160)));
         self.load_picture(url);
     }
 
@@ -543,8 +548,12 @@ impl Part {
 
     fn look_again(&self) {
         match self.kind {
-            Kind::Picture if self.root.has_css_class("missing") => {
-                self.load_picture(&self.root.widget_name());
+            Kind::Picture => {
+                if let Some((_, frame, _)) = self.picture()
+                    && frame.has_css_class("missing")
+                {
+                    self.load_picture(&frame.widget_name());
+                }
             }
             Kind::Card => crate::cardview::look_again(&self.root),
             Kind::Preview => {
@@ -559,7 +568,7 @@ impl Part {
 
     /// Leaves everything as it is until it knows.
     fn load_picture(&self, url: &str) {
-        let Some((frame, picture)) = self.picture() else {
+        let Some((fit, frame, picture)) = self.picture() else {
             return;
         };
         let missing = self.labels[0].clone();
@@ -573,16 +582,15 @@ impl Part {
             picture.set_paintable(texture);
             match texture {
                 Some(texture) => {
-                    let (width, height) = crate::art::shown_size(
+                    fit.set_size(Some(crate::art::shown_size(
                         texture.width(),
                         texture.height(),
                         crate::art::scale(),
-                    );
-                    frame.set_size_request(width, height);
+                    )));
                     frame.remove_css_class("missing");
                 }
                 None => {
-                    frame.set_size_request(-1, -1);
+                    fit.set_size(None);
                     frame.add_css_class("missing");
                 }
             }
@@ -671,7 +679,7 @@ impl MessageRow {
         self.align_mark();
         imp.note.set_visible(item.note.is_some());
         imp.note.set_text(item.note.as_deref().unwrap_or(""));
-        clear(&imp.reactions);
+        imp.reactions.remove_all();
         imp.reactions.set_visible(!item.reactions.is_empty());
         for reaction in &item.reactions {
             let chip = gtk::Button::builder()

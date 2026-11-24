@@ -52,12 +52,17 @@ fn breakable(text: &str) -> String {
     while !rest.is_empty() {
         let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
         let (word, after) = rest.split_at(end);
-        if word.is_ascii() && word.len() > LONG_WORD {
-            for (index, letter) in word.chars().enumerate() {
-                if index > 0 && index % PIECE == 0 {
+        if word.chars().count() > LONG_WORD {
+            // Since the last place to break, or since letters with rules of their own.
+            let (mut run, mut before) = (0, None);
+            for letter in word.chars() {
+                if run >= PIECE && before.is_some_and(is_plain) && is_plain(letter) {
                     out.push(BREAK);
+                    run = 0;
                 }
                 out.push(letter);
+                run += 1;
+                before = Some(letter);
             }
         } else {
             out.push_str(word);
@@ -69,9 +74,23 @@ fn breakable(text: &str) -> String {
     out
 }
 
-/// Text of a message inside markup.
-fn shown(text: &str) -> String {
-    escape(&breakable(&text.replace(BREAK, "")))
+/// Letters and signs that stand by themselves: nothing joins them, and nothing is put on them, as
+/// in scripts that are written together and in emoji made of several.
+fn is_plain(letter: char) -> bool {
+    matches!(letter,
+        '\u{21}'..='\u{7e}'
+        | '\u{a1}'..='\u{2ff}'
+        | '\u{370}'..='\u{482}'
+        | '\u{48a}'..='\u{52f}'
+        | '\u{2010}'..='\u{2027}'
+        | '\u{2030}'..='\u{205e}'
+        | '\u{2190}'..='\u{25ff}')
+}
+
+/// Text of a message inside markup. Other clients put spaces that do not break between mentions,
+/// which makes one long word of them all.
+pub fn shown(text: &str) -> String {
+    escape(&breakable(&text.replace(BREAK, "").replace('\u{a0}', " ")))
 }
 
 /// What was selected, as it was written.
@@ -394,6 +413,26 @@ mod tests {
         // Joined emoji and other scripts keep their own rules.
         assert!(!breakable(&"👩‍👩‍👧".repeat(20)).contains(BREAK));
         assert!(!breakable(&"日本語".repeat(20)).contains(BREAK));
+        assert!(!breakable(&"مرحبا".repeat(20)).contains(BREAK));
+        assert!(!breakable(&"e\u{301}".repeat(40)).contains(BREAK));
+        // One odd letter does not keep the others together.
+        for long in [
+            "─".repeat(93),
+            format!("{url}…"),
+            format!("é{url}"),
+            format!("{url}👩‍👩‍👧{url}"),
+            "Ünïcödé".repeat(9),
+        ] {
+            let broken = breakable(&long);
+            let longest = broken.split(BREAK).map(|piece| piece.chars().count()).max();
+            assert!(longest.is_some_and(|longest| longest <= 24), "{broken}");
+            assert_eq!(as_written(&broken), long);
+        }
+        // Mentions in a row, as other clients write them.
+        let [Block::Text(markup)] = &of("<p>@Ann&nbsp;@Bo&nbsp;@Cy</p>")[..] else {
+            panic!()
+        };
+        assert_eq!(markup, "@Ann @Bo @Cy");
     }
 
     #[test]

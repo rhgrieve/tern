@@ -231,7 +231,7 @@ pub fn items(
             &draft.markdown,
         ))));
         for file in &draft.files {
-            blocks.push(Block::Text(format!("📎 {}", rich::escape(&file.name))));
+            blocks.push(Block::Text(format!("📎 {}", rich::shown(&file.name))));
         }
         let sending = waiting.state == OutboxState::Sending;
         // The service has it already, and the outbox is about to know.
@@ -467,7 +467,7 @@ fn content(message: &MessageRecord) -> Vec<Block> {
         let text = teams_core::readable_text(message);
         return vec![Block::Text(format!(
             "<small>{}</small>",
-            rich::escape(&text)
+            rich::shown(&text)
         ))];
     }
     let mut blocks = Vec::new();
@@ -476,7 +476,7 @@ fn content(message: &MessageRecord) -> Vec<Block> {
         .as_deref()
         .filter(|subject| !subject.trim().is_empty())
     {
-        blocks.push(Block::Heading(rich::escape(&one_line(subject))));
+        blocks.push(Block::Heading(rich::shown(&one_line(subject))));
     }
     blocks.extend(rich::blocks(&linked_message_spans(message)));
     for attachment in teams_core::attachments(message) {
@@ -487,7 +487,7 @@ fn content(message: &MessageRecord) -> Vec<Block> {
         if let Some(card) = card {
             blocks.push(Block::Card(Box::new(card)));
         } else if let Some(text) = attachment.card_text() {
-            blocks.push(Block::Quote(vec![Block::Text(rich::escape(text.trim()))]));
+            blocks.push(Block::Quote(vec![Block::Text(rich::shown(text.trim()))]));
         }
     }
     if let Some(preview) = teams_core::link_preview(message).filter(|it| rich::may_open(&it.url)) {
@@ -507,7 +507,7 @@ fn content(message: &MessageRecord) -> Vec<Block> {
         })));
     }
     for file in files(message) {
-        let name = rich::escape(&one_line(&file.name));
+        let name = rich::shown(&one_line(&file.name));
         // Opens in the browser; the daemon's copy is behind `tern-cli get`.
         blocks.push(Block::Text(if rich::may_open(&file.open_url) {
             format!("📎 <a href=\"{}\">{name}</a>", rich::escape(&file.open_url))

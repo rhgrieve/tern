@@ -20,6 +20,8 @@
 - The chat that is selected opens again from the list of a narrow window.
 - Long text stayed shifted up in the message box, with an empty strip below.
 - A chat moved by a few pixels when a message was read.
+- One long word or a row of mentions made a whole chat wider than its window. Pictures and reactions
+  fit narrow windows, too.
 - "Sending…" no longer flashes by and moves the chat.
 - The time stands on the line of the name, and messages no longer show a text cursor.
 

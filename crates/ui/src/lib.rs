@@ -9,6 +9,7 @@ pub mod demo;
 pub mod desk;
 pub mod drafts;
 pub mod emoji;
+pub mod fit;
 pub mod history;
 pub mod list;
 pub mod mark;

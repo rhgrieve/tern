@@ -637,9 +637,25 @@ mod tests {
                 child = widget.next_sibling();
             }
         }
+        // Once the new row has its place.
         let mut found = Vec::new();
-        chips(&root, &mut found);
+        let end = Instant::now() + Duration::from_secs(8);
+        while (found.len() < 4 || found.iter().any(|chip: &gtk::Button| chip.width() < 20))
+            && Instant::now() < end
+        {
+            window.queue_draw();
+            wait(60);
+            found.clear();
+            chips(&root, &mut found);
+        }
         for chip in &found {
+            // Nothing is in the way of a click on it.
+            let place = chip.compute_bounds(&list.over).unwrap().center();
+            let (x, y) = (f64::from(place.x()), f64::from(place.y()));
+            if y > 0.0 && y < f64::from(list.over.height()) {
+                let hit = list.over.pick(x, y, gtk::PickFlags::DEFAULT).unwrap();
+                assert!(hit == *chip || hit.is_ancestor(chip), "{hit:?}");
+            }
             chip.emit_clicked();
         }
         assert_eq!(*opened.borrow(), [url("a"), url("b")]);
@@ -722,5 +738,99 @@ mod tests {
         list.update(items(Progress::Delivered, 3));
         wait(400);
         assert_eq!(distance(&place), 0.0, "new messages are seen whole");
+    }
+
+    /// As the composer's test: needs a display.
+    #[test]
+    #[ignore = "needs a display"]
+    fn no_message_is_wider_than_the_narrowest_window() {
+        gtk::init().unwrap();
+        adw::init().unwrap();
+        crate::window::load_style();
+        let folder = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::demo::store());
+        crate::art::set_source(store, Some(folder.path().to_owned()), 1);
+        let url = "https://us-api.asm.skype.com/v1/objects/w/views/imgo";
+        let files = store::ImageFileCache::open(folder.path(), 1 << 30).unwrap();
+        let picture =
+            gtk::gdk_pixbuf::Pixbuf::new(gtk::gdk_pixbuf::Colorspace::Rgb, false, 8, 1600, 700)
+                .unwrap();
+        files
+            .put(url, &picture.save_to_bufferv("png", &[]).unwrap(), "png")
+            .unwrap();
+        let text = |text: &str| Block::Text(crate::rich::shown(text));
+        let long = "https://example.com/".to_owned() + &"a-very-long-name_".repeat(9) + "…";
+        let blocks = [
+            text(&long),
+            text(&"─".repeat(93)),
+            text(&["@Somebody"; 12].join("\u{a0}")),
+            Block::Picture(url.into()),
+            Block::Quote(vec![text(&long), Block::Picture(url.into())]),
+            Block::Code {
+                language: None,
+                text: long.clone(),
+            },
+            Block::Table {
+                header: true,
+                rows: vec![vec![long.clone(); 6]],
+            },
+            Block::Preview(Box::new(crate::rich::Preview {
+                url: long.clone(),
+                title: long.clone(),
+                description: long.clone(),
+                site: "example.com".into(),
+                picture: Some(url.into()),
+            })),
+        ];
+        let row = MessageRow::default();
+        for block in blocks {
+            row.bind(&Rc::new(Item {
+                id: "1".into(),
+                sender: long.clone(),
+                own: true,
+                note: Some(format!("Not sent: {long}")),
+                blocks: vec![block.clone()],
+                reactions: (0..30)
+                    .map(|at| crate::row::Reaction {
+                        emoji: format!("{at}"),
+                        count: 1,
+                        ..Default::default()
+                    })
+                    .collect(),
+                progress: Some(Progress::Delivered),
+                ..Default::default()
+            }));
+            let end = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < end {
+                glib::MainContext::default().iteration(false);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let least = row.measure(gtk::Orientation::Horizontal, -1).0;
+            assert!(least <= 340, "{least}: {block:?}");
+            if block == Block::Picture(url.into()) {
+                // In its shape, with all the room and with little.
+                // 420 wide at first, and then what a window of 340 leaves.
+                let room = 340 - (least - 120);
+                let smaller = 184 - (room * 700 + 800) / 1600;
+                // The note and the reactions take more lines instead.
+                let (low, natural, _, _) = row.measure(gtk::Orientation::Vertical, 340);
+                assert_eq!(low, natural);
+                let bare = |item: &Item| {
+                    let mut item = Item::clone(item);
+                    (item.note, item.reactions) = (None, Vec::new());
+                    item
+                };
+                let item = row.item().unwrap();
+                row.bind(&Rc::new(bare(&item)));
+                let end = Instant::now() + Duration::from_millis(250);
+                while Instant::now() < end {
+                    glib::MainContext::default().iteration(false);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                let high = |wide| row.measure(gtk::Orientation::Vertical, wide).0;
+                // But for rounding.
+                assert!((high(700) - high(340) - smaller).abs() <= 1, "{room}");
+            }
+        }
     }
 }
