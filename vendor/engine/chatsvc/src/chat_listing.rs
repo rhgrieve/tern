@@ -15,6 +15,9 @@ pub struct ConversationPage {
     pub next_url: Option<String>,
 }
 
+/// Empty pages followed in a row before giving up for now.
+const MAX_EMPTY_PAGES: usize = 30;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MessagePage {
     pub messages: Vec<Value>,
@@ -122,20 +125,34 @@ impl<T: MessageTransport> ChatListing<T> {
         let url = format!(
             "{base}/epochTimeStamp/{anchor_ms}?pageSize={page_size}&direction=BACKWARD&includeMetadata=true&locationType=Primary"
         );
-        let body = self.get(&url).await?;
-        let messages: Vec<Value> = body
-            .get("messages")
-            .and_then(Value::as_array)
-            .cloned()
-            .ok_or_else(|| Error::UnexpectedAnswer("no messages list".into()))?
-            .into_iter()
-            .filter(|message| before_ms.is_none_or(|before| arrival_ms(message) < Some(before)))
-            .collect();
-        let has_older = body
-            .pointer("/_metadata/backwardLink")
-            .and_then(Value::as_str)
-            .is_some_and(|link| !link.is_empty())
-            && !messages.is_empty();
+        // Tern patch: the service pages by stretches of time. A stretch without messages answers
+        // an empty page that still links to the one before it, so only a missing link is the end.
+        let mut url = url;
+        let mut messages: Vec<Value>;
+        let mut older: Option<String>;
+        let mut hops = 0;
+        loop {
+            let body = self.get(&url).await?;
+            messages = body
+                .get("messages")
+                .and_then(Value::as_array)
+                .cloned()
+                .ok_or_else(|| Error::UnexpectedAnswer("no messages list".into()))?
+                .into_iter()
+                .filter(|message| before_ms.is_none_or(|before| arrival_ms(message) < Some(before)))
+                .collect();
+            older = body
+                .pointer("/_metadata/backwardLink")
+                .and_then(Value::as_str)
+                .filter(|link| !link.is_empty() && **link != *url)
+                .map(str::to_owned);
+            hops += 1;
+            match &older {
+                Some(link) if messages.is_empty() && hops < MAX_EMPTY_PAGES => url = link.clone(),
+                _ => break,
+            }
+        }
+        let has_older = older.is_some();
         let oldest_arrival_ms = messages.iter().filter_map(arrival_ms).min();
         Ok(MessagePage {
             messages,
@@ -212,6 +229,47 @@ mod tests {
             transport.requests.lock().unwrap()[0],
             "https://teams.cloud.microsoft/api/chatsvc/emea/v1/users/ME/conversations?view=msnp24Equivalent&pageSize=50"
         );
+    }
+
+    #[tokio::test]
+    async fn an_empty_stretch_is_not_the_end() {
+        let empty = |link: &str| json!({"messages": [], "_metadata": {"backwardLink": link}});
+        let transport = canned(vec![
+            empty("https://a"),
+            empty("https://b"),
+            json!({"messages": [{"id": "5"}], "_metadata": {"backwardLink": "https://c"}}),
+        ]);
+        let listing = ChatListing::with_transport(&transport, "emea");
+        let page = listing.messages("19:a@thread.v2", Some(1000), 20).await.unwrap();
+        assert_eq!((page.messages.len(), page.has_older), (1, true));
+        assert_eq!(transport.requests.lock().unwrap()[1..], ["https://a", "https://b"]);
+    }
+
+    #[tokio::test]
+    async fn only_a_missing_link_is_the_end() {
+        let transport = canned(vec![json!({"messages": [], "_metadata": {}})]);
+        let listing = ChatListing::with_transport(&transport, "emea");
+        let page = listing.messages("19:a@thread.v2", Some(1000), 20).await.unwrap();
+        assert!(page.messages.is_empty() && !page.has_older);
+    }
+
+    #[tokio::test]
+    async fn endless_empty_pages_stop() {
+        let answers = (0..100)
+            .map(|number| json!({"messages": [], "_metadata": {"backwardLink": format!("https://{number}")}}))
+            .collect();
+        let transport = canned(answers);
+        let listing = ChatListing::with_transport(&transport, "emea");
+        let page = listing.messages("19:a@thread.v2", Some(1000), 20).await.unwrap();
+        assert!(page.has_older, "there may be more");
+        assert_eq!(transport.requests.lock().unwrap().len(), MAX_EMPTY_PAGES);
+        // A link to itself goes nowhere.
+        let transport = canned(vec![
+            json!({"messages": [], "_metadata": {"backwardLink": "https://x"}}),
+            json!({"messages": [], "_metadata": {"backwardLink": "https://x"}}),
+        ]);
+        let listing = ChatListing::with_transport(&transport, "emea");
+        assert!(!listing.messages("19:a@thread.v2", Some(1000), 20).await.unwrap().has_older);
     }
 
     #[tokio::test]

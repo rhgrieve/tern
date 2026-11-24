@@ -7,11 +7,13 @@ use chatsvc::realtime::MessageEvent;
 use chrono::{DateTime, Utc};
 use session::Session;
 use store::{MessageRecord, Store};
+use teams_core::CoreEvent;
 use tern_engine::{
-    Arrived, FILE_BYTES, Files, Job, Notice, Outbox, Queued, Rules, Sync, SyncState, Teams, Want,
-    database_path, media_usage, open_store, people, pictures, prefetch,
+    Arrived, Draft, FILE_BYTES, Files, Job, Notice, Outbox, Queued, Rules, Sync, SyncState, Teams,
+    Want, database_path, media_usage, open_store, people, pictures, prefetch,
 };
-use tokio::sync::{mpsc, watch};
+use tern_ipc::Event;
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 
 pub enum News {
@@ -96,6 +98,30 @@ async fn want_recent(
     }
 }
 
+/// Passes on what the engine changed in the cache.
+async fn tell(mut core: broadcast::Receiver<CoreEvent>, changes: broadcast::Sender<Event>) {
+    loop {
+        let event = match core.recv().await {
+            Ok(CoreEvent::SidebarChanged) => Event::Chats,
+            Ok(
+                CoreEvent::MessagesChanged { conversation_id }
+                | CoreEvent::MessagesStoredLate {
+                    conversation_id, ..
+                },
+            ) => Event::Messages {
+                conversation: conversation_id,
+            },
+            Ok(CoreEvent::ImagesChanged { .. }) => Event::Pictures,
+            Ok(CoreEvent::AvatarsChanged { .. }) => Event::Faces,
+            Ok(_) => continue,
+            // Some were missed; the list says which conversations moved.
+            Err(broadcast::error::RecvError::Lagged(_)) => Event::Chats,
+            Err(broadcast::error::RecvError::Closed) => return,
+        };
+        let _ = changes.send(event);
+    }
+}
+
 /// The region of the last connection, so a start without a network can queue messages.
 const META_REGION: &str = "tern.region";
 
@@ -114,6 +140,7 @@ impl Messages {
         account: &str,
         session: Session,
         news: mpsc::UnboundedSender<News>,
+        changes: broadcast::Sender<Event>,
     ) -> Result<Self, String> {
         let path = database_path(account).map_err(|error| error.to_string())?;
         let store = Arc::new(open_store(&path)?);
@@ -122,6 +149,7 @@ impl Messages {
             Files::open(&media.join("files"), FILE_BYTES).map_err(|error| error.to_string())?;
         let teams = Teams::with_pictures(session, store.clone(), &media.join("pictures"))?;
         let (want, wanted) = mpsc::unbounded_channel();
+        let core = teams.engine().subscribe();
         let (jobs, job_queue) = mpsc::unbounded_channel();
         let (arrived, mut arrivals) = mpsc::unbounded_channel();
         let (sync, state) = Sync::new(teams.clone(), job_queue, arrived);
@@ -129,6 +157,7 @@ impl Messages {
         let sent = news.clone();
         let tasks = vec![
             tokio::spawn(prefetch(teams.clone(), wanted)),
+            tokio::spawn(tell(core, changes)),
             tokio::spawn(want_recent(state.clone(), store.clone(), want.clone())),
             tokio::spawn(sync.run()),
             tokio::spawn(async move {
@@ -172,8 +201,23 @@ impl Messages {
         self.outbox.wake();
     }
 
-    pub fn send(&self, conversation: &str, text: &str) -> Result<(), String> {
-        self.outbox.add(conversation, text)
+    pub fn teams(&self) -> Arc<Teams> {
+        self.teams.clone()
+    }
+
+    pub fn send(&self, conversation: &str, draft: &Draft) -> Result<(), String> {
+        self.outbox.add(conversation, draft)
+    }
+
+    /// Marks a conversation read in Teams, which its members can see.
+    pub fn mark_read(&self, conversation: String) {
+        let teams = self.teams.clone();
+        tokio::spawn(async move {
+            if let Err(error) = teams.engine().mark_read(&conversation).await {
+                let failure = tern_engine::Failure::from(error);
+                tracing::debug!(error = failure.text(), "mark read");
+            }
+        });
     }
 
     pub fn state(&self) -> SyncState {

@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use store::{MessageRecord, OutboxRecord, OutboxState, OutboxTarget, Store, plain_text};
-use teams_core::markdown_to_html;
+use store::{MessageRecord, OutboxRecord, OutboxState, OutboxTarget, Store};
+use teams_core::{markdown_to_html, readable_text};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
@@ -21,12 +21,38 @@ const CLOCK_SLACK: chrono::Duration = chrono::Duration::seconds(10);
 const META_SENT: &str = "tern.outbox.sent";
 const REMEMBERED: usize = 100;
 
+/// A message to send.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Draft {
+    pub markdown: String,
+    /// Quotes this message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+    /// Answers in the thread of this post.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
+    /// Starts a new post in a channel.
+    #[serde(default)]
+    pub post: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+}
+
+impl Draft {
+    pub fn text(markdown: &str) -> Draft {
+        Draft {
+            markdown: markdown.to_owned(),
+            ..Default::default()
+        }
+    }
+}
+
 pub trait Post: Send + Sync + 'static {
     /// Sends and answers the message id.
     fn post(
         &self,
         conversation: &str,
-        markdown: &str,
+        draft: &Draft,
         client_id: &str,
     ) -> impl Future<Output = Result<String, Failure>> + Send;
     /// The user's own messages, read fresh.
@@ -39,7 +65,8 @@ pub trait Post: Send + Sync + 'static {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Payload {
-    markdown: String,
+    #[serde(flatten)]
+    draft: Draft,
     /// A try was started; whether it reached the service is unknown.
     tried: bool,
 }
@@ -86,16 +113,20 @@ impl<P: Post> Outbox<P> {
     }
 
     /// Stores the message; it is sent in the background, now or when there is a connection.
-    pub fn add(&self, conversation: &str, markdown: &str) -> Result<(), String> {
-        if markdown.trim().is_empty() {
+    pub fn add(&self, conversation: &str, draft: &Draft) -> Result<(), String> {
+        if draft.markdown.trim().is_empty() {
             return Err("the message is empty".into());
         }
         let record = OutboxRecord {
             id: chatsvc::new_client_message_id(),
             conversation_id: conversation.to_owned(),
-            target: OutboxTarget::Flat,
-            thread_root_id: None,
-            payload: payload(markdown, false),
+            target: match (&draft.thread, draft.post) {
+                (Some(_), _) => OutboxTarget::Thread,
+                (None, true) => OutboxTarget::Post,
+                (None, false) => OutboxTarget::Flat,
+            },
+            thread_root_id: draft.thread.clone(),
+            payload: payload(draft, false),
             images: Vec::new(),
             state: OutboxState::Sending,
             last_error: None,
@@ -185,20 +216,20 @@ impl<P: Post> Outbox<P> {
             .map_err(|_| Failure::Permanent("the saved message is unreadable".into()))?;
         let disk = |error: store::Error| Failure::Temporary(error.to_string());
         if stored.tried {
-            if let Some(message) = self.already_sent(record, &stored.markdown).await? {
+            if let Some(message) = self.already_sent(record, &stored.draft).await? {
                 self.remember(&message);
                 return self.store.delete_outbox(&record.id).map_err(disk);
             }
         } else {
             let tried = OutboxRecord {
-                payload: payload(&stored.markdown, true),
+                payload: payload(&stored.draft, true),
                 ..record.clone()
             };
             self.store.put_outbox(&tried).map_err(disk)?;
         }
         let message = self
             .post
-            .post(&record.conversation_id, &stored.markdown, &record.id)
+            .post(&record.conversation_id, &stored.draft, &record.id)
             .await?;
         self.remember(&message);
         self.store.delete_outbox(&record.id).map_err(disk)
@@ -209,9 +240,13 @@ impl<P: Post> Outbox<P> {
     async fn already_sent(
         &self,
         record: &OutboxRecord,
-        markdown: &str,
+        draft: &Draft,
     ) -> Result<Option<String>, Failure> {
-        let wanted = comparable(&plain_text(&markdown_to_html(markdown)));
+        // Without quotes, which the service adds to a reply.
+        let wanted = comparable(&readable_text(&MessageRecord {
+            body_html: markdown_to_html(&draft.markdown),
+            ..Default::default()
+        }));
         let sent = self.sent();
         let own = self
             .post
@@ -221,7 +256,8 @@ impl<P: Post> Outbox<P> {
             .into_iter()
             .find(|message| {
                 !sent.contains(&message.message_id)
-                    && comparable(&plain_text(&message.body_html)) == wanted
+                    && message.reply_to_id == draft.thread
+                    && comparable(&readable_text(message)) == wanted
             })
             .map(|message| message.message_id))
     }
@@ -246,8 +282,12 @@ impl<P: Post> Outbox<P> {
     }
 }
 
-fn payload(markdown: &str, tried: bool) -> String {
-    serde_json::json!({"markdown": markdown, "tried": tried}).to_string()
+fn payload(draft: &Draft, tried: bool) -> String {
+    let payload = Payload {
+        draft: draft.clone(),
+        tried,
+    };
+    serde_json::to_string(&payload).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -271,13 +311,14 @@ mod tests {
         /// conversation, text, client id
         got: Mutex<Vec<(String, String, String)>>,
         tries: Mutex<Vec<String>>,
+        quoting: std::sync::atomic::AtomicBool,
     }
 
     impl Post for Service {
         async fn post(
             &self,
             conversation: &str,
-            markdown: &str,
+            draft: &Draft,
             id: &str,
         ) -> Result<String, Failure> {
             self.tries.lock().unwrap().push(id.to_owned());
@@ -290,10 +331,11 @@ mod tests {
                 }
             };
             if matches!(next, Next::Works | Next::AnswerLost) {
-                self.got
-                    .lock()
-                    .unwrap()
-                    .push((conversation.into(), markdown.into(), id.into()));
+                self.got.lock().unwrap().push((
+                    conversation.into(),
+                    draft.markdown.clone(),
+                    id.into(),
+                ));
             }
             match next {
                 Next::Works => Ok(format!("id-{}", self.got.lock().unwrap().len())),
@@ -314,7 +356,11 @@ mod tests {
                 .filter(|(_, (id, _, _))| id == conversation)
                 .map(|(index, (_, text, _))| MessageRecord {
                     message_id: format!("id-{}", index + 1),
-                    body_html: markdown_to_html(text),
+                    body_html: if self.quoting.load(std::sync::atomic::Ordering::SeqCst) {
+                        format!("<blockquote itemtype=\"http://schema.skype.com/Reply\" itemscope itemid=\"1\"><p>quoted</p></blockquote>{}", markdown_to_html(text))
+                    } else {
+                        markdown_to_html(text)
+                    },
                     ..Default::default()
                 })
                 .collect())
@@ -353,7 +399,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_lost_answer_does_not_send_twice() {
         let (outbox, service, reports) = outbox(&[Next::AnswerLost]);
-        outbox.add("c", "Hello **you**").unwrap();
+        outbox.add("c", &Draft::text("Hello **you**")).unwrap();
         run(&outbox, &reports, 60).await;
         assert_eq!(texts(&service), ["Hello **you**"]);
         assert_eq!(outbox.waiting(), 0);
@@ -362,13 +408,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_same_text_twice_is_two_messages() {
         let (outbox, service, reports) = outbox(&[Next::Works, Next::AnswerLost]);
-        outbox.add("c", "ok").unwrap();
+        outbox.add("c", &Draft::text("ok")).unwrap();
         tokio::time::sleep(Duration::from_millis(5)).await;
-        outbox.add("c", "ok").unwrap();
+        outbox.add("c", &Draft::text("ok")).unwrap();
         run(&outbox, &reports, 60).await;
         assert_eq!(texts(&service).len(), 2);
         // And when the second never reached the service, the first does not stand in for it.
-        outbox.add("c", "ok").unwrap();
+        outbox.add("c", &Draft::text("ok")).unwrap();
         *service.plan.lock().unwrap() = vec![Next::Offline];
         run(&outbox, &reports, 60).await;
         assert_eq!(texts(&service).len(), 3);
@@ -377,7 +423,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn every_try_has_the_same_id() {
         let (outbox, service, reports) = outbox(&[Next::Offline, Next::Offline]);
-        outbox.add("c", "x").unwrap();
+        outbox.add("c", &Draft::text("x")).unwrap();
         run(&outbox, &reports, 60).await;
         let tries = service.tries.lock().unwrap();
         assert_eq!(tries.len(), 3);
@@ -388,7 +434,7 @@ mod tests {
     async fn order_holds_within_a_conversation_but_not_across() {
         let (outbox, service, reports) = outbox(&[Next::Offline]);
         for (conversation, text) in [("a", "a1"), ("a", "a2"), ("b", "b1")] {
-            outbox.add(conversation, text).unwrap();
+            outbox.add(conversation, &Draft::text(text)).unwrap();
             std::thread::sleep(Duration::from_millis(3));
         }
         run(&outbox, &reports, 60).await;
@@ -398,7 +444,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_kill_during_a_send_is_settled_after_the_restart() {
         let (outbox, service, reports) = outbox(&[Next::AnswerLost]);
-        outbox.add("c", "x").unwrap();
+        outbox.add("c", &Draft::text("x")).unwrap();
         // Killed right after the first try.
         run(&outbox, &reports, 1).await;
         assert_eq!(outbox.waiting(), 1);
@@ -410,14 +456,35 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_refusal_is_reported_and_does_not_block() {
         let (outbox, service, reports) = outbox(&[Next::Forbidden]);
-        outbox.add("c", "x").unwrap();
+        outbox.add("c", &Draft::text("x")).unwrap();
         std::thread::sleep(Duration::from_millis(3));
-        outbox.add("c", "y").unwrap();
+        outbox.add("c", &Draft::text("y")).unwrap();
         run(&outbox, &reports, 5).await;
         assert_eq!(texts(&service), ["y"]);
         assert!(
             matches!(&reports.lock().unwrap()[0], Queued::Failed { reason, .. } if reason == "HTTP 403")
         );
-        assert!(outbox.add("c", "  ").is_err());
+        assert!(outbox.add("c", &Draft::text("  ")).is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_is_recognised_in_spite_of_its_quote() {
+        let (outbox, service, reports) = outbox(&[Next::AnswerLost]);
+        let reply = Draft {
+            reply_to: Some("m1".into()),
+            ..Draft::text("agreed")
+        };
+        outbox.add("c", &reply).unwrap();
+        service
+            .quoting
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        run(&outbox, &reports, 60).await;
+        assert_eq!(texts(&service).len(), 1);
+    }
+
+    #[test]
+    fn older_payloads_are_still_read() {
+        let old: Payload = serde_json::from_str(r#"{"markdown":"x","tried":true}"#).unwrap();
+        assert_eq!((old.draft, old.tried), (Draft::text("x"), true));
     }
 }

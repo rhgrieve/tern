@@ -16,6 +16,15 @@ struct Entry {
     last_used: SystemTime,
 }
 
+/// Tern patch: the cached file of `key`, for readers beside the daemon. Touches nothing.
+pub fn find_image_file(directory: &Path, key: &str) -> Option<PathBuf> {
+    let stem = file_stem(key);
+    ["jpg", "png", "gif", "webp", "bmp", "bin"]
+        .iter()
+        .map(|extension| directory.join(format!("{stem}.{extension}")))
+        .find(|path| path.exists())
+}
+
 /// Image files in one directory, evicted least recently used first once the total exceeds the cap.
 pub struct ImageFileCache {
     directory: PathBuf,

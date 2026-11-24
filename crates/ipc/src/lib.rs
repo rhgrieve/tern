@@ -17,6 +17,12 @@ pub enum Request {
     Status,
     /// The stored sign-in changed.
     Reload,
+    /// Follow changes: answered with one `Event` per line until the connection ends.
+    Watch,
+    /// The user has seen a conversation.
+    MarkRead {
+        conversation: String,
+    },
     /// Downloads a file of a message, or finds its copy; answers the path.
     File {
         conversation: String,
@@ -27,12 +33,62 @@ pub enum Request {
     Send {
         conversation: String,
         text: String,
+        #[serde(default)]
+        reply_to: Option<String>,
+        #[serde(default)]
+        thread: Option<String>,
+        #[serde(default)]
+        post: bool,
+        #[serde(default)]
+        subject: Option<String>,
     },
+    React {
+        conversation: String,
+        message: String,
+        emoji: String,
+        on: bool,
+    },
+    Edit {
+        conversation: String,
+        message: String,
+        text: String,
+    },
+    Delete {
+        conversation: String,
+        message: String,
+    },
+    /// A conversation, or one post of a channel, is being opened: read what is new.
+    Look {
+        conversation: String,
+        post: Option<String>,
+    },
+    /// Read older messages than the cache has.
+    Older {
+        conversation: String,
+    },
+}
+
+/// What changed. Only names things: the content is in the cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum Event {
+    /// Sent first, and whenever the connection or account changes.
+    Status {
+        status: Box<Status>,
+    },
+    Chats,
+    Messages {
+        conversation: String,
+    },
+    Pictures,
+    Faces,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
     pub account: Option<String>,
+    /// Names the cache of the account.
+    pub account_id: Option<String>,
     /// What this computer says: active, idle, locked, sleeping or in_call.
     pub state: String,
     pub state_for_secs: u64,
@@ -135,6 +191,24 @@ pub async fn respond(stream: &mut UnixStream, response: &Response) -> io::Result
 
 pub async fn ask(request: &Request) -> io::Result<Response> {
     ask_within(request, TIMEOUT).await
+}
+
+/// Follows changes until the daemon goes away.
+pub async fn watch(mut on: impl FnMut(Event)) -> io::Result<()> {
+    let mut stream = UnixStream::connect(socket_path()?).await?;
+    send(&mut stream, &Request::Watch).await?;
+    let mut lines = BufReader::new(stream).lines();
+    while let Some(line) = lines.next_line().await? {
+        // An event a newer daemon added is not for us.
+        if let Ok(event) = serde_json::from_str(&line) {
+            on(event);
+        }
+    }
+    Ok(())
+}
+
+pub async fn send_event(stream: &mut UnixStream, event: &Event) -> io::Result<()> {
+    tokio::time::timeout(TIMEOUT, send(stream, event)).await?
 }
 
 /// For requests that take long, like downloads.

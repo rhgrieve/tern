@@ -233,10 +233,30 @@ impl crate::outbox::Post for Teams {
     async fn post(
         &self,
         conversation: &str,
-        markdown: &str,
+        draft: &crate::outbox::Draft,
         client_id: &str,
     ) -> Result<String, Failure> {
-        let send = self.engine.send_message(conversation, markdown, None);
+        let text = draft.markdown.as_str();
+        let send = async {
+            match (&draft.reply_to, &draft.thread, draft.post) {
+                (Some(quoted), _, _) => self.engine.reply_to(conversation, quoted, text).await,
+                (None, Some(root), _) => {
+                    self.engine
+                        .send_message(conversation, text, Some(root))
+                        .await
+                }
+                (None, None, true) => {
+                    let subject = draft
+                        .subject
+                        .as_deref()
+                        .filter(|subject| !subject.trim().is_empty());
+                    self.engine
+                        .post_to_channel(conversation, text, subject)
+                        .await
+                }
+                (None, None, false) => self.engine.send_message(conversation, text, None).await,
+            }
+        };
         Ok(with_client_message_id(client_id.to_owned(), send)
             .await?
             .message_id)
@@ -262,6 +282,45 @@ impl crate::outbox::Post for Teams {
                     && message.sender_id == me
             })
             .collect())
+    }
+}
+
+/// What the user does to a message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Act {
+    React { emoji: String, on: bool },
+    Edit { markdown: String },
+    Delete,
+}
+
+impl Teams {
+    pub async fn act(&self, conversation: &str, message: &str, act: &Act) -> Result<(), Failure> {
+        let engine = &self.engine;
+        match act {
+            Act::React { emoji, on: true } => {
+                engine.set_reaction(conversation, message, emoji).await?
+            }
+            Act::React { emoji, on: false } => {
+                engine.unset_reaction(conversation, message, emoji).await?
+            }
+            Act::Edit { markdown } => engine.edit_message(conversation, message, markdown).await?,
+            Act::Delete => engine.soft_delete_message(conversation, message).await?,
+        }
+        Ok(())
+    }
+
+    /// Reads what is new, for a conversation that is being opened.
+    pub async fn look(&self, conversation: &str, post: Option<&str>) -> Result<(), Failure> {
+        match post {
+            Some(post) => drop(self.engine.open_post(conversation, post).await?),
+            None => drop(self.engine.fetch_newer(conversation).await?),
+        }
+        Ok(())
+    }
+
+    /// Reads older messages; answers whether any came.
+    pub async fn back(&self, conversation: &str) -> Result<bool, Failure> {
+        Ok(!self.engine.load_older(conversation).await?.is_empty())
     }
 }
 
@@ -360,6 +419,14 @@ mod tests {
             json!({"requests": [{"method": "GET"}, {"method": "POST"}]})
         )));
         assert!(!allows(&post(batch, json!({}))));
+    }
+
+    #[test]
+    fn the_offered_reactions_are_known_to_teams() {
+        for emoji in ["👍", "❤️", "❤", "😆", "😮", "🙁", "😠"] {
+            assert!(chatsvc::reaction_key(emoji).is_some(), "{emoji}");
+            assert!(!chatsvc::reaction_keys(emoji).is_empty(), "{emoji}");
+        }
     }
 
     #[test]

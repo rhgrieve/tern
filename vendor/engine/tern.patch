@@ -1,6 +1,6 @@
-diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/error.rs vendor/engine/session/src/error.rs
---- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/error.rs	2026-11-24 07:04:16.830396462 -0500
-+++ vendor/engine/session/src/error.rs	2026-11-24 07:54:14.849353466 -0500
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/error.rs vendor/engine/session/src/error.rs
+--- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/error.rs	2026-11-24 10:17:31.905420653 -0500
++++ vendor/engine/session/src/error.rs	2026-11-24 08:31:04.035082568 -0500
 @@ -21,6 +21,12 @@
      },
      #[error("browser protocol error: {0}")]
@@ -14,9 +14,9 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
      #[error("tab connection lost during a write ({0}); check whether it was sent before retrying")]
      WriteInterrupted(String),
  }
-diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/lib.rs vendor/engine/session/src/lib.rs
---- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/lib.rs	2026-11-24 07:04:16.830396462 -0500
-+++ vendor/engine/session/src/lib.rs	2026-11-24 08:19:08.071257402 -0500
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/lib.rs vendor/engine/session/src/lib.rs
+--- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/lib.rs	2026-11-24 10:17:31.905420653 -0500
++++ vendor/engine/session/src/lib.rs	2026-11-24 08:31:04.035082568 -0500
 @@ -4,9 +4,11 @@
  mod http;
  mod native;
@@ -41,8 +41,8 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
  pub use session::{DEFAULT_ENDPOINT, Session, SessionConfig, TabHold};
 +pub use skype::skype_token_allowed;
  pub use transport::{BoxFuture, CdpTransport, Diagnosis, OpenedTab, Transport};
-diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/native.rs vendor/engine/session/src/native.rs
---- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/native.rs	2026-11-24 07:04:16.830396462 -0500
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/native.rs vendor/engine/session/src/native.rs
+--- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/native.rs	2026-11-24 10:17:31.905420653 -0500
 +++ vendor/engine/session/src/native.rs	2026-11-24 07:48:40.743375454 -0500
 @@ -8,6 +8,7 @@
  use serde_json::{Value, json};
@@ -125,8 +125,8 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
      fn a_token_is_used_until_the_margin_before_it_expires() {
          let now = SystemTime::now()
              .duration_since(UNIX_EPOCH)
-diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/page_script.rs vendor/engine/session/src/page_script.rs
---- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/page_script.rs	2026-11-24 07:04:16.830396462 -0500
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/page_script.rs vendor/engine/session/src/page_script.rs
+--- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/page_script.rs	2026-11-24 10:17:31.905420653 -0500
 +++ vendor/engine/session/src/page_script.rs	2026-11-24 07:37:57.549111843 -0500
 @@ -25,6 +25,9 @@
  impl Session {
@@ -150,9 +150,9 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
          let marker_at = FETCH_SCRIPT
              .find(TOKEN_MARKER)
              .expect("fetch.js contains the token marker");
-diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/provider.rs vendor/engine/session/src/provider.rs
---- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/provider.rs	1969-12-31 19:00:00.000000000 -0500
-+++ vendor/engine/session/src/provider.rs	2026-11-24 07:54:14.848919996 -0500
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/provider.rs vendor/engine/session/src/provider.rs
+--- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/provider.rs	1969-12-31 19:00:00.000000000 -0500
++++ vendor/engine/session/src/provider.rs	2026-11-24 08:31:04.035082568 -0500
 @@ -0,0 +1,258 @@
 +//! Tern patch: a session without a browser. Tokens come from a [`TokenProvider`], and a bearer
 +//! is only ever attached to a host that belongs to the token's audience.
@@ -412,9 +412,9 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
 +        }
 +    }
 +}
-diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/session.rs vendor/engine/session/src/session.rs
---- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/session.rs	2026-11-24 07:04:16.830396462 -0500
-+++ vendor/engine/session/src/session.rs	2026-11-24 08:19:08.071427351 -0500
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/session.rs vendor/engine/session/src/session.rs
+--- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/session.rs	2026-11-24 10:17:31.905420653 -0500
++++ vendor/engine/session/src/session.rs	2026-11-24 08:31:04.035082568 -0500
 @@ -11,6 +11,7 @@
  use crate::error::{Error, Result};
  use crate::events::TabControl;
@@ -606,9 +606,9 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
  pub struct TabHold {
      transport: Arc<dyn Transport>,
      app: App,
-diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/skype.rs vendor/engine/session/src/skype.rs
---- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/skype.rs	1969-12-31 19:00:00.000000000 -0500
-+++ vendor/engine/session/src/skype.rs	2026-11-24 08:19:08.071125632 -0500
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/skype.rs vendor/engine/session/src/skype.rs
+--- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/session/src/skype.rs	1969-12-31 19:00:00.000000000 -0500
++++ vendor/engine/session/src/skype.rs	2026-11-24 08:31:04.035082568 -0500
 @@ -0,0 +1,146 @@
 +//! Tern patch: the Skype token some Teams services still take, without a page.
 +
@@ -756,9 +756,9 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
 +        assert_eq!(parse(&json!({})), None);
 +    }
 +}
-diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/ams.rs vendor/engine/chatsvc/src/ams.rs
---- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/ams.rs	2026-11-24 07:04:16.811260764 -0500
-+++ vendor/engine/chatsvc/src/ams.rs	2026-11-24 08:19:08.071855701 -0500
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/ams.rs vendor/engine/chatsvc/src/ams.rs
+--- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/ams.rs	2026-11-24 10:17:31.887081317 -0500
++++ vendor/engine/chatsvc/src/ams.rs	2026-11-24 08:31:04.026533713 -0500
 @@ -87,6 +87,11 @@
  
      /// Reads an AMS image view such as `.../v1/objects/{id}/views/imgo` with the Skype token.
@@ -771,9 +771,119 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
          let answer = self
              .session
              .run_with_token(
-diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/conversations.rs vendor/engine/chatsvc/src/conversations.rs
---- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/conversations.rs	2026-11-24 07:04:16.812335646 -0500
-+++ vendor/engine/chatsvc/src/conversations.rs	2026-11-24 08:11:38.936954137 -0500
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/chat_listing.rs vendor/engine/chatsvc/src/chat_listing.rs
+--- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/chat_listing.rs	2026-11-24 10:17:31.888265486 -0500
++++ vendor/engine/chatsvc/src/chat_listing.rs	2026-11-24 10:14:36.756690498 -0500
+@@ -15,6 +15,9 @@
+     pub next_url: Option<String>,
+ }
+ 
++/// Empty pages followed in a row before giving up for now.
++const MAX_EMPTY_PAGES: usize = 30;
++
+ #[derive(Debug, Clone, PartialEq)]
+ pub struct MessagePage {
+     pub messages: Vec<Value>,
+@@ -122,20 +125,34 @@
+         let url = format!(
+             "{base}/epochTimeStamp/{anchor_ms}?pageSize={page_size}&direction=BACKWARD&includeMetadata=true&locationType=Primary"
+         );
+-        let body = self.get(&url).await?;
+-        let messages: Vec<Value> = body
+-            .get("messages")
+-            .and_then(Value::as_array)
+-            .cloned()
+-            .ok_or_else(|| Error::UnexpectedAnswer("no messages list".into()))?
+-            .into_iter()
+-            .filter(|message| before_ms.is_none_or(|before| arrival_ms(message) < Some(before)))
+-            .collect();
+-        let has_older = body
+-            .pointer("/_metadata/backwardLink")
+-            .and_then(Value::as_str)
+-            .is_some_and(|link| !link.is_empty())
+-            && !messages.is_empty();
++        // Tern patch: the service pages by stretches of time. A stretch without messages answers
++        // an empty page that still links to the one before it, so only a missing link is the end.
++        let mut url = url;
++        let mut messages: Vec<Value>;
++        let mut older: Option<String>;
++        let mut hops = 0;
++        loop {
++            let body = self.get(&url).await?;
++            messages = body
++                .get("messages")
++                .and_then(Value::as_array)
++                .cloned()
++                .ok_or_else(|| Error::UnexpectedAnswer("no messages list".into()))?
++                .into_iter()
++                .filter(|message| before_ms.is_none_or(|before| arrival_ms(message) < Some(before)))
++                .collect();
++            older = body
++                .pointer("/_metadata/backwardLink")
++                .and_then(Value::as_str)
++                .filter(|link| !link.is_empty() && **link != *url)
++                .map(str::to_owned);
++            hops += 1;
++            match &older {
++                Some(link) if messages.is_empty() && hops < MAX_EMPTY_PAGES => url = link.clone(),
++                _ => break,
++            }
++        }
++        let has_older = older.is_some();
+         let oldest_arrival_ms = messages.iter().filter_map(arrival_ms).min();
+         Ok(MessagePage {
+             messages,
+@@ -215,6 +232,47 @@
+     }
+ 
+     #[tokio::test]
++    async fn an_empty_stretch_is_not_the_end() {
++        let empty = |link: &str| json!({"messages": [], "_metadata": {"backwardLink": link}});
++        let transport = canned(vec![
++            empty("https://a"),
++            empty("https://b"),
++            json!({"messages": [{"id": "5"}], "_metadata": {"backwardLink": "https://c"}}),
++        ]);
++        let listing = ChatListing::with_transport(&transport, "emea");
++        let page = listing.messages("19:a@thread.v2", Some(1000), 20).await.unwrap();
++        assert_eq!((page.messages.len(), page.has_older), (1, true));
++        assert_eq!(transport.requests.lock().unwrap()[1..], ["https://a", "https://b"]);
++    }
++
++    #[tokio::test]
++    async fn only_a_missing_link_is_the_end() {
++        let transport = canned(vec![json!({"messages": [], "_metadata": {}})]);
++        let listing = ChatListing::with_transport(&transport, "emea");
++        let page = listing.messages("19:a@thread.v2", Some(1000), 20).await.unwrap();
++        assert!(page.messages.is_empty() && !page.has_older);
++    }
++
++    #[tokio::test]
++    async fn endless_empty_pages_stop() {
++        let answers = (0..100)
++            .map(|number| json!({"messages": [], "_metadata": {"backwardLink": format!("https://{number}")}}))
++            .collect();
++        let transport = canned(answers);
++        let listing = ChatListing::with_transport(&transport, "emea");
++        let page = listing.messages("19:a@thread.v2", Some(1000), 20).await.unwrap();
++        assert!(page.has_older, "there may be more");
++        assert_eq!(transport.requests.lock().unwrap().len(), MAX_EMPTY_PAGES);
++        // A link to itself goes nowhere.
++        let transport = canned(vec![
++            json!({"messages": [], "_metadata": {"backwardLink": "https://x"}}),
++            json!({"messages": [], "_metadata": {"backwardLink": "https://x"}}),
++        ]);
++        let listing = ChatListing::with_transport(&transport, "emea");
++        assert!(!listing.messages("19:a@thread.v2", Some(1000), 20).await.unwrap().has_older);
++    }
++
++    #[tokio::test]
+     async fn older_messages_end_before_the_anchor() {
+         let transport = canned(vec![json!({
+             "messages": [{"id": "1000"}, {"id": "900"}],
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/conversations.rs vendor/engine/chatsvc/src/conversations.rs
+--- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/conversations.rs	2026-11-24 10:17:31.889081285 -0500
++++ vendor/engine/chatsvc/src/conversations.rs	2026-11-24 08:31:04.026533713 -0500
 @@ -12,6 +12,7 @@
  
  const PAGE_SIZE: usize = 200;
@@ -823,9 +933,9 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
      }
  
      pub async fn set_alerts(&self, conversation_id: &str, enabled: bool) -> Result<()> {
-diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/lib.rs vendor/engine/chatsvc/src/lib.rs
---- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/lib.rs	2026-11-24 07:04:16.814467261 -0500
-+++ vendor/engine/chatsvc/src/lib.rs	2026-11-24 07:57:01.968048875 -0500
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/lib.rs vendor/engine/chatsvc/src/lib.rs
+--- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/lib.rs	2026-11-24 10:17:31.890081269 -0500
++++ vendor/engine/chatsvc/src/lib.rs	2026-11-24 08:31:04.026533713 -0500
 @@ -111,7 +111,7 @@
      HistoryShare, INVALID_TOPIC_CHARACTER, MAX_HISTORY_DAYS, MAX_TOPIC_LENGTH, ThreadMembers,
      TopicProblem, topic_problem,
@@ -835,9 +945,9 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
  pub use pins::{
      ChannelLayout, ChannelTab, Folder, FolderKind, Folders, PinnedChannels, PinnedChats,
      PinnedMessage, Pins, TeamLayout, TeamRights,
-diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/messages.rs vendor/engine/chatsvc/src/messages.rs
---- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/messages.rs	2026-11-24 07:04:16.814467261 -0500
-+++ vendor/engine/chatsvc/src/messages.rs	2026-11-24 07:57:01.996077585 -0500
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/messages.rs vendor/engine/chatsvc/src/messages.rs
+--- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/messages.rs	2026-11-24 10:17:31.890081269 -0500
++++ vendor/engine/chatsvc/src/messages.rs	2026-11-24 08:31:04.026533713 -0500
 @@ -336,9 +336,19 @@
      })
  }
@@ -885,8 +995,8 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
 +        assert_ne!(body(), body());
 +    }
 +}
-diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/presence.rs vendor/engine/chatsvc/src/presence.rs
---- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/presence.rs	2026-11-24 07:04:16.815508159 -0500
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/presence.rs vendor/engine/chatsvc/src/presence.rs
+--- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/presence.rs	2026-11-24 10:17:31.891403640 -0500
 +++ vendor/engine/chatsvc/src/presence.rs	2026-11-24 07:06:29.035276028 -0500
 @@ -126,6 +126,7 @@
  
@@ -973,8 +1083,8 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
          let mri = format!("{ORGID_PREFIX}{user_id}");
          let body = json!([{ "mri": mri }]);
          let answer = self
-diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/realtime/native.rs vendor/engine/chatsvc/src/realtime/native.rs
---- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/realtime/native.rs	2026-11-24 07:04:16.816335647 -0500
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/realtime/native.rs vendor/engine/chatsvc/src/realtime/native.rs
+--- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/chatsvc/src/realtime/native.rs	2026-11-24 10:17:31.892520176 -0500
 +++ vendor/engine/chatsvc/src/realtime/native.rs	2026-11-24 07:07:12.531347494 -0500
 @@ -5,7 +5,7 @@
  use futures_util::{SinkExt, StreamExt};
@@ -1018,9 +1128,9 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
      }
  
      pub(super) async fn run(mut self, mut stop: oneshot::Receiver<oneshot::Sender<()>>) {
-diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/core/src/engine.rs vendor/engine/core/src/engine.rs
---- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/core/src/engine.rs	2026-11-24 07:04:16.821335647 -0500
-+++ vendor/engine/core/src/engine.rs	2026-11-24 08:11:07.555885851 -0500
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/core/src/engine.rs vendor/engine/core/src/engine.rs
+--- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/core/src/engine.rs	2026-11-24 10:17:31.897081156 -0500
++++ vendor/engine/core/src/engine.rs	2026-11-24 08:31:04.028533712 -0500
 @@ -104,6 +104,12 @@
      pub display_name: String,
  }
@@ -1051,9 +1161,9 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
              app_channel_horizon_ms: Mutex::new(0),
              activity: Mutex::new(crate::activity_sync::ActivityState::default()),
              chat_paging,
-diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/core/src/remote.rs vendor/engine/core/src/remote.rs
---- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/core/src/remote.rs	2026-11-24 07:04:16.825335648 -0500
-+++ vendor/engine/core/src/remote.rs	2026-11-24 08:11:38.937798081 -0500
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/core/src/remote.rs vendor/engine/core/src/remote.rs
+--- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/core/src/remote.rs	2026-11-24 10:17:31.900187072 -0500
++++ vendor/engine/core/src/remote.rs	2026-11-24 08:31:04.030533711 -0500
 @@ -150,6 +150,10 @@
          share: HistoryShare,
      ) -> Result<()>;
@@ -1078,9 +1188,9 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
      async fn chat_states(&self) -> Result<Vec<ConversationState>> {
          Ok(Conversations::new(self.session())
              .conversation_states()
-diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/core/src/sidebar_sync.rs vendor/engine/core/src/sidebar_sync.rs
---- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/core/src/sidebar_sync.rs	2026-11-24 07:04:16.825335648 -0500
-+++ vendor/engine/core/src/sidebar_sync.rs	2026-11-24 08:11:38.938634410 -0500
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/core/src/sidebar_sync.rs vendor/engine/core/src/sidebar_sync.rs
+--- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/core/src/sidebar_sync.rs	2026-11-24 10:17:31.901081091 -0500
++++ vendor/engine/core/src/sidebar_sync.rs	2026-11-24 08:31:04.031533711 -0500
 @@ -119,14 +119,29 @@
          Ok(refresh)
      }
@@ -1129,9 +1239,40 @@ diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3
          let (Some(states), Ok(mentions)) = (
              states,
              mentions.inspect_err(|error| {
-diff --color -ruN -x examples /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/store/src/store.rs vendor/engine/store/src/store.rs
---- /tmp/claude-1000/-home-rhg--claude-spares-spare-a3LC5i/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/store/src/store.rs	2026-11-24 07:04:16.832335649 -0500
-+++ vendor/engine/store/src/store.rs	2026-11-24 07:54:14.850233903 -0500
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/store/src/image_files.rs vendor/engine/store/src/image_files.rs
+--- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/store/src/image_files.rs	2026-11-24 10:17:31.906288534 -0500
++++ vendor/engine/store/src/image_files.rs	2026-11-24 08:44:45.864366598 -0500
+@@ -16,6 +16,15 @@
+     last_used: SystemTime,
+ }
+ 
++/// Tern patch: the cached file of `key`, for readers beside the daemon. Touches nothing.
++pub fn find_image_file(directory: &Path, key: &str) -> Option<PathBuf> {
++    let stem = file_stem(key);
++    ["jpg", "png", "gif", "webp", "bmp", "bin"]
++        .iter()
++        .map(|extension| directory.join(format!("{stem}.{extension}")))
++        .find(|path| path.exists())
++}
++
+ /// Image files in one directory, evicted least recently used first once the total exceeds the cap.
+ pub struct ImageFileCache {
+     directory: PathBuf,
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/store/src/lib.rs vendor/engine/store/src/lib.rs
+--- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/store/src/lib.rs	2026-11-24 10:17:31.906288534 -0500
++++ vendor/engine/store/src/lib.rs	2026-11-24 08:44:45.866577506 -0500
+@@ -32,7 +32,7 @@
+     load_calendar_accounts, merge_caldav_metadata, merge_google_tokens, save_calendar_accounts,
+ };
+ pub use error::{Error, Result};
+-pub use image_files::ImageFileCache;
++pub use image_files::{ImageFileCache, find_image_file};
+ pub use migrations::latest_version;
+ pub use models::{
+     ActivityRecord, AgentMeetingRecord, AgentProposalMention, AgentProposalRecord,
+diff --color -ruN -x examples /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/store/src/store.rs vendor/engine/store/src/store.rs
+--- /tmp/claude-1000/-home-rhg-Workspace-github-linux-teams/c309ae99-c20c-4e8e-b35c-3914d9edf3ba/scratchpad/upstream/rt/crates/store/src/store.rs	2026-11-24 10:17:31.907080994 -0500
++++ vendor/engine/store/src/store.rs	2026-11-24 08:31:04.037533709 -0500
 @@ -56,6 +56,24 @@
          Self::from_connection(connection)
      }

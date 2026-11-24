@@ -32,7 +32,7 @@ pub use calendar_accounts::{
     load_calendar_accounts, merge_caldav_metadata, merge_google_tokens, save_calendar_accounts,
 };
 pub use error::{Error, Result};
-pub use image_files::ImageFileCache;
+pub use image_files::{ImageFileCache, find_image_file};
 pub use migrations::latest_version;
 pub use models::{
     ActivityRecord, AgentMeetingRecord, AgentProposalMention, AgentProposalRecord,

@@ -60,6 +60,8 @@ enum Cmd {
     Get { chat: String, number: usize },
     /// Send a message; waits for a connection if there is none
     Send { chat: String, text: String },
+    /// Look at how the service pages history; reads only, prints counts only
+    ProbeHistory,
     /// What the background service is doing
     Status,
     /// Watch activity, lock and sleep detection; needs no account
@@ -262,6 +264,63 @@ fn skeleton(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+async fn probe_history() -> Outcome {
+    let (broker, identity) = signed_in().await?;
+    let regions = broker.regions().await.map_err(text)?;
+    let session = Session::with_provider(broker, SessionConfig::default())
+        .with_region(&regions.region)
+        .with_guard(tern_engine::read_only_guard());
+    let store = tern_engine::open_read_only(&identity.object_id)?;
+    let now = chrono::Utc::now();
+    let listing = chatsvc::ChatListing::new(&session);
+    let mut tried = 0;
+    for chat in store.recent_chats(50).map_err(text)? {
+        let state = store.sync_state(&chat.id).map_err(text)?;
+        let Some(oldest) = state
+            .filter(|state| !state.has_more)
+            .and_then(|state| state.oldest_loaded)
+        else {
+            continue;
+        };
+        tried += 1;
+        if tried > 10 {
+            break;
+        }
+        let mut before = oldest.timestamp_millis();
+        let mut line = format!(
+            "{:9} from {:3} days back:",
+            chat.kind,
+            (now - oldest).num_days()
+        );
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            match listing.messages(&chat.id, Some(before), 50).await {
+                Ok(page) => {
+                    let back = page
+                        .oldest_arrival_ms
+                        .map(|at| (now.timestamp_millis() - at) / 86_400_000);
+                    line += &format!(
+                        "  {} more to {back:?} d, older {} ({} ms)",
+                        page.messages.len(),
+                        page.has_older,
+                        start.elapsed().as_millis()
+                    );
+                    match page.oldest_arrival_ms {
+                        Some(at) if page.has_older => before = at,
+                        _ => break,
+                    }
+                }
+                Err(error) => {
+                    line += &format!("  failed {}", skeleton(&error.to_string()));
+                    break;
+                }
+            }
+        }
+        println!("{line}");
+    }
+    Ok(())
 }
 
 async fn probe_sync() -> Outcome {
@@ -549,6 +608,10 @@ async fn send(chat: &str, message: String) -> Outcome {
     match tern_ipc::ask(&Request::Send {
         conversation,
         text: message,
+        reply_to: None,
+        thread: None,
+        post: false,
+        subject: None,
     })
     .await
     {
@@ -679,6 +742,7 @@ async fn main() -> ExitCode {
         Cmd::Files { chat } => list_files(&chat).await,
         Cmd::Get { chat, number } => get_file(&chat, number).await,
         Cmd::Send { chat, text } => send(&chat, text).await,
+        Cmd::ProbeHistory => probe_history().await,
         Cmd::ProbeSync => probe_sync().await,
         Cmd::Status => status().await,
         Cmd::Sensors { idle } => sensors(idle).await,

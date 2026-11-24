@@ -14,11 +14,12 @@ use chatsvc::realtime::{Realtime, RealtimeConfig, RealtimeEvent, StatusKind};
 use chatsvc::{PresenceService, PresenceStatus};
 use session::{Session, SessionConfig};
 use tern_auth::{Broker, HttpEndpoint, KeyringStore};
-use tern_ipc::{Request, Response, Status};
+use tern_engine::{Act, Draft, Failure, Teams};
+use tern_ipc::{Event as Change, Request, Response, Status};
 use tern_presence::{Config, Event, Input, Machine, Sensors, Source, State};
 use tokio::net::UnixStream;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, interval, sleep_until, timeout};
 
@@ -109,6 +110,61 @@ async fn connect(broker: Arc<Broker>, active: bool) -> Connect {
     }
 }
 
+type Work = std::pin::Pin<Box<dyn Future<Output = Result<(), Failure>> + Send>>;
+
+/// Requests that ask the service something: done beside the loop, which they must not hold up.
+fn beside(teams: Arc<Teams>, request: &Request) -> Option<Work> {
+    let act = |conversation: &String, message: &String, act: Act| -> Option<Work> {
+        let (conversation, message, teams) = (conversation.clone(), message.clone(), teams.clone());
+        Some(Box::pin(async move {
+            teams.act(&conversation, &message, &act).await
+        }))
+    };
+    match request {
+        Request::React {
+            conversation,
+            message,
+            emoji,
+            on,
+        } => act(
+            conversation,
+            message,
+            Act::React {
+                emoji: emoji.clone(),
+                on: *on,
+            },
+        ),
+        Request::Edit {
+            conversation,
+            message,
+            text,
+        } => act(
+            conversation,
+            message,
+            Act::Edit {
+                markdown: text.clone(),
+            },
+        ),
+        Request::Delete {
+            conversation,
+            message,
+        } => act(conversation, message, Act::Delete),
+        Request::Look { conversation, post } => {
+            let (conversation, post, teams) = (conversation.clone(), post.clone(), teams.clone());
+            Some(Box::pin(async move {
+                teams.look(&conversation, post.as_deref()).await
+            }))
+        }
+        Request::Older { conversation } => {
+            let (conversation, teams) = (conversation.clone(), teams.clone());
+            Some(Box::pin(async move {
+                teams.back(&conversation).await.map(drop)
+            }))
+        }
+        _ => None,
+    }
+}
+
 struct Daemon {
     broker: Arc<Broker>,
     machine: Machine,
@@ -129,6 +185,8 @@ struct Daemon {
     presence: bool,
     messages: Option<Messages>,
     news: mpsc::UnboundedSender<News>,
+    changes: broadcast::Sender<Change>,
+    told: Option<Status>,
     notifier: Notifier,
     tray: TrayIcon,
     paused_until: Option<Instant>,
@@ -138,6 +196,7 @@ impl Daemon {
     fn new(
         broker: Arc<Broker>,
         news: mpsc::UnboundedSender<News>,
+        changes: broadcast::Sender<Change>,
         notifier: Notifier,
         tray: TrayIcon,
     ) -> Self {
@@ -161,6 +220,8 @@ impl Daemon {
             presence: std::env::var_os("TERN_NO_PRESENCE").is_none(),
             messages: None,
             news,
+            changes,
+            told: None,
             notifier,
             tray,
             paused_until: None,
@@ -338,7 +399,12 @@ impl Daemon {
         {
             return;
         }
-        match Messages::start(&online.object_id, online.session.clone(), self.news.clone()) {
+        match Messages::start(
+            &online.object_id,
+            online.session.clone(),
+            self.news.clone(),
+            self.changes.clone(),
+        ) {
             Ok(messages) => {
                 messages.remember_region(&online.region);
                 self.messages = Some(messages);
@@ -363,7 +429,13 @@ impl Daemon {
         };
         let session = Session::with_provider(self.broker.clone(), SessionConfig::default())
             .with_region(&region);
-        self.messages = Messages::start(&identity.object_id, session, self.news.clone()).ok();
+        self.messages = Messages::start(
+            &identity.object_id,
+            session,
+            self.news.clone(),
+            self.changes.clone(),
+        )
+        .ok();
     }
 
     async fn news(&mut self, news: News) {
@@ -394,7 +466,7 @@ impl Daemon {
             Action::Open(target) => drop(tokio::spawn(async move { notify::open(&target).await })),
             Action::Reply { conversation, text } => {
                 let queued = match &self.messages {
-                    Some(messages) => messages.send(&conversation, &text),
+                    Some(messages) => messages.send(&conversation, &Draft::text(&text)),
                     None => Err("not signed in".into()),
                 };
                 if let Err(error) = queued {
@@ -472,6 +544,20 @@ impl Daemon {
             .await;
     }
 
+    /// Tells followers when the connection or account changed, not every passing second.
+    async fn tell_status(&mut self) {
+        let mut status = self.status(false).await;
+        status.state_for_secs = 0;
+        status.teams_read_secs_ago = None;
+        status.reading = 0;
+        if self.told.as_ref() != Some(&status) {
+            self.told = Some(status.clone());
+            let _ = self.changes.send(Change::Status {
+                status: Box::new(status),
+            });
+        }
+    }
+
     /// Takes down notifications for what was read elsewhere.
     async fn sweep(&mut self) {
         if let Some(messages) = &self.messages {
@@ -516,13 +602,19 @@ impl Daemon {
         }
     }
 
-    async fn status(&self) -> Status {
+    /// `media` counts files on disk, so only who asks for it pays for it.
+    async fn status(&self, media: bool) -> Status {
         let sync = self
             .messages
             .as_ref()
             .map(Messages::state)
             .unwrap_or_default();
         Status {
+            account_id: self
+                .broker
+                .identity()
+                .await
+                .map(|identity| identity.object_id),
             account: self.broker.identity().await.map(|identity| identity.name),
             state: match self.machine.state() {
                 State::Active => "active",
@@ -557,6 +649,7 @@ impl Daemon {
             media: self
                 .messages
                 .as_ref()
+                .filter(|_| media)
                 .map(Messages::media)
                 .unwrap_or_default(),
         }
@@ -564,16 +657,49 @@ impl Daemon {
 
     async fn answer(&mut self, request: Request) -> Response {
         match request {
-            Request::Status => Response::Status(Box::new(self.status().await)),
-            Request::Send { conversation, text } => match &self.messages {
-                Some(messages) => match messages.send(&conversation, &text) {
-                    Ok(()) => Response::Done,
-                    Err(error) => Response::Error(error),
-                },
-                None => Response::Error("not connected yet".into()),
-            },
+            Request::Status => Response::Status(Box::new(self.status(true).await)),
+            Request::MarkRead { conversation } => {
+                if let Some(messages) = &self.messages {
+                    messages.mark_read(conversation);
+                }
+                Response::Done
+            }
+            // Answered by `serve`.
+            Request::Watch => Response::Error("not here".into()),
+            Request::Send {
+                conversation,
+                text,
+                reply_to,
+                thread,
+                post,
+                subject,
+            } => {
+                let draft = Draft {
+                    markdown: text,
+                    reply_to,
+                    thread,
+                    post,
+                    subject,
+                };
+                match &self.messages {
+                    Some(messages) => match messages.send(&conversation, &draft) {
+                        Ok(()) => {
+                            // It shows as being sent at once.
+                            let _ = self.changes.send(Change::Messages { conversation });
+                            Response::Done
+                        }
+                        Err(error) => Response::Error(error),
+                    },
+                    None => Response::Error("not connected yet".into()),
+                }
+            }
             // Answered beside the loop, see `run`.
-            Request::File { .. } => Response::Error("not connected yet".into()),
+            Request::File { .. }
+            | Request::React { .. }
+            | Request::Edit { .. }
+            | Request::Delete { .. }
+            | Request::Look { .. }
+            | Request::Older { .. } => Response::Error("not connected yet".into()),
             Request::Reload => {
                 self.leave().await;
                 self.messages = None;
@@ -607,6 +733,7 @@ impl Daemon {
         let mut interrupt = signal(SignalKind::interrupt())?;
         loop {
             self.update_tray().await;
+            self.tell_status().await;
             let connect_at = self.connect_at;
             tokio::select! {
                 Some(event) = sensors.recv() => self.sensor(event).await,
@@ -661,6 +788,17 @@ impl Daemon {
                         });
                         continue;
                     }
+                    if let Some(messages) = &self.messages
+                        && let Some(work) = beside(messages.teams(), &request)
+                    {
+                        tokio::spawn(async move {
+                            let _ = reply.send(match work.await {
+                                Ok(()) => Response::Done,
+                                Err(failure) => Response::Error(failure.text().to_owned()),
+                            });
+                        });
+                        continue;
+                    }
                     let response = self.answer(request).await;
                     let _ = reply.send(response);
                 }
@@ -674,11 +812,48 @@ impl Daemon {
     }
 }
 
-async fn serve(mut stream: UnixStream, ask: mpsc::Sender<Asked>) {
+/// Streams changes to a follower, its first line being how things are.
+async fn follow(
+    mut stream: UnixStream,
+    ask: &mpsc::Sender<Asked>,
+    mut changes: broadcast::Receiver<Change>,
+) {
+    let (reply, answer) = oneshot::channel();
+    if ask.send((Request::Status, reply)).await.is_err() {
+        return;
+    }
+    if let Ok(Response::Status(status)) = answer.await
+        && tern_ipc::send_event(&mut stream, &Change::Status { status })
+            .await
+            .is_err()
+    {
+        return;
+    }
+    loop {
+        let change = match changes.recv().await {
+            Ok(change) => change,
+            Err(broadcast::error::RecvError::Lagged(_)) => Change::Chats,
+            Err(broadcast::error::RecvError::Closed) => return,
+        };
+        if tern_ipc::send_event(&mut stream, &change).await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn serve(
+    mut stream: UnixStream,
+    ask: mpsc::Sender<Asked>,
+    changes: broadcast::Sender<Change>,
+) {
     if !tern_ipc::same_user(&stream) {
         return;
     }
     let response = match tern_ipc::receive(&mut stream).await {
+        Ok(Request::Watch) => {
+            let changes = changes.subscribe();
+            return follow(stream, &ask, changes).await;
+        }
         Ok(request) => {
             let (reply, answer) = oneshot::channel();
             if ask.send((request, reply)).await.is_err() {
@@ -701,15 +876,17 @@ async fn start() -> Result<(), String> {
         tracing::warn!(%error, "could not read the stored sign-in");
     }
     let (ask, asked) = mpsc::channel(8);
+    let changes = broadcast::channel(256).0;
+    let followers = changes.clone();
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
-            tokio::spawn(serve(stream, ask.clone()));
+            tokio::spawn(serve(stream, ask.clone(), followers.clone()));
         }
     });
     let (news, news_queue) = mpsc::unbounded_channel();
     let (notifier, actions) = Notifier::start();
     let (tray, picks) = TrayIcon::start().await;
-    let outcome = Daemon::new(broker, news, notifier, tray)
+    let outcome = Daemon::new(broker, news, changes, notifier, tray)
         .run(asked, news_queue, actions, picks)
         .await
         .map_err(|error| error.to_string());

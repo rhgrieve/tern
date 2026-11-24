@@ -3102,6 +3102,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tern"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "gtk4",
+ "libadwaita",
+ "serde_json",
+ "store",
+ "teams-core",
+ "tempfile",
+ "tern-engine",
+ "tern-ipc",
+ "tokio",
+]
+
+[[package]]
 name = "tern-auth"
 version = "0.1.0"
 dependencies = [

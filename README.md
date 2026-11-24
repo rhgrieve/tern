@@ -8,10 +8,12 @@ organization may not allow.
 computer, in any app, also while you still use Teams on the web; keeps chats and channels in a
 local cache you can read and search offline; queues messages until they can be sent; and shows
 notifications you can answer. Recent pictures and faces are kept for offline use, files on request;
-a tray icon shows your status and unread chats. There is no window yet.
+a tray icon shows your status and unread chats. The window shows chats and
+channels with threads, sends, answers, edits and reacts, and searches.
 
 | Program | What it does |
 |---|---|
+| `tern` | The window; `tern --demo` shows it with invented people |
 | `ternd` | The background service |
 | `tern-cli` | `login`, `logout`, `whoami`, `chats`, `read`, `search`, `files`, `get`, `send`, `status`, `tokens`, `tail`, `sensors`, `probe-sync` |
 | `tern-login` | The sign-in window (WebKitGTK). It takes the redirect before the page loads; pasting that address from a browser is deliberately not supported, because that is how sign-in codes get phished |
@@ -31,6 +33,8 @@ To run a build beside the installed service: `TERN_INSTANCE=dev TERN_NO_PRESENCE
 
 ```sh
 cargo test --workspace
+cargo run --release -p tern -- --demo
+cargo run --release -p tern --example scroll   # 10,000 messages, on a real display
 cargo run -p tern-cli -- sensors     # watch detection, no account needed
 ```
 
