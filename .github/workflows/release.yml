@@ -1,6 +1,7 @@
 name: Release
 
-# A tag like v0.1.0 becomes a release with the build attached.
+# A tag like v0.1.0 becomes a release with what main's build of the same commit made. Nothing is
+# built again: what was tested is what is published.
 on:
   push:
     tags: ["v*"]
@@ -8,42 +9,68 @@ on:
 permissions:
   contents: read
 
-jobs:
-  build:
-    uses: ./.github/workflows/build.yml
+defaults:
+  run:
+    shell: bash
 
+jobs:
   release:
-    needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # A build that is still running is waited for.
+    timeout-minutes: 60
     permissions:
+      actions: read
+      attestations: read
       contents: write
-      id-token: write
-      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           path: source
+      - name: Find the build of this commit
+        id: build
+        run: |
+          commit=$(git -C source rev-parse HEAD)
+          for try in $(seq 100); do
+            # The newest, should there be several.
+            read -r run status result < <(gh api --method GET \
+              "repos/$GH_REPO/actions/workflows/build.yml/runs" \
+              -f head_sha="$commit" -f branch=main -f event=push \
+              --jq '.workflow_runs[0] // {} | "\(.id) \(.status) \(.conclusion)"') || true
+            echo "build ${run:-unknown}: ${status:-unknown} ${result:-}"
+            [ "$status" = completed ] && break
+            # Not pushed to main, or not yet.
+            [ "$run" = null ] && [ "$try" -ge 6 ] && break
+            sleep 30
+          done
+          if [ "$result" != success ]; then
+            echo "::error::$commit has no successful build on main. Run that build again, then this."
+            exit 1
+          fi
+          echo "run=$run" >>"$GITHUB_OUTPUT"
+          echo "commit=$commit" >>"$GITHUB_OUTPUT"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
+          run-id: ${{ steps.build.outputs.run }}
+          github-token: ${{ github.token }}
           pattern: tern-x86_64*
           merge-multiple: true
-      - name: The tag has to name the version that was built
+      - name: Check what was built
         env:
-          TAG: ${{ github.ref_name }}
-        run: test -f "tern-${TAG#v}-x86_64.tar.gz"
-      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: |
-            *.tar.gz
-            *.AppImage
-            *.flatpak
+          COMMIT: ${{ steps.build.outputs.commit }}
+        run: |
+          # The tag has to name the version.
+          test -f "tern-${TAG#v}-x86_64.tar.gz"
+          cat ./*.sha256 | sha256sum -c
+          for file in ./*.tar.gz ./*.AppImage ./*.flatpak; do
+            gh attestation verify "$file" --repo "$GH_REPO" --source-digest "$COMMIT" \
+              --signer-workflow "$GH_REPO/.github/workflows/build.yml"
+          done
       - name: Publish
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
         run: |
           # What the changes file says of this version.
           awk -v version="${TAG#v}" '/^## /{on = ($2 == version); next} on' source/CHANGELOG.md >notes.md

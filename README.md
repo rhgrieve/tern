@@ -179,7 +179,7 @@ cargo run --release -p tern --example opening   # what opening chats costs
 ```
 
 Every change is checked, built and started on the supported systems by
-[GitHub Actions](.github/workflows/build.yml). A tag like `v0.1.0` publishes a release.
+[GitHub Actions](.github/workflows/build.yml). A tag like `v0.1.0` publishes what `main`'s build of that commit made.
 
 </details>
 
