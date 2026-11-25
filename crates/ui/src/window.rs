@@ -49,6 +49,8 @@ struct State {
     asked: HashSet<String>,
     /// Reactions the service does not know yet.
     reacting: Vec<Reacting>,
+    /// Chats that are being pinned or unpinned.
+    pinning: Vec<(String, bool)>,
 }
 
 pub struct Window {
@@ -353,14 +355,15 @@ impl Window {
             }
 
             // Keys
-            let keys: [(&str, &[&str], Run); 10] = [
-                ("leave", &["Escape"], Window::leave_thread),
+            let keys: [(&str, &[&str], Run); 11] = [
+                ("leave", &["Escape"], Window::escape),
                 ("search", &["<Ctrl>k", "<Ctrl>f"], Window::search),
                 ("next", &["<Alt>Down"], |window| window.step(1)),
                 ("previous", &["<Alt>Up"], |window| window.step(-1)),
                 ("write", &["<Ctrl>r"], |window| window.composer.focus()),
                 ("newest", &["<Ctrl>End"], |window| window.list.to_end()),
                 ("out", &["<Ctrl><Shift>o"], Window::pop_out),
+                ("pin-open", &["<Ctrl><Shift>p"], Window::pin_open),
                 ("area", &["F6"], Window::next_area),
                 ("keys", &["<Ctrl>question"], Window::show_keys),
                 ("close", &["<Ctrl>w"], |window| window.window.close()),
@@ -400,6 +403,29 @@ impl Window {
                 }
             });
             window.add_action(&react);
+            let pin = gio::SimpleAction::new("pin", Some(&<(String, bool)>::static_variant_type()));
+            pin.connect_activate({
+                let weak = weak.clone();
+                move |_, what| {
+                    let what = what.and_then(|what| what.get::<(String, bool)>());
+                    if let (Some(window), Some((id, on))) = (weak.upgrade(), what) {
+                        window.pin(&id, on);
+                    }
+                }
+            });
+            window.add_action(&pin);
+            let apart = gio::SimpleAction::new("apart", Some(glib::VariantTy::STRING));
+            apart.connect_activate({
+                let weak = weak.clone();
+                move |_, id| {
+                    if let (Some(window), Some(id)) =
+                        (weak.upgrade(), id.and_then(|id| id.get::<String>()))
+                    {
+                        window.desk.pop_out(&id);
+                    }
+                }
+            });
+            window.add_action(&apart);
             let picture = gio::SimpleAction::new("picture", Some(glib::VariantTy::STRING));
             picture.connect_activate({
                 let weak = weak.clone();
@@ -875,7 +901,7 @@ impl Window {
     /// Shows a picture on its own, and asks for it in full.
     pub fn view_picture(self: &Rc<Self>, url: &str) {
         if !art::has_picture(url) {
-            return;
+            return self.find_picture(url);
         }
         let viewer = Viewer::show(&self.window, url);
         let full = tern_engine::full_size(url);
@@ -887,6 +913,30 @@ impl Window {
             }
         }
         self.viewer.replace(Some(viewer));
+    }
+
+    /// A picture that is not here: asks for it again, or opens it where it is.
+    fn find_picture(self: &Rc<Self>, url: &str) {
+        if tern_engine::may_prefetch(url) {
+            // Already on its way.
+            if art::wait_for(url).is_none() && !self.desk.demo {
+                art::wait_again(url);
+                self.list.show_pictures();
+                self.client.ask(Request::Picture { url: url.into() });
+            }
+        } else if crate::rich::may_open(url) {
+            let toasts = self.toasts.clone();
+            gtk::UriLauncher::new(url).launch(
+                Some(&self.window),
+                gio::Cancellable::NONE,
+                move |opened| {
+                    if let Err(error) = opened {
+                        let text = format!("The picture could not be opened: {error}");
+                        toasts.add_toast(adw::Toast::new(&glib::markup_escape_text(&text)));
+                    }
+                },
+            );
+        }
     }
 
     /// Asks for pictures of what is shown that nobody asked for yet.
@@ -944,6 +994,16 @@ impl Window {
             state.history.count = 0;
         }
         self.enter();
+    }
+
+    /// Closes what is in front, else the thread.
+    fn escape(self: &Rc<Self>) {
+        match self.window.visible_dialog() {
+            Some(dialog) => {
+                dialog.close();
+            }
+            None => self.leave_thread(),
+        }
     }
 
     fn leave_thread(self: &Rc<Self>) {
@@ -1088,7 +1148,11 @@ impl Window {
                     self.show_presence();
                 }
             }
-            News::Picture { url } => {
+            News::Picture { url, here } => {
+                if !here {
+                    art::give_up(&url);
+                }
+                self.list.show_pictures();
                 if let Some(viewer) = self.viewer.borrow().as_ref() {
                     viewer.load(&url);
                 }
@@ -1099,6 +1163,11 @@ impl Window {
                 on,
                 refused,
             } => self.reacted(&message, &emoji, on, refused),
+            News::Pinned {
+                conversation,
+                on,
+                refused,
+            } => self.pinned(&conversation, on, refused),
             News::Refused(reason) => self
                 .toasts
                 .add_toast(adw::Toast::new(&glib::markup_escape_text(&reason))),
@@ -1140,9 +1209,9 @@ impl Window {
         if self.own {
             return;
         }
-        let (store, filter) = {
+        let (store, filter, pinning) = {
             let state = self.state.borrow();
-            (state.store.clone(), state.filter)
+            (state.store.clone(), state.filter, state.pinning.clone())
         };
         let Some(store) = store else { return };
         let turn = self.chats_turn.get() + 1;
@@ -1159,8 +1228,15 @@ impl Window {
                     return model::channel_rows(&teams, now);
                 }
                 let me = store.meta("me_user_id").ok().flatten();
-                let chats = store.recent_chats(CHATS).unwrap_or_default();
-                model::chat_rows(&chats, filter, me.as_deref(), now)
+                let mut chats = store.recent_chats(CHATS).unwrap_or_default();
+                let pinned = model::pins(tern_engine::pinned(&store), &pinning);
+                // However long nobody wrote in them.
+                for id in &pinned {
+                    if !chats.iter().any(|chat| chat.id == *id) {
+                        chats.extend(store.chat(id).ok().flatten());
+                    }
+                }
+                model::chat_rows(&chats, &pinned, filter, me.as_deref(), now)
             })
             .await;
             if let (Some(window), Ok(rows)) = (weak.upgrade(), rows)
@@ -1172,6 +1248,41 @@ impl Window {
                 }
             }
         });
+    }
+
+    fn pin(self: &Rc<Self>, id: &str, on: bool) {
+        {
+            let mut state = self.state.borrow_mut();
+            state.pinning.retain(|(other, _)| other != id);
+            state.pinning.push((id.to_owned(), on));
+        }
+        self.read_chats();
+        self.client.ask(Request::Pin {
+            conversation: id.to_owned(),
+            on,
+        });
+    }
+
+    fn pinned(self: &Rc<Self>, id: &str, on: bool, refused: Option<String>) {
+        // Unless it was changed again meanwhile.
+        self.state
+            .borrow_mut()
+            .pinning
+            .retain(|pinning| *pinning != (id.to_owned(), on));
+        if let Some(reason) = refused {
+            let what = if on { "pinned" } else { "unpinned" };
+            let text = glib::markup_escape_text(&format!("The chat was not {what}: {reason}"));
+            self.toasts.add_toast(adw::Toast::new(&text));
+        }
+        self.read_chats();
+    }
+
+    /// Pins the open chat, or unpins it.
+    fn pin_open(self: &Rc<Self>) {
+        let open = self.state.borrow().open.clone();
+        if let Some(on) = open.as_deref().and_then(|id| self.sidebar.is_pinned(id)) {
+            self.pin(&open.unwrap_or_default(), !on);
+        }
     }
 
     /// The user chose a conversation in the list or by searching.
@@ -1461,6 +1572,10 @@ impl Window {
     }
 
     fn search(self: &Rc<Self>) {
+        // Not behind what is in front, nor twice.
+        if self.window.visible_dialog().is_some() {
+            return;
+        }
         let Some(store) = self.state.borrow().store.clone() else {
             return;
         };
@@ -1501,6 +1616,8 @@ impl Window {
                     ("Newest message", "<Ctrl>End"),
                     ("Back to the channel", "Escape"),
                     ("Open in its own window", "<Ctrl><Shift>o"),
+                    ("Pin the chat, or unpin it", "<Ctrl><Shift>p"),
+                    ("More for a chat in the list", "Menu <Shift>F10"),
                     ("Close window", "<Ctrl>w"),
                 ][..],
             ),

@@ -108,11 +108,13 @@ const PREVIEW: std::time::Duration = std::time::Duration::from_secs(20);
 
 pub struct Teams {
     engine: SyncEngine<Graph>,
+    pub(crate) pins: chatsvc::Pins,
 }
 
 impl Teams {
     pub fn new(session: Session, store: Arc<Store>) -> Arc<Self> {
         Arc::new(Teams {
+            pins: chatsvc::Pins::new(&session),
             engine: SyncEngine::new(Graph::new(session), store),
         })
     }
@@ -123,10 +125,11 @@ impl Teams {
         store: Arc<Store>,
         folder: &std::path::Path,
     ) -> Result<Arc<Self>, String> {
+        let pins = chatsvc::Pins::new(&session);
         let engine = SyncEngine::new(Graph::new(session), store)
             .with_image_dir(folder, crate::media::IMAGE_BYTES)
             .map_err(|error| error.to_string())?;
-        Ok(Arc::new(Teams { engine }))
+        Ok(Arc::new(Teams { engine, pins }))
     }
 
     pub fn engine(&self) -> &SyncEngine<Graph> {

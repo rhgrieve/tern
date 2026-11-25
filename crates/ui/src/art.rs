@@ -4,10 +4,13 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gtk4::prelude::*;
 use gtk4::{gdk, gdk_pixbuf, gio, glib};
 use store::Store;
+
+use crate::moving::Frames;
 
 pub const WIDTH: i32 = 420;
 pub const HEIGHT: i32 = 320;
@@ -23,6 +26,9 @@ struct Art {
     faces: HashMap<String, Option<gdk::Texture>>,
     pictures: HashMap<String, gdk::Texture>,
     order: Vec<String>,
+    emoji: HashMap<String, Frames>,
+    /// Since when pictures are waited for; none where that was given up.
+    waiting: HashMap<String, Option<Instant>>,
     scale: i32,
 }
 
@@ -164,6 +170,43 @@ fn decode(path: &std::path::Path, scale: i32) -> Option<Decoded> {
     Some(Decoded::of(&picture))
 }
 
+/// Emoji are drawn at 18 points.
+const EMOJI: i32 = 18;
+
+/// The pictures of an emoji, once: at once when they are decoded already; none when it is not here.
+pub fn emoji(url: &str, show: impl FnOnce(Option<Frames>) + 'static) {
+    if let Some(known) = ART.with_borrow(|art| art.emoji.get(url).cloned()) {
+        return show(Some(known));
+    }
+    let Some(path) = file(url) else {
+        return show(None);
+    };
+    let size = EMOJI * scale();
+    let url = url.to_owned();
+    glib::spawn_future_local(async move {
+        let decoded = gio::spawn_blocking(move || {
+            let frames = crate::moving::decode(&path, size)?;
+            let frames = frames
+                .iter()
+                .map(|(picture, delay)| (Decoded::of(picture), *delay));
+            Some(frames.collect::<Vec<_>>())
+        })
+        .await
+        .ok()
+        .flatten();
+        let frames = decoded.map(|frames| {
+            let frames = frames
+                .into_iter()
+                .map(|(picture, delay)| (picture.texture(), delay));
+            Frames::new(frames.collect())
+        });
+        if let Some(frames) = &frames {
+            ART.with_borrow_mut(|art| art.emoji.insert(url, frames.clone()));
+        }
+        show(frames);
+    });
+}
+
 /// Gives the picture to `show`, at once when it is decoded already; `None` when it is not cached.
 pub fn picture(url: &str, show: impl FnOnce(Option<&gdk::Texture>) + 'static) {
     let (known, path, scale) = ART.with_borrow(|art| {
@@ -200,6 +243,36 @@ pub fn picture(url: &str, show: impl FnOnce(Option<&gdk::Texture>) + 'static) {
     });
 }
 
+/// A picture is waited for this long.
+const PATIENCE: Duration = Duration::from_secs(20);
+
+/// How much longer a picture is waited for; none when it did not come. It may come yet.
+pub fn wait_for(url: &str) -> Option<Duration> {
+    ART.with_borrow_mut(|art| {
+        let since = *art
+            .waiting
+            .entry(url.to_owned())
+            .or_insert_with(|| Some(Instant::now()));
+        PATIENCE
+            .checked_sub(since?.elapsed())
+            .filter(|left| !left.is_zero())
+    })
+}
+
+/// It was asked for again.
+pub fn wait_again(url: &str) {
+    ART.with_borrow_mut(|art| {
+        art.waiting.insert(url.to_owned(), Some(Instant::now()));
+    });
+}
+
+/// It will not come.
+pub fn give_up(url: &str) {
+    ART.with_borrow_mut(|art| {
+        art.waiting.insert(url.to_owned(), None);
+    });
+}
+
 /// The file of a picture that is on this computer.
 pub fn file(url: &str) -> Option<PathBuf> {
     ART.with_borrow(|art| store::find_image_file(art.folder.as_ref()?, url))
@@ -226,6 +299,11 @@ pub fn has_picture(url: &str) -> bool {
                 .as_ref()
                 .is_some_and(|folder| store::find_image_file(folder, url).is_some())
     })
+}
+
+/// How large a picture is shown that says how large it is.
+pub fn room(size: Option<(i32, i32)>) -> Option<(i32, i32)> {
+    size.map(|(width, height)| shown_size(width, height, 1))
 }
 
 /// How large a picture of `width` by `height` pixels is shown.
@@ -257,6 +335,18 @@ mod tests {
         assert_eq!(shown_size(100, 80, 2), (50, 40));
         assert_eq!(shown_size(4000, 100, 1), (420, 24));
         assert_eq!(shown_size(0, 0, 0), (24, 24));
+        assert_eq!(room(Some((840, 640))), Some((420, 320)));
+        assert_eq!(room(Some((100, 80))), Some((100, 80)));
+        assert_eq!(room(None), None);
+    }
+
+    #[test]
+    fn pictures_are_waited_for_until_given_up() {
+        assert!(wait_for("a").is_some());
+        give_up("a");
+        assert_eq!(wait_for("a"), None);
+        wait_again("a");
+        assert!(wait_for("a").is_some());
     }
 
     #[test]

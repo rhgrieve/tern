@@ -23,4 +23,4 @@ From https://github.com/danieldaeschle/rusty-teams (MIT, see `LICENSE`), commit
 | Pictures of linked pages without a page | `core/src/remote.rs` | Link previews; upstream asks a page for them |
 | Reacting with an org's own emoji | `chatsvc/src/reactions.rs` | Upstream only knows the standard ones |
 
-Known for later phases: pins still run in a page.
+Known for later phases: pinned posts still run in a page.

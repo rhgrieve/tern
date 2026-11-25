@@ -5,7 +5,7 @@ use store::{
     ChatRecord, MessageRecord, OutboxRecord, OutboxState, ReadHorizonRecord, SidebarTeam, Store,
 };
 use teams_core::{
-    files, html_to_spans, linked_message_spans, markdown_to_html, reaction_summaries,
+    ImageRef, files, html_to_spans, linked_message_spans, markdown_to_html, reaction_summaries,
 };
 
 use crate::card;
@@ -33,6 +33,9 @@ pub struct ChatRow {
     /// The team of a channel.
     pub team: Option<String>,
     pub mentions: bool,
+    pub pinned: bool,
+    /// Listed above the others, for being pinned.
+    pub apart: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -114,17 +117,40 @@ fn chat_row(chat: &ChatRecord, me: Option<&str>, now: DateTime<Utc>) -> ChatRow 
     }
 }
 
+/// What the user pinned or unpinned and the service does not know yet, on top of what is pinned.
+pub fn pins(mut pinned: Vec<String>, pinning: &[(String, bool)]) -> Vec<String> {
+    for (id, on) in pinning {
+        if !on {
+            pinned.retain(|other| other != id);
+        } else if !pinned.contains(id) {
+            pinned.push(id.clone());
+        }
+    }
+    pinned
+}
+
+/// The pinned chats in their order, then the others.
 pub fn chat_rows(
     chats: &[ChatRecord],
+    pinned: &[String],
     filter: Filter,
     me: Option<&str>,
     now: DateTime<Utc>,
 ) -> Vec<ChatRow> {
-    chats
+    let mut rows: Vec<ChatRow> = chats
         .iter()
         .filter(|chat| filter != Filter::Unread || chat.unread)
         .map(|chat| chat_row(chat, me, now))
-        .collect()
+        .collect();
+    let place = |id: &str| pinned.iter().position(|other| other == id);
+    for row in &mut rows {
+        row.pinned = place(&row.id).is_some();
+        row.apart = row.pinned && filter == Filter::Chats;
+    }
+    if filter == Filter::Chats {
+        rows.sort_by_key(|row| place(&row.id).unwrap_or(usize::MAX));
+    }
+    rows
 }
 
 pub fn channel_rows(teams: &[SidebarTeam], now: DateTime<Utc>) -> Vec<ChatRow> {
@@ -415,12 +441,34 @@ pub fn apply_reacting(items: &mut [Item], conversation: &str, waiting: &mut Vec<
     });
 }
 
+/// How large the message says its pictures are, so that they have their room before they come.
+fn size_pictures(blocks: &mut [Block], message: &MessageRecord) {
+    fn fill(blocks: &mut [Block], known: &mut Option<Vec<ImageRef>>, message: &MessageRecord) {
+        for block in blocks {
+            match block {
+                Block::Picture { url, size } => {
+                    let known = known.get_or_insert_with(|| teams_core::images(message));
+                    let image = known.iter().find(|image| image.url == *url);
+                    let side = |length: Option<u32>| {
+                        let length = i32::try_from(length?).ok()?;
+                        (1..=20_000).contains(&length).then_some(length)
+                    };
+                    *size = image.and_then(|image| Some((side(image.width)?, side(image.height)?)));
+                }
+                Block::Quote(inner) => fill(inner, known, message),
+                _ => {}
+            }
+        }
+    }
+    fill(blocks, &mut None, message);
+}
+
 /// The pictures messages show, of the messages and of reactions to them.
 pub fn pictures(items: &[Item]) -> Vec<&str> {
     fn within<'a>(blocks: &'a [Block], out: &mut Vec<&'a str>) {
         for block in blocks {
             match block {
-                Block::Picture(url) => out.push(url),
+                Block::Picture { url, .. } => out.push(url),
                 Block::Quote(inner) => within(inner, out),
                 Block::Preview(preview) => out.extend(preview.picture.as_deref()),
                 _ => {}
@@ -479,6 +527,7 @@ fn content(message: &MessageRecord) -> Vec<Block> {
         blocks.push(Block::Heading(rich::shown(&one_line(subject))));
     }
     blocks.extend(rich::blocks(&linked_message_spans(message)));
+    size_pictures(&mut blocks, message);
     for attachment in teams_core::attachments(message) {
         let card = attachment.adaptive_card().and_then(|card| {
             let teams = card::link(&message.conversation_id, &message.message_id);
@@ -1184,7 +1233,7 @@ mod tests {
             chat("2", "group", "ann", false),
             chat("3", "group", "me", false),
         ];
-        let rows = chat_rows(&chats, Filter::Chats, Some("me"), at(0));
+        let rows = chat_rows(&chats, &[], Filter::Chats, Some("me"), at(0));
         let previews: Vec<&str> = rows.iter().map(|row| row.preview.as_str()).collect();
         assert_eq!(
             previews,
@@ -1193,9 +1242,32 @@ mod tests {
         assert_eq!(rows[0].title, "Chat 1");
         assert_eq!(rows[0].when, "11:00");
         assert_eq!(
-            chat_rows(&chats, Filter::Unread, Some("me"), at(0)).len(),
+            chat_rows(&chats, &[], Filter::Unread, Some("me"), at(0)).len(),
             1
         );
+
+        // The pinned ones come first, in their own order; one of them is gone.
+        let pinned = ["3", "gone", "2"].map(str::to_owned);
+        let ids = |rows: &[ChatRow]| -> Vec<(String, bool)> {
+            rows.iter().map(|row| (row.id.clone(), row.apart)).collect()
+        };
+        let rows = chat_rows(&chats, &pinned, Filter::Chats, Some("me"), at(0));
+        let expected = [("3", true), ("2", true), ("1", false)];
+        assert_eq!(
+            ids(&rows),
+            expected.map(|(id, apart)| (id.to_owned(), apart))
+        );
+        let rows = chat_rows(&chats, &["1".into()], Filter::Unread, Some("me"), at(0));
+        assert!(rows[0].pinned && !rows[0].apart);
+    }
+
+    #[test]
+    fn pins_are_shown_before_the_service_knows() {
+        let pinned = || vec!["a".to_owned(), "b".to_owned()];
+        let pinning = |id: &str, on| (id.to_owned(), on);
+        assert_eq!(pins(pinned(), &[pinning("c", true)]), ["a", "b", "c"]);
+        assert_eq!(pins(pinned(), &[pinning("a", false)]), ["b"]);
+        assert_eq!(pins(pinned(), &[pinning("b", true)]), pinned());
     }
 
     #[test]

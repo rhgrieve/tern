@@ -1,5 +1,20 @@
 # Changes
 
+## 0.2.1
+
+**New**
+
+- Pinned chats, the same ones as in Teams, above the others. Pin a chat or take that back with a
+  right click in the list, or with Ctrl+Shift+P for the open chat.
+- A button that leads to the newest message.
+- Pictures have their room before they come, and say so while they load. One that did not load is
+  tried again with a click, and one on another site opens in the browser.
+- Emoji of your organization's own move, if they do.
+
+**Fixed**
+
+- Search and pictures close with Esc, and with a click beside them.
+
 ## 0.2.0
 
 **New**

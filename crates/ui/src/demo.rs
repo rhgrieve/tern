@@ -91,6 +91,7 @@ pub fn store() -> Store {
         )
         .collect();
     let _ = store.upsert_chats(&records);
+    let _ = tern_engine::keep_pinned(&store, "pins", &["c2".into(), "c5".into()]);
     let bodies = [
         "<p>Morning! Did the <b>tide table</b> make it into the folder?</p>",
         "<p>Yes, see <a href=\"https://example.com/harbour/plans/2026/tide-table-final-version\">https://example.com/harbour/plans/2026/tide-table-final-version</a></p>",

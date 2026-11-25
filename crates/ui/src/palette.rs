@@ -141,6 +141,7 @@ pub fn show(
         .content_width(620)
         .content_height(520)
         .build();
+    crate::beside::closes(&dialog);
 
     let hits: Rc<RefCell<Vec<Hit>>> = Rc::default();
     let turn = Rc::new(std::cell::Cell::new(0u64));
@@ -206,6 +207,15 @@ pub fn show(
         move |_| {
             if let Some(row) = list.selected_row() {
                 row.activate();
+            }
+        }
+    });
+    // The entry takes Escape for itself.
+    entry.connect_stop_search({
+        let dialog = dialog.downgrade();
+        move |_| {
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.close();
             }
         }
     });

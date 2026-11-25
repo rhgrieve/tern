@@ -43,7 +43,7 @@ for nothing else.
 | **Presence that is true** | Input in any app keeps you Available. Away after 5 minutes without it, at once when you lock, and before sleep. A status you set yourself always wins. It reports what you do; it does not pretend |
 | **Offline** | Chats and channels are kept on your computer. Read and search them without a network |
 | **Sending** | Messages queue until they can be sent, and are sent once. What fails comes back to you |
-| **Conversations** | Chats, channels and threads; replies, edits, reactions, mentions, `@Everyone`, pictures, files, link previews, `:emoji:`, spell checking, drafts, who is writing |
+| **Conversations** | Chats, channels and threads; pinned chats; replies, edits, reactions, mentions, `@Everyone`, pictures, files, link previews, `:emoji:`, spell checking, drafts, who is writing |
 | **Who is there** | Other people's status on their faces, as it changes |
 | **Receipts** | One check while your newest message is on its way, two when it arrived, blue when it was read. Point at it to see by whom |
 | **Windows** | Any chat can have its own (Ctrl+Shift+O, or a double click). One pane when narrow. Made for tiling, too |

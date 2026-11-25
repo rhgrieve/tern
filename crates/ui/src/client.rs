@@ -22,14 +22,21 @@ pub enum News {
     },
     /// Whether people are there.
     Presence(Vec<(String, Availability)>),
-    /// A picture that was asked for is here.
+    /// A picture that was asked for is here, or cannot be had.
     Picture {
         url: String,
+        here: bool,
     },
     /// The service answered a reaction.
     Reacted {
         message: String,
         emoji: String,
+        on: bool,
+        refused: Option<String>,
+    },
+    /// The service answered a pin.
+    Pinned {
+        conversation: String,
         on: bool,
         refused: Option<String>,
     },
@@ -95,7 +102,7 @@ async fn run(mut queue: mpsc::UnboundedReceiver<Request>, news: mpsc::UnboundedS
     let ask = async {
         while let Some(request) = queue.recv().await {
             let news = news.clone();
-            if matches!(request, Request::React { .. }) {
+            if matches!(request, Request::React { .. } | Request::Pin { .. }) {
                 let _ = react.send(request);
             } else if matches!(request, Request::Send { .. }) {
                 // In the order they were written.
@@ -125,9 +132,21 @@ async fn answer(request: Request, news: mpsc::UnboundedSender<News>) {
         return;
     }
     if let Request::Picture { url } = request {
-        if matches!(outcome, Ok(Response::Done)) {
-            let _ = news.send(News::Picture { url });
-        }
+        let here = matches!(outcome, Ok(Response::Done));
+        let _ = news.send(News::Picture { url, here });
+        return;
+    }
+    if let Request::Pin { conversation, on } = request {
+        let refused = match outcome {
+            Ok(Response::Error(error)) => Some(error),
+            Ok(_) => None,
+            Err(_) => Some(GONE.to_owned()),
+        };
+        let _ = news.send(News::Pinned {
+            conversation,
+            on,
+            refused,
+        });
         return;
     }
     if let Request::React {

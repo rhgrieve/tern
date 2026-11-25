@@ -25,7 +25,12 @@
 .table { padding: 8px 12px; }
 .quote { border-left: 3px solid alpha(currentColor, 0.25); padding-left: 10px; opacity: 0.85; }
 .picture { border-radius: 10px; background: alpha(currentColor, 0.06); padding: 0; min-width: 0; min-height: 0; font-weight: 400; }
-.picture.missing { padding: 12px 16px; }
+.picture.missing { color: alpha(currentColor, 0.7); }
+.picture .instead { margin: 8px 12px; }
+.picture.coming { animation: pulse 1.6s ease-in-out infinite; }
+.picture.fresh picture { animation: appear 220ms ease-out; }
+@keyframes pulse { 0%, 100% { background: alpha(currentColor, 0.04); } 50% { background: alpha(currentColor, 0.11); } }
+@keyframes appear { from { opacity: 0; } to { opacity: 1; } }
 .chip { background: alpha(currentColor, 0.08); border-radius: 99px; padding: 1px 8px; font-size: 0.9em; min-height: 0; font-weight: 400; }
 .chip.mine { background: alpha(var(--accent-bg-color), 0.25); box-shadow: inset 0 0 0 1px alpha(var(--accent-bg-color), 0.6); }
 .thread { padding: 2px 8px; margin-left: -8px; min-height: 0; font-size: 0.9em; color: var(--accent-color); }
@@ -43,6 +48,7 @@
 .message.own .heading { color: var(--accent-color); }
 /* What is in a row fills it, so that clicks anywhere on it arrive. */
 .chats > row { padding: 0; }
+.chats > header { padding: 10px 20px 4px; font-size: 0.85em; }
 .chat { padding: 8px 14px; }
 .chat.unread .title { font-weight: 700; }
 .chat.muted { opacity: 0.6; }

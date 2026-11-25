@@ -6,6 +6,7 @@ mod links;
 mod media;
 mod notice;
 mod outbox;
+mod pins;
 mod sync;
 
 pub use backend::{Act, Backend, Failure, Teams, read_only_guard};
@@ -17,4 +18,5 @@ pub use media::{
 };
 pub use notice::{Notice, Rules};
 pub use outbox::{Attached, Draft, MAX_FILES, Outbox, Post, Queued};
+pub use pins::{keep_pinned, pinned};
 pub use sync::{Arrived, Job, Sync, SyncState};

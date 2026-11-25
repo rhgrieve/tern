@@ -1,6 +1,7 @@
 //! One message in the list. Rows are recycled, so everything is set again on every bind.
 
 use std::cell::RefCell;
+use std::time::Duration;
 
 use gtk4 as gtk;
 use gtk4::glib;
@@ -107,9 +108,9 @@ fn custom(emoji: &tern_engine::Emoji, count: usize) -> gtk::Box {
 /// Shows the picture instead of the name, once it is here.
 fn show_emoji(picture: &gtk::Image) {
     let shown = picture.clone();
-    crate::art::picture(&picture.widget_name(), move |texture| {
-        if let Some(texture) = texture {
-            shown.set_paintable(Some(texture));
+    crate::art::emoji(&picture.widget_name(), move |frames| {
+        if let Some(frames) = frames {
+            crate::moving::play(&shown, frames);
             shown.set_visible(true);
             shown.remove_css_class("missing");
             if let Some(name) = shown.next_sibling() {
@@ -313,6 +314,8 @@ pub struct Part {
     labels: Vec<gtk::Label>,
     /// Holds a quote's blocks.
     inner: Option<Parts>,
+    /// The room the message says its picture needs.
+    said: std::cell::Cell<Option<(i32, i32)>>,
 }
 
 #[derive(Debug)]
@@ -334,7 +337,7 @@ fn kind(block: &Block) -> Kind {
         Block::Quote(_) => Kind::Quote,
         Block::Item { .. } => Kind::Item,
         Block::Table { .. } => Kind::Table,
-        Block::Picture(_) => Kind::Picture,
+        Block::Picture { .. } => Kind::Picture,
         Block::Card(_) => Kind::Card,
         Block::Preview(_) => Kind::Preview,
         Block::Rule => Kind::Rule,
@@ -406,16 +409,34 @@ impl Part {
                 frame.add_css_class("picture");
                 frame.set_cursor_from_name(Some("zoom-in"));
                 say(&frame, "Show the picture");
-                let missing = gtk::Label::new(Some("Picture not on this computer"));
-                missing.add_css_class("dim-label");
+                // What is there until the picture is, or why it is not.
+                let spinner = adw::Spinner::new();
+                spinner.set_size_request(24, 24);
+                let icon = gtk::Image::builder().pixel_size(24).build();
+                let why = gtk::Label::builder()
+                    .wrap(true)
+                    .justify(gtk::Justification::Center)
+                    .build();
+                why.add_css_class("caption");
+                let instead = gtk::Box::builder()
+                    .orientation(gtk::Orientation::Vertical)
+                    .spacing(8)
+                    .halign(gtk::Align::Center)
+                    .valign(gtk::Align::Center)
+                    .vexpand(true)
+                    .build();
+                instead.add_css_class("instead");
+                instead.append(&spinner);
+                instead.append(&icon);
+                instead.append(&why);
                 let picture = gtk::Picture::builder()
                     .content_fit(gtk::ContentFit::Contain)
                     .can_shrink(true)
                     .vexpand(true)
                     .build();
                 holder.append(&picture);
-                holder.append(&missing);
-                labels.push(missing);
+                holder.append(&instead);
+                labels.push(why);
                 Fit::new(&frame).upcast()
             }
             Kind::Card => {
@@ -436,6 +457,7 @@ impl Part {
             root,
             labels,
             inner,
+            said: Default::default(),
         }
     }
 
@@ -480,7 +502,7 @@ impl Part {
                     scroll.set_child(Some(&grid));
                 }
             }
-            Block::Picture(url) => self.set_picture(url),
+            Block::Picture { url, size } => self.set_picture(url, *size),
             Block::Card(card) => {
                 if let Some(frame) = self.root.downcast_ref::<gtk::Box>() {
                     clear(frame);
@@ -508,19 +530,21 @@ impl Part {
         Some((fit, frame, picture))
     }
 
-    fn set_picture(&self, url: &str) {
+    fn set_picture(&self, url: &str, size: Option<(i32, i32)>) {
         let Some((fit, frame, picture)) = self.picture() else {
             return;
         };
-        let missing = &self.labels[0];
         frame.set_action_target_value(Some(&url.to_variant()));
         // The row may show another message by the time the picture is decoded.
         frame.set_widget_name(url);
         picture.set_paintable(gtk::gdk::Paintable::NONE);
         picture.set_visible(false);
-        missing.set_visible(false);
-        frame.remove_css_class("missing");
-        fit.set_size(Some((240, 160)));
+        for class in ["missing", "coming", "fresh"] {
+            frame.remove_css_class(class);
+        }
+        stand_in(&frame, Instead::Nothing);
+        self.said.set(crate::art::room(size));
+        fit.set_size(Some(self.said.get().unwrap_or(ROOM)));
         self.load_picture(url);
     }
 
@@ -571,30 +595,128 @@ impl Part {
         let Some((fit, frame, picture)) = self.picture() else {
             return;
         };
-        let missing = self.labels[0].clone();
+        let said = self.said.get();
         let wanted = url.to_owned();
         crate::art::picture(url, move |texture| {
             if frame.widget_name() != wanted {
                 return;
             }
-            missing.set_visible(texture.is_none());
             picture.set_visible(texture.is_some());
             picture.set_paintable(texture);
-            match texture {
-                Some(texture) => {
-                    fit.set_size(Some(crate::art::shown_size(
-                        texture.width(),
-                        texture.height(),
-                        crate::art::scale(),
-                    )));
-                    frame.remove_css_class("missing");
-                }
-                None => {
-                    fit.set_size(None);
-                    frame.add_css_class("missing");
-                }
+            let Some(texture) = texture else {
+                frame.add_css_class("missing");
+                wait_for(&frame, &wanted);
+                return;
+            };
+            let (width, height) = (texture.width(), texture.height());
+            fit.set_size(Some(said.unwrap_or_else(|| {
+                crate::art::shown_size(width, height, crate::art::scale())
+            })));
+            // One that was waited for comes in gently.
+            if frame.has_css_class("coming") {
+                frame.add_css_class("fresh");
+            }
+            frame.remove_css_class("missing");
+            stand_in(&frame, Instead::Nothing);
+        });
+    }
+}
+
+/// The room of a picture whose size is not known.
+const ROOM: (i32, i32) = (240, 160);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Instead {
+    Nothing,
+    Spinner,
+    /// It did not come.
+    Failed,
+    /// It is here, and nothing can be made of it.
+    Unreadable,
+    /// Fetching it would tell somebody.
+    Elsewhere,
+}
+
+/// What a picture that is not here shows, until it is here or given up.
+fn wait_for(frame: &gtk::Button, url: &str) {
+    let instead = if crate::art::file(url).is_some() {
+        Instead::Unreadable
+    } else if !tern_engine::may_prefetch(url) {
+        Instead::Elsewhere
+    } else if let Some(left) = crate::art::wait_for(url) {
+        let (frame, url) = (frame.downgrade(), url.to_owned());
+        glib::timeout_add_local_once(left + Duration::from_millis(50), move || {
+            if let Some(frame) = frame.upgrade()
+                && frame.widget_name() == url
+                && frame.has_css_class("coming")
+            {
+                wait_for(&frame, &url);
             }
         });
+        Instead::Spinner
+    } else {
+        Instead::Failed
+    };
+    stand_in(frame, instead);
+}
+
+fn stand_in(frame: &gtk::Button, instead: Instead) {
+    let (icon, why, does) = match instead {
+        Instead::Nothing | Instead::Spinner => ("", "", "Show the picture"),
+        Instead::Failed => (
+            "view-refresh-symbolic",
+            "The picture did not load. Click to try again.",
+            "Load the picture again",
+        ),
+        Instead::Unreadable => (
+            "image-missing-symbolic",
+            "This kind of picture cannot be shown here. Click for more.",
+            "Show the picture",
+        ),
+        Instead::Elsewhere => (
+            "image-x-generic-symbolic",
+            "A picture on another site. Click to open it in the browser.",
+            "Open the picture in the browser",
+        ),
+    };
+    say(frame, does);
+    // Where there is little room, the icon has to do.
+    frame.set_tooltip_text((!why.is_empty()).then_some(why));
+    let loading = instead == Instead::Spinner;
+    if loading {
+        frame.add_css_class("coming");
+    } else {
+        frame.remove_css_class("coming");
+    }
+    frame.set_cursor_from_name(Some(match instead {
+        Instead::Nothing => "zoom-in",
+        Instead::Spinner => "default",
+        _ => "pointer",
+    }));
+    let Some(holder) = frame
+        .child()
+        .and_then(|child| child.last_child())
+        .filter(|child| child.has_css_class("instead"))
+    else {
+        return;
+    };
+    holder.set_visible(instead != Instead::Nothing);
+    let mut part = holder.first_child();
+    while let Some(widget) = part {
+        part = widget.next_sibling();
+        if let Some(image) = widget.downcast_ref::<gtk::Image>() {
+            image.set_icon_name((!icon.is_empty()).then_some(icon));
+        } else if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+            label.set_label(why);
+            let roomy = frame
+                .parent()
+                .and_downcast::<Fit>()
+                .and_then(|fit| fit.size())
+                .is_some_and(|(width, height)| width >= 180 && height >= 90);
+            label.set_visible(!why.is_empty() && roomy);
+            continue;
+        }
+        widget.set_visible(loading == widget.is::<adw::Spinner>());
     }
 }
 

@@ -5,9 +5,9 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gtk4 as gtk;
-use gtk4::gio;
 use gtk4::glib::{self, BoxedAnyObject};
 use gtk4::prelude::*;
+use gtk4::{gdk, gio, graphene};
 use libadwaita as adw;
 
 use crate::art;
@@ -101,6 +101,7 @@ fn bind(widgets: &RowWidgets, row: &ChatRow) {
 fn spoken(row: &ChatRow) -> String {
     let unread = if row.unread { ", unread" } else { "" };
     let mentions = if row.mentions { ", mentions you" } else { "" };
+    let pinned = if row.pinned { ", pinned" } else { "" };
     let muted = if row.muted { ", muted" } else { "" };
     let there = row
         .person
@@ -109,9 +110,58 @@ fn spoken(row: &ChatRow) -> String {
         .map(|availability| format!(", {}", presence::words(availability).to_lowercase()))
         .unwrap_or_default();
     format!(
-        "{}{there}{unread}{mentions}{muted}. {} {}",
+        "{}{there}{pinned}{unread}{mentions}{muted}. {} {}",
         row.title, row.preview, row.when
     )
+}
+
+/// What can be done with a chat, next to the pointer.
+fn show_menu(row: &ChatRow, near: &gtk::Widget, x: f64, y: f64) {
+    let menu = gio::Menu::new();
+    let item = |label: &str, action: &str, target: glib::Variant| {
+        let item = gio::MenuItem::new(Some(label), None);
+        item.set_action_and_target_value(Some(action), Some(&target));
+        menu.append_item(&item);
+    };
+    if row.team.is_none() {
+        let label = if row.pinned { "Unpin" } else { "Pin" };
+        item(label, "win.pin", (&row.id, !row.pinned).to_variant());
+    }
+    item("Open in its own window", "win.apart", row.id.to_variant());
+    let popover = gtk::PopoverMenu::from_model(Some(&menu));
+    popover.set_has_arrow(false);
+    popover.set_halign(gtk::Align::Start);
+    // The row may be another one by the time something is chosen. Within what scrolls, the arrow
+    // keys would lead back to the list.
+    let Some(list) = near
+        .ancestor(gtk::ScrolledWindow::static_type())
+        .and_then(|scroll| scroll.parent())
+    else {
+        return;
+    };
+    let at = graphene::Point::new(x as f32, y as f32);
+    let Some(at) = near.compute_point(&list, &at) else {
+        return;
+    };
+    popover.set_parent(&list);
+    popover.set_pointing_to(Some(&gdk::Rectangle::new(
+        at.x() as i32,
+        at.y() as i32,
+        1,
+        1,
+    )));
+    let focus = list.root().and_then(|root| root.focus());
+    popover.connect_closed(move |popover| {
+        // The action runs after it closes.
+        let (popover, focus) = (popover.clone(), focus.clone());
+        glib::idle_add_local_once(move || {
+            popover.unparent();
+            if let Some(focus) = focus.filter(WidgetExt::is_mapped) {
+                focus.grab_focus();
+            }
+        });
+    });
+    popover.popup();
 }
 
 type Chosen = Rc<RefCell<Option<Rc<dyn Fn(&str)>>>>;
@@ -130,13 +180,26 @@ pub struct Sidebar {
     later: Rc<RefCell<Option<Vec<ChatRow>>>>,
     /// Called for a row clicked twice.
     twice: Chosen,
+    headings: gtk::SignalListItemFactory,
 }
 
 impl Sidebar {
     pub fn new(chosen: impl Fn(&str) + 'static) -> Sidebar {
         let items = gio::ListStore::new::<BoxedAnyObject>();
-        let selection = gtk::SingleSelection::builder()
+        // The pinned ones have a heading. They come first already: sorting keeps the rest in order.
+        let apart = gtk::CustomSorter::new(|one, other| {
+            let after = |row: &glib::Object| {
+                row.downcast_ref::<BoxedAnyObject>()
+                    .is_some_and(|row| !row.borrow::<ChatRow>().apart)
+            };
+            after(one).cmp(&after(other)).into()
+        });
+        let sections = gtk::SortListModel::builder()
             .model(&items)
+            .section_sorter(&apart)
+            .build();
+        let selection = gtk::SingleSelection::builder()
+            .model(&sections)
             .autoselect(false)
             .can_unselect(true)
             .build();
@@ -149,6 +212,30 @@ impl Sidebar {
         factory.connect_setup(move |_, cell| {
             if let Some(cell) = cell.downcast_ref::<gtk::ListItem>() {
                 let widgets = build();
+                let menu = gtk::GestureClick::builder()
+                    .button(gdk::BUTTON_SECONDARY)
+                    .build();
+                let press = gtk::GestureLongPress::builder().touch_only(true).build();
+                let show = {
+                    let cell = cell.downgrade();
+                    move |x: f64, y: f64| {
+                        let Some(cell) = cell.upgrade() else { return };
+                        let row = cell.item().and_downcast::<BoxedAnyObject>();
+                        if let (Some(row), Some(widget)) = (row, cell.child()) {
+                            show_menu(&row.borrow::<ChatRow>(), &widget, x, y);
+                        }
+                    }
+                };
+                menu.connect_pressed({
+                    let show = show.clone();
+                    move |menu, _, x, y| {
+                        menu.set_state(gtk::EventSequenceState::Claimed);
+                        show(x, y);
+                    }
+                });
+                press.connect_pressed(move |_, x, y| show(x, y));
+                widgets.root.add_controller(menu);
+                widgets.root.add_controller(press);
                 let click = gtk::GestureClick::new();
                 click.connect_pressed({
                     let (cell, clicked) = (cell.downgrade(), clicked.clone());
@@ -221,6 +308,47 @@ impl Sidebar {
             .vexpand(true)
             .child(&view)
             .build();
+        let headings = gtk::SignalListItemFactory::new();
+        headings.connect_setup(|_, header| {
+            if let Some(header) = header.downcast_ref::<gtk::ListHeader>() {
+                let label = gtk::Label::builder().xalign(0.0).build();
+                label.add_css_class("heading");
+                label.add_css_class("dim-label");
+                header.set_child(Some(&label));
+            }
+        });
+        headings.connect_bind(|_, header| {
+            let Some(header) = header.downcast_ref::<gtk::ListHeader>() else {
+                return;
+            };
+            let row = header.item().and_downcast::<BoxedAnyObject>();
+            if let (Some(row), Some(label)) = (row, header.child().and_downcast::<gtk::Label>()) {
+                let pinned = row.borrow::<ChatRow>().apart;
+                label.set_label(if pinned { "Pinned" } else { "Chats" });
+            }
+        });
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_pressed({
+            let (view, selection) = (view.downgrade(), selection.clone());
+            move |_, key, _, held| {
+                let asked = key == gdk::Key::Menu
+                    || (key == gdk::Key::F10 && held.contains(gdk::ModifierType::SHIFT_MASK));
+                let row = selection.selected_item().and_downcast::<BoxedAnyObject>();
+                let (true, Some(row), Some(view)) = (asked, row, view.upgrade()) else {
+                    return glib::Propagation::Proceed;
+                };
+                // Below the row that has the keyboard.
+                let focus = view
+                    .root()
+                    .and_then(|root| root.focus())
+                    .filter(|focus| focus.is_ancestor(&view))
+                    .unwrap_or(view.upcast());
+                let (x, y) = (40.0, f64::from(focus.height().min(56)));
+                show_menu(&row.borrow::<ChatRow>(), &focus, x, y);
+                glib::Propagation::Stop
+            }
+        });
+        view.add_controller(keys);
         let quiet = Rc::new(std::cell::Cell::new(false));
         selection.connect_selected_item_notify({
             let (wanted, quiet) = (wanted.clone(), quiet.clone());
@@ -257,7 +385,15 @@ impl Sidebar {
             moved,
             later: Rc::default(),
             twice,
+            headings,
         }
+    }
+
+    /// Whether a chat in the list is pinned.
+    pub fn is_pinned(&self, id: &str) -> Option<bool> {
+        let rows = self.rows.borrow();
+        let row = rows.iter().find(|row| row.id == id)?;
+        row.team.is_none().then_some(row.pinned)
     }
 
     /// Calls `run` for a row that is clicked twice.
@@ -301,6 +437,11 @@ impl Sidebar {
                 Step::Insert(at, from) => self.items.insert(at as u32, &boxed(&rows[from])),
                 Step::Replace(at, from) => self.items.splice(at as u32, 1, &[boxed(&rows[from])]),
             }
+        }
+        // Where nothing is pinned there is nothing to tell apart.
+        let headings = rows.iter().any(|row| row.apart).then_some(&self.headings);
+        if self.view.header_factory().is_some() != headings.is_some() {
+            self.view.set_header_factory(headings);
         }
         let people = rows.iter().filter_map(|row| row.person.clone()).collect();
         self.rows.replace(rows);

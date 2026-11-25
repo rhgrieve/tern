@@ -154,6 +154,10 @@ fn beside(teams: Arc<Teams>, request: &Request) -> Option<Work> {
             conversation,
             message,
         } => act(conversation, message, Act::Delete),
+        Request::Pin { conversation, on } => {
+            let (conversation, on, teams) = (conversation.clone(), *on, teams.clone());
+            Some(Box::pin(async move { teams.pin(&conversation, on).await }))
+        }
         Request::Look { conversation, post } => {
             let (conversation, post, teams) = (conversation.clone(), post.clone(), teams.clone());
             Some(Box::pin(async move {
@@ -800,6 +804,7 @@ impl Daemon {
             | Request::React { .. }
             | Request::Edit { .. }
             | Request::Delete { .. }
+            | Request::Pin { .. }
             | Request::Look { .. }
             | Request::Receipts { .. }
             | Request::Picture { .. }
@@ -932,9 +937,17 @@ impl Daemon {
                     if let Some(messages) = &self.messages
                         && let Some(work) = beside(messages.teams(), &request)
                     {
+                        // Other windows list the chats, too.
+                        let moved = matches!(request, Request::Pin { .. })
+                            .then(|| self.changes.clone());
                         tokio::spawn(async move {
                             let _ = reply.send(match work.await {
-                                Ok(()) => Response::Done,
+                                Ok(()) => {
+                                    if let Some(moved) = moved {
+                                        let _ = moved.send(Change::Chats);
+                                    }
+                                    Response::Done
+                                }
                                 Err(failure) => Response::Error(failure.text().to_owned()),
                             });
                         });

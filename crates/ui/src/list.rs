@@ -634,6 +634,13 @@ mod tests {
     use crate::card::{Card, Piece};
     use crate::rich::Block;
 
+    fn shown(url: &str) -> Block {
+        Block::Picture {
+            url: url.into(),
+            size: None,
+        }
+    }
+
     /// As the composer's test: needs a display.
     #[test]
     #[ignore = "needs a display"]
@@ -658,8 +665,8 @@ mod tests {
         items.push(Item {
             blocks: vec![
                 Block::Text("look".into()),
-                Block::Picture(url("a")),
-                Block::Quote(vec![Block::Picture(url("b"))]),
+                shown(&url("a")),
+                Block::Quote(vec![shown(&url("b"))]),
                 Block::Card(Box::new(Card {
                     pieces: vec![Piece::Picture {
                         url: url("c"),
@@ -703,9 +710,9 @@ mod tests {
                     found.0 += usize::from(image.paintable().is_some());
                 }
                 if let Some(label) = within.downcast_ref::<gtk::Label>() {
-                    let stands_in = ["Picture not on this computer", ":party:"];
-                    found.1 += usize::from(stands_in.contains(&label.text().as_str()));
+                    found.1 += usize::from(label.text() == ":party:");
                 }
+                found.1 += usize::from(within.is::<adw::Spinner>());
             }
             let mut child = within.first_child();
             while let Some(widget) = child {
@@ -719,6 +726,12 @@ mod tests {
         assert_eq!(count(&root), (0, 3));
         assert!(list.at_end());
 
+        // One is given up: it does not turn forever.
+        crate::art::give_up(&url("b"));
+        list.show_pictures();
+        wait(100);
+        assert_eq!(count(&root), (0, 2));
+
         // One of them is here, and then all.
         let files = store::ImageFileCache::open(folder.path(), 1 << 30).unwrap();
         let picture =
@@ -729,7 +742,7 @@ mod tests {
         files.put(&url("a"), &bytes, "png").unwrap();
         list.show_pictures();
         wait(400);
-        assert_eq!(count(&root), (1, 2));
+        assert_eq!(count(&root), (1, 1));
         for name in ["b", "c"] {
             files.put(&url(name), &bytes, "png").unwrap();
         }
@@ -909,8 +922,8 @@ mod tests {
             text(&long),
             text(&"─".repeat(93)),
             text(&["@Somebody"; 12].join("\u{a0}")),
-            Block::Picture(url.into()),
-            Block::Quote(vec![text(&long), Block::Picture(url.into())]),
+            shown(url),
+            Block::Quote(vec![text(&long), shown(url)]),
             Block::Code {
                 language: None,
                 text: long.clone(),
@@ -952,7 +965,7 @@ mod tests {
             }
             let least = row.measure(gtk::Orientation::Horizontal, -1).0;
             assert!(least <= 340, "{least}: {block:?}");
-            if block == Block::Picture(url.into()) {
+            if block == shown(url) {
                 // In its shape, with all the room and with little.
                 // 420 wide at first, and then what a window of 340 leaves.
                 let room = 340 - (least - 120);

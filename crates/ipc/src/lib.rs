@@ -53,6 +53,11 @@ pub enum Request {
         #[serde(default)]
         files: Vec<PathBuf>,
     },
+    /// Keep a chat at the top of the list, or no longer.
+    Pin {
+        conversation: String,
+        on: bool,
+    },
     /// Try a message again that could not be sent, or forget it.
     Retry {
         id: String,

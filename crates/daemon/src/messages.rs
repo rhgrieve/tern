@@ -1,5 +1,6 @@
 //! Message sync, the outbox and notification rules for the signed-in account.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,8 +15,10 @@ use tern_engine::{
     Want, database_path, media_usage, open_store, people, pictures, prefetch,
 };
 use tern_ipc::{Availability, Event};
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
+use tokio::time::{Instant, timeout_at};
 
 pub enum News {
     Arrived(Arrived),
@@ -61,6 +64,9 @@ const REACTED: usize = 200;
 /// At most this many messages are looked at for a window.
 const LOOKED_FOR: usize = 2000;
 const PEOPLE: usize = 200;
+/// How often in that time a pinned chat is read that is not in the chat list.
+const PIN_TRIES: u32 = 2;
+const PINS_EVERY: Duration = Duration::from_secs(5 * 60);
 const MEDIA_EVERY: Duration = Duration::from_secs(30 * 60);
 
 pub fn presence<'a>(
@@ -135,6 +141,53 @@ async fn want_recent(
             return;
         }
         tokio::time::sleep(MEDIA_EVERY).await;
+    }
+}
+
+/// Reads which chats are pinned, after the first sync and now and then: nobody tells.
+async fn read_pins(
+    mut state: watch::Receiver<SyncState>,
+    teams: Arc<Teams>,
+    changes: broadcast::Sender<Event>,
+) {
+    loop {
+        if state.wait_for(|state| state.refreshed).await.is_err() {
+            return;
+        }
+        // Before anything can change.
+        let mut core = teams.engine().subscribe();
+        match teams.read_pins().await {
+            Ok(true) => drop(changes.send(Event::Chats)),
+            Ok(false) => {}
+            Err(failure) => tracing::debug!(error = failure.text(), "pinned chats"),
+        }
+        let mut tries: HashMap<String, u32> = HashMap::new();
+        let next = Instant::now() + PINS_EVERY;
+        loop {
+            for id in teams.missing_pins() {
+                let tried = tries.entry(id.clone()).or_default();
+                *tried += 1;
+                // The service may list it as gone, and give it all the same.
+                if *tried <= PIN_TRIES
+                    && let Err(failure) = teams.read_chat(&id).await
+                {
+                    tracing::debug!(error = failure.text(), "a pinned chat");
+                }
+            }
+            // A new chat list may have dropped one.
+            let dropped = async {
+                loop {
+                    match core.recv().await {
+                        Ok(CoreEvent::SidebarChanged) | Err(RecvError::Lagged(_)) => return,
+                        Ok(_) => {}
+                        Err(RecvError::Closed) => std::future::pending().await,
+                    }
+                }
+            };
+            if timeout_at(next, dropped).await.is_err() {
+                break;
+            }
+        }
     }
 }
 
@@ -217,6 +270,7 @@ impl Messages {
         let (sent, moved) = (news.clone(), changes.clone());
         let tasks = vec![
             tokio::spawn(prefetch(teams.clone(), wanted)),
+            tokio::spawn(read_pins(state.clone(), teams.clone(), changes.clone())),
             tokio::spawn(tell(core, changes, news.clone())),
             tokio::spawn(want_recent(state.clone(), store.clone(), want.clone())),
             tokio::spawn(sync.run()),

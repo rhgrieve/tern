@@ -22,7 +22,11 @@ pub enum Block {
         header: bool,
         rows: Vec<Vec<String>>,
     },
-    Picture(String),
+    Picture {
+        url: String,
+        /// As wide and high as the message says it is.
+        size: Option<(i32, i32)>,
+    },
     Card(Box<crate::card::Card>),
     /// What is behind a link, as Teams saw it.
     Preview(Box<Preview>),
@@ -182,7 +186,10 @@ impl Builder {
                     });
                 }
                 Span::Image { hosted_content_url } => {
-                    self.block(Block::Picture(hosted_content_url.clone()));
+                    self.block(Block::Picture {
+                        url: hosted_content_url.clone(),
+                        size: None,
+                    });
                 }
                 Span::Quote { children, .. } | Span::BlockQuote(children) => {
                     let inner = blocks(children);

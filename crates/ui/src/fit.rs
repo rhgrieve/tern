@@ -101,6 +101,10 @@ impl Fit {
         self.imp().child.borrow().clone()
     }
 
+    pub fn size(&self) -> Option<(i32, i32)> {
+        self.imp().size.get()
+    }
+
     pub fn set_size(&self, size: Option<(i32, i32)>) {
         if self.imp().size.replace(size) != size {
             self.queue_resize();

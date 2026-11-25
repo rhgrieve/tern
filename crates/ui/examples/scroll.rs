@@ -48,7 +48,10 @@ fn item(number: i64) -> Item {
                 markup: text(1),
             })
             .collect(),
-        6 => vec![Block::Picture("x".into())],
+        6 => vec![Block::Picture {
+            url: "x".into(),
+            size: None,
+        }],
         7 => vec![Block::Text(text(12))],
         8 => vec![Block::Table {
             header: true,

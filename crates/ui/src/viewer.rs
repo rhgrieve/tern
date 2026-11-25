@@ -48,6 +48,7 @@ impl Viewer {
             .content_width((widget.width() - AROUND).max(320))
             .content_height((widget.height() - AROUND).max(280))
             .build();
+        crate::beside::closes(&dialog);
         let viewer = Rc::new(Viewer {
             dialog,
             picture,
@@ -108,8 +109,13 @@ impl Viewer {
         let click = gtk::GestureClick::new();
         click.connect_released({
             let viewer = Rc::downgrade(&viewer);
-            move |_, _, _, _| {
-                if let Some(viewer) = viewer.upgrade() {
+            move |_, _, x, y| {
+                let Some(viewer) = viewer.upgrade() else {
+                    return;
+                };
+                if viewer.beside(x, y) {
+                    viewer.dialog.close();
+                } else {
                     viewer.fit(viewer.actual.get());
                 }
             }
@@ -150,6 +156,19 @@ impl Viewer {
         });
         self.picture
             .set_cursor_from_name(Some(if fit { "zoom-in" } else { "zoom-out" }));
+    }
+
+    /// The place is next to the picture, where there is nothing to see.
+    fn beside(&self, x: f64, y: f64) -> bool {
+        let Some(texture) = self.texture() else {
+            return true;
+        };
+        let room = (
+            f64::from(self.picture.width()),
+            f64::from(self.picture.height()),
+        );
+        let size = (f64::from(texture.width()), f64::from(texture.height()));
+        outside(room, size, (x, y))
     }
 
     fn texture(&self) -> Option<gdk::Texture> {
@@ -218,11 +237,30 @@ impl Viewer {
     }
 }
 
+/// Whether a place is outside of a picture of `size` in the middle of `room`, shrunk to fit.
+fn outside(room: (f64, f64), size: (f64, f64), (x, y): (f64, f64)) -> bool {
+    let fit = (room.0 / size.0).min(room.1 / size.1).min(1.0);
+    let off = |at: f64, room: f64, size: f64| (at - room / 2.0).abs() > size * fit / 2.0;
+    off(x, room.0, size.0) || off(y, room.1, size.1)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    #[test]
+    fn what_is_beside_a_picture() {
+        let wide = |x, y| outside((600.0, 400.0), (1200.0, 400.0), (x, y));
+        assert!(!wide(1.0, 200.0));
+        assert!(!wide(300.0, 101.0));
+        assert!(wide(300.0, 99.0));
+        assert!(wide(300.0, 301.0));
+        let small = |x, y| outside((600.0, 400.0), (100.0, 100.0), (x, y));
+        assert!(!small(300.0, 200.0));
+        assert!(small(240.0, 200.0));
+    }
 
     /// As the composer's test: needs a display.
     #[test]
