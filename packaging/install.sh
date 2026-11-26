@@ -38,10 +38,10 @@ for name in ternd tern tern-cli tern-login tern-call; do
 $name cannot run here:
 $wrong
 
-Tern needs GTK 4.16, libadwaita 1.8 and WebKitGTK 6.0 or newer (and a 64-bit Intel or AMD computer):
-  Fedora   sudo dnf install gtk4 libadwaita webkitgtk6.0
-  Ubuntu   sudo apt install libgtk-4-1 libadwaita-1-0 libwebkitgtk-6.0-4
-  Arch     sudo pacman -S --needed gtk4 libadwaita webkitgtk-6.0
+Tern needs GTK 4.16, libadwaita 1.8 and WebKitGTK 6.0 or newer, and ALSA for calls (and a 64-bit Intel or AMD computer):
+  Fedora   sudo dnf install gtk4 libadwaita webkitgtk6.0 alsa-lib
+  Ubuntu   sudo apt install libgtk-4-1 libadwaita-1-0 libwebkitgtk-6.0-4 libasound2t64
+  Arch     sudo pacman -S --needed gtk4 libadwaita webkitgtk-6.0 alsa-lib
 Older systems (Ubuntu 25.04, Debian 13, Fedora 42 and before) do not have them.
 END
         exit 1

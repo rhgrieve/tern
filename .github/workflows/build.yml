@@ -135,13 +135,13 @@ jobs:
       matrix:
         include:
           - system: ubuntu:26.04
-            install: apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -qy libgtk-4-1 libadwaita-1-0 libwebkitgtk-6.0-4 libgtk-4-bin
+            install: apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -qy libgtk-4-1 libadwaita-1-0 libwebkitgtk-6.0-4 libasound2t64 libgtk-4-bin
           - system: fedora:43
-            install: dnf -qy install gtk4 libadwaita webkitgtk6.0 procps-ng
+            install: dnf -qy install gtk4 libadwaita webkitgtk6.0 alsa-lib procps-ng
           - system: fedora:44
-            install: dnf -qy install gtk4 libadwaita webkitgtk6.0 procps-ng
+            install: dnf -qy install gtk4 libadwaita webkitgtk6.0 alsa-lib procps-ng
           - system: archlinux:latest
-            install: pacman -Syu --noconfirm --needed gtk4 libadwaita webkitgtk-6.0
+            install: pacman -Syu --noconfirm --needed gtk4 libadwaita webkitgtk-6.0 alsa-lib
     container: ${{ matrix.system }}
     name: try (${{ matrix.system }})
     steps:
