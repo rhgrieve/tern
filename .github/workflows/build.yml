@@ -93,6 +93,15 @@ jobs:
       - name: Build
         run: cargo build --locked --release --workspace
 
+      # Built on a newer glibc than some systems tried below have: Fedora 43's is 2.42.
+      - name: Runs on older glibc
+        run: |
+          for program in tern ternd tern-cli tern-login tern-call; do
+            newest=$(objdump -T "target/release/$program" | grep -oE 'GLIBC_2\.[0-9]+' | sort -t. -k2 -n -u | tail -1)
+            echo "$program needs $newest"
+            [ "${newest#GLIBC_2.}" -le 42 ]
+          done
+
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: github.ref == 'refs/heads/main'
         with:

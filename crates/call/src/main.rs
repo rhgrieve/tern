@@ -14,6 +14,7 @@
 //! standard input. They say `caller: …` once the call is reached.
 
 mod guard;
+mod math;
 
 use std::process::ExitCode;
 use std::sync::Arc;
