@@ -4,12 +4,14 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use gtk4 as gtk;
 use gtk4::prelude::*;
 use gtk4::{gdk, gio, glib};
 use serde::{Deserialize, Serialize};
 
+use crate::editor;
 use crate::emoji;
 use crate::mention::{self, Person};
 use crate::row;
@@ -74,6 +76,7 @@ impl Written {
 pub type Drafts = Rc<RefCell<HashMap<String, Written>>>;
 
 type Search = Rc<dyn Fn(&str) -> Vec<Person>>;
+type Told = Rc<dyn Fn(&str)>;
 
 /// How many emoji are offered.
 const EMOJI: usize = 8;
@@ -83,6 +86,30 @@ const EMOJI: usize = 8;
 enum Choice {
     Person(Person),
     Emoji(emoji::Found),
+}
+
+/// What is in the user's editor for a conversation.
+struct Away {
+    /// What the composer was for.
+    aim: Aim,
+    sent: editor::Sent,
+    file: PathBuf,
+    marker: Option<PathBuf>,
+    name: String,
+    /// The editor has not ended yet.
+    running: Rc<std::cell::Cell<bool>>,
+}
+
+/// What ends this soon only handed the file on, unless it failed.
+const AT_ONCE: Duration = Duration::from_secs(2);
+
+/// Whether text written for `was` is what is being written for `now`.
+fn same_aim(was: &Aim, now: &Aim) -> bool {
+    match (was, now) {
+        (Aim::Edit { message: was }, Aim::Edit { message: now }) => was == now,
+        (Aim::Edit { .. }, _) | (_, Aim::Edit { .. }) => false,
+        _ => true,
+    }
 }
 
 #[derive(Clone)]
@@ -108,6 +135,12 @@ pub struct Composer {
     aside: Rc<RefCell<Written>>,
     /// The text is being set by us.
     filling: Rc<std::cell::Cell<bool>>,
+    /// Conversations whose text is in the user's editor.
+    away: Rc<RefCell<HashMap<String, Away>>>,
+    elsewhere: gtk::Button,
+    away_bar: gtk::Box,
+    away_text: gtk::Label,
+    trouble: Rc<RefCell<Option<Told>>>,
 }
 
 impl Composer {
@@ -184,16 +217,48 @@ impl Composer {
         row::say(&attach, "Attach files");
         attach.add_css_class("flat");
         attach.add_css_class("circular");
+        let elsewhere = gtk::Button::builder()
+            .icon_name("document-edit-symbolic")
+            .tooltip_text("Write in your editor (Ctrl+Shift+E)")
+            .valign(gtk::Align::End)
+            .visible(editor::reachable())
+            .build();
+        row::say(&elsewhere, "Write in your editor");
+        elsewhere.add_css_class("flat");
+        elsewhere.add_css_class("circular");
+        let away_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        away_bar.add_css_class("about");
+        away_bar.set_visible(false);
+        let away_text = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .wrap(true)
+            .valign(gtk::Align::BaselineFill)
+            .build();
+        away_text.add_css_class("caption");
+        let done = gtk::Button::builder()
+            .label("Done")
+            .tooltip_text("Bring back what was saved, also if the editor is still open")
+            .valign(gtk::Align::BaselineFill)
+            .build();
+        done.add_css_class("flat");
+        if let Some(label) = done.child() {
+            label.set_valign(gtk::Align::BaselineFill);
+        }
+        away_bar.append(&away_text);
+        away_bar.append(&done);
         let chips = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         chips.add_css_class("chips");
         chips.set_visible(false);
         let line = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         line.append(&attach);
+        line.append(&elsewhere);
         line.append(&overlay);
         line.append(&send);
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.add_css_class("composer");
         root.append(&about);
+        root.append(&away_bar);
         root.append(&chips);
         root.append(&line);
 
@@ -233,6 +298,11 @@ impl Composer {
             hint,
             aside: Rc::default(),
             filling: Rc::default(),
+            away: Rc::default(),
+            elsewhere: elsewhere.clone(),
+            away_bar,
+            away_text,
+            trouble: Rc::default(),
         };
         let submit = {
             let composer = composer.clone();
@@ -241,6 +311,10 @@ impl Composer {
                 let Some(id) = composer.open.borrow().clone() else {
                     return;
                 };
+                // What is in the editor is not sent from here.
+                if composer.shown_away().is_some() {
+                    return;
+                }
                 if written.text.is_empty() && written.files.is_empty() {
                     return;
                 }
@@ -312,6 +386,18 @@ impl Composer {
             let composer = composer.clone();
             move |_| composer.ask_for_files()
         });
+        elsewhere.connect_clicked({
+            let composer = composer.clone();
+            move |_| composer.write_elsewhere()
+        });
+        done.connect_clicked({
+            let composer = composer.clone();
+            move |_| {
+                if let Some(id) = composer.shown_away() {
+                    composer.finish(&id);
+                }
+            }
+        });
         text.connect_paste_clipboard({
             let composer = composer.clone();
             move |text| {
@@ -371,9 +457,184 @@ impl Composer {
 
     fn update(&self) {
         let raw = self.raw();
-        self.hint.set_visible(raw.is_empty());
-        self.send
-            .set_sensitive(!raw.trim().is_empty() || !self.files.borrow().is_empty());
+        let away = self.shown_away();
+        self.hint.set_visible(raw.is_empty() && away.is_none());
+        self.send.set_sensitive(
+            away.is_none() && (!raw.trim().is_empty() || !self.files.borrow().is_empty()),
+        );
+        // What is in the editor is changed there only.
+        self.text.set_editable(away.is_none());
+        self.text.set_cursor_visible(away.is_none());
+        self.elsewhere
+            .set_sensitive(away.is_none() && self.open.borrow().is_some());
+        let name = away.and_then(|id| Some(self.away.borrow().get(&id)?.name.clone()));
+        self.away_bar.set_visible(name.is_some());
+        if let Some(name) = name {
+            self.away_text.set_text(&format!(
+                "Writing in {name}. Save and close it to bring the text back here."
+            ));
+        }
+    }
+
+    /// The conversation open here, when what it shows is in the user's editor.
+    fn shown_away(&self) -> Option<String> {
+        let id = self.open.borrow().clone()?;
+        let away = self.away.borrow();
+        let aim = self.aim.borrow();
+        same_aim(&away.get(&id)?.aim, &aim).then_some(id)
+    }
+
+    /// Calls `told` with what went wrong when the editor could not be used.
+    pub fn connect_trouble(&self, told: impl Fn(&str) + 'static) {
+        self.trouble.replace(Some(Rc::new(told)));
+    }
+
+    fn tell(&self, text: &str) {
+        let told = self.trouble.borrow().clone();
+        match told {
+            Some(told) => told(text),
+            None => eprintln!("tern: {text}"),
+        }
+    }
+
+    /// Opens what is being written in the user's editor. It comes back when the editor ends.
+    pub fn write_elsewhere(&self) {
+        self.write_with(|file| editor::plan(&editor::Setting::here(), file));
+    }
+
+    /// Opens what is being written with what `plan` says for its file.
+    fn write_with(&self, plan: impl FnOnce(&Path) -> Option<editor::Plan>) {
+        let Some(id) = self.opened().filter(|_| editor::reachable()) else {
+            return;
+        };
+        if self.away.borrow().contains_key(&id) {
+            return;
+        }
+        let written = self.written();
+        let file = match editor::write(&editor::folder(), &written.text) {
+            Ok(file) => file,
+            Err(error) => {
+                self.tell(&format!("The message could not be put in a file: {error}"));
+                return;
+            }
+        };
+        let Some(plan) = plan(&file) else {
+            editor::forget(&file, None);
+            self.tell("No editor was found: set $EDITOR, or a default app for text");
+            return;
+        };
+        if let Some(marker) = &plan.marker
+            && let Err(error) = editor::mark(marker)
+        {
+            editor::forget(&file, None);
+            self.tell(&format!("{} could not be opened: {error}", plan.name));
+            return;
+        }
+        let command: Vec<&std::ffi::OsStr> =
+            plan.command.iter().map(|word| word.as_os_str()).collect();
+        let child = match gio::Subprocess::newv(&command, gio::SubprocessFlags::NONE) {
+            Ok(child) => child,
+            Err(error) => {
+                editor::forget(&file, plan.marker.as_deref());
+                self.tell(&format!("{} could not be opened: {error}", plan.name));
+                return;
+            }
+        };
+        let running = Rc::new(std::cell::Cell::new(true));
+        let mut chosen = self.chosen.borrow().clone();
+        chosen.extend(written.mentions);
+        let away = Away {
+            aim: self.aim.borrow().clone(),
+            sent: editor::Sent {
+                text: written.text,
+                chosen,
+            },
+            file: file.clone(),
+            marker: plan.marker.clone(),
+            name: plan.name.clone(),
+            running: running.clone(),
+        };
+        self.away.borrow_mut().insert(id.clone(), away);
+        self.popover.popdown();
+        self.update();
+        let began = Instant::now();
+        child.wait_async(gio::Cancellable::NONE, {
+            let (composer, id, file) = (self.clone(), id.clone(), file.clone());
+            let (child, name) = (child.clone(), plan.name.clone());
+            move |_| {
+                running.set(false);
+                let ok = child.has_exited() && child.exit_status() == 0;
+                if !composer.is_away(&id, &file) {
+                    // Done was pressed while it was open.
+                    editor::forget(&file, Some(&editor::marker(&file)));
+                } else if began.elapsed() >= AT_ONCE {
+                    composer.finish(&id);
+                } else if !ok {
+                    composer.tell(&format!("{name} could not be opened"));
+                    composer.finish(&id);
+                }
+                // Otherwise it only handed the file on: the marker, or Done, ends it.
+            }
+        });
+        if let Some(marker) = plan.marker {
+            let composer = self.clone();
+            glib::timeout_add_local(Duration::from_millis(500), move || {
+                if !composer.is_away(&id, &file) {
+                    return glib::ControlFlow::Break;
+                }
+                if marker.exists() {
+                    return glib::ControlFlow::Continue;
+                }
+                composer.finish(&id);
+                glib::ControlFlow::Break
+            });
+        }
+    }
+
+    fn is_away(&self, id: &str, file: &Path) -> bool {
+        self.away
+            .borrow()
+            .get(id)
+            .is_some_and(|away| away.file == file)
+    }
+
+    /// Takes back what the editor of `id` saved.
+    fn finish(&self, id: &str) {
+        let Some(away) = self.away.borrow_mut().remove(id) else {
+            return;
+        };
+        let edited = std::fs::read_to_string(&away.file);
+        if !away.running.get() {
+            editor::forget(&away.file, away.marker.as_deref());
+        }
+        match edited {
+            Ok(edited) => self.bring_back(id, &away, &edited),
+            Err(error) => self.tell(&format!(
+                "What {} saved could not be read: {error}",
+                away.name
+            )),
+        }
+        self.update();
+    }
+
+    /// Puts what came back where the conversation's text is now: here, put aside for an edit, or
+    /// with the drafts.
+    fn bring_back(&self, id: &str, away: &Away, edited: &str) {
+        if !self.is_open(id) {
+            editor::into_drafts(&mut self.drafts.borrow_mut(), id, &away.sent, edited);
+            return;
+        }
+        let aim = self.aim.borrow().clone();
+        let editing = matches!(aim, Aim::Edit { .. });
+        if editing && !same_aim(&away.aim, &aim) {
+            let now = self.aside.borrow().clone();
+            if let Some(written) = editor::came_back(&away.sent, edited, &now) {
+                self.aside.replace(written);
+            }
+        } else if let Some(written) = editor::came_back(&away.sent, edited, &self.written()) {
+            self.fill(written);
+            self.focus();
+        }
     }
 
     /// Who can be mentioned: called with what was typed after the `@`.
@@ -785,6 +1046,7 @@ fn free_path(folder: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     type Sent = Rc<RefCell<Vec<(String, Written, Aim)>>>;
 
@@ -1003,5 +1265,125 @@ mod tests {
         press();
         assert!(take().unwrap().1.files.is_empty());
         assert_eq!(composer.written().files, [PathBuf::from("/x/b.txt")]);
+    }
+
+    /// An editor in a terminal, as `editor::plan` makes it: `script` gets the file as `$1`.
+    fn pretend(script: &str) -> impl FnOnce(&Path) -> Option<editor::Plan> {
+        let script = format!(r#"{script}; rm -f -- "$0""#);
+        move |file| {
+            let marker = editor::marker(file);
+            Some(editor::Plan {
+                command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    script.into(),
+                    marker.clone().into(),
+                    file.into(),
+                ],
+                name: "pretend".into(),
+                marker: Some(marker),
+            })
+        }
+    }
+
+    fn wait_until(done: impl Fn() -> bool) {
+        let context = glib::MainContext::default();
+        let began = Instant::now();
+        while !done() {
+            assert!(
+                began.elapsed() < Duration::from_secs(10),
+                "it never came back"
+            );
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// As above, one test at a time: `-- --ignored --exact composer::tests::the_composer_takes_back_what_the_editor_wrote`.
+    #[test]
+    #[ignore = "needs a display"]
+    fn the_composer_takes_back_what_the_editor_wrote() {
+        gtk::init().unwrap();
+        let drafts = Drafts::default();
+        let sent: Sent = Rc::default();
+        let composer = Composer::new(
+            drafts.clone(),
+            {
+                let sent = sent.clone();
+                move |id, text, aim| {
+                    sent.borrow_mut()
+                        .push((id.into(), text.clone(), aim.clone()))
+                }
+            },
+            || {},
+        );
+        let told: Rc<RefCell<Vec<String>>> = Rc::default();
+        composer.connect_trouble({
+            let told = told.clone();
+            move |text| told.borrow_mut().push(text.into())
+        });
+        let away = || !composer.away.borrow().is_empty();
+        let ann = ("a".to_owned(), "Ann Example".to_owned());
+
+        // Here, with the mention kept and the file left be.
+        composer.open("c1");
+        composer.chosen.replace(vec![ann.clone()]);
+        composer.text.buffer().set_text("hi @Ann Example");
+        composer.attach([PathBuf::from("/x/plan.pdf")]);
+        composer.write_with(pretend(r#"sleep 0.3; printf '\n\nand more\n' >> "$1""#));
+        assert!(away());
+        assert!(!composer.text.is_editable() && composer.away_bar.is_visible());
+        assert!(
+            !composer.is_sendable(),
+            "not sent while it is in the editor"
+        );
+        composer.send.emit_clicked();
+        assert!(sent.borrow().is_empty());
+        let file = composer.away.borrow()["c1"].file.clone();
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hi @Ann Example\n");
+        wait_until(|| !away());
+        assert!(!file.exists(), "the file is gone");
+        assert_eq!(
+            composer.written(),
+            Written {
+                text: "hi @Ann Example\n\n\nand more".into(),
+                mentions: vec![ann.clone()],
+                files: vec![PathBuf::from("/x/plan.pdf")],
+            }
+        );
+        assert!(composer.text.is_editable() && !composer.away_bar.is_visible());
+
+        // Into the draft of a chat left meanwhile; the other chat can be written in.
+        composer.open("c2");
+        composer.text.buffer().set_text("short");
+        composer.write_with(pretend(r#"sleep 0.3; printf 'long instead' > "$1""#));
+        composer.open("c3");
+        assert!(composer.text.is_editable() && !composer.away_bar.is_visible());
+        composer.text.buffer().set_text("for c3");
+        wait_until(|| !away());
+        assert_eq!(drafts.borrow()["c2"].text, "long instead");
+        assert_eq!(composer.raw(), "for c3");
+        composer.open("c2");
+        assert_eq!(composer.raw(), "long instead");
+
+        // Nothing changed, or an editor that fails, leaves the text.
+        composer.write_with(pretend("true"));
+        wait_until(|| !away());
+        composer.write_with(pretend(r#": > "$1""#));
+        wait_until(|| !away());
+        assert_eq!(composer.raw(), "long instead");
+        assert!(told.borrow().is_empty());
+        composer.write_with(|_| {
+            Some(editor::Plan {
+                command: vec!["false".into()],
+                name: "broken".into(),
+                marker: None,
+            })
+        });
+        wait_until(|| !away());
+        assert_eq!(*told.borrow(), ["broken could not be opened"]);
+        assert_eq!(composer.raw(), "long instead");
     }
 }

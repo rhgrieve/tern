@@ -400,13 +400,16 @@ impl Window {
             }
 
             // Keys
-            let keys: [(&str, &[&str], Run); 12] = [
+            let keys: [(&str, &[&str], Run); 13] = [
                 ("leave", &["Escape"], Window::escape),
                 ("search", &["<Ctrl>k", "<Ctrl>f"], Window::search),
                 ("calendar", &["<Ctrl>e"], Window::calendar),
                 ("next", &["<Alt>Down"], |window| window.step(1)),
                 ("previous", &["<Alt>Up"], |window| window.step(-1)),
                 ("write", &["<Ctrl>r"], |window| window.composer.focus()),
+                ("elsewhere", &["<Ctrl><Shift>e"], |window| {
+                    window.composer.write_elsewhere()
+                }),
                 ("newest", &["<Ctrl>End"], |window| window.list.to_end()),
                 ("out", &["<Ctrl><Shift>o"], Window::pop_out),
                 ("pin-open", &["<Ctrl><Shift>p"], Window::pin_open),
@@ -525,6 +528,14 @@ impl Window {
                         glib::ControlFlow::Continue
                     }
                     None => glib::ControlFlow::Break,
+                }
+            });
+            composer.connect_trouble({
+                let weak = weak.clone();
+                move |text| {
+                    if let Some(window) = weak.upgrade() {
+                        window.toast(text);
+                    }
                 }
             });
             composer.connect_changed({
@@ -1863,6 +1874,13 @@ impl Window {
             let section = adw::ShortcutsSection::new(Some(title));
             for (what, keys) in keys {
                 section.add(adw::ShortcutsItem::new(what, keys));
+            }
+            // Not from inside a sandbox.
+            if title == "Messages" && crate::editor::reachable() {
+                section.add(adw::ShortcutsItem::new(
+                    "Write in your editor",
+                    "<Ctrl><Shift>e",
+                ));
             }
             dialog.add(section);
         }
