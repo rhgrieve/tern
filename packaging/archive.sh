@@ -7,7 +7,7 @@ version=$(cargo metadata --format-version 1 --no-deps --locked |
 name=tern-$version-x86_64
 rm -rf "dist/$name"
 mkdir -p "dist/$name/bin" "dist/$name/share"
-for program in ternd tern tern-cli tern-login; do
+for program in ternd tern tern-cli tern-login tern-call; do
     install -m755 "target/release/$program" "dist/$name/bin/"
     strip "dist/$name/bin/$program"
 done

@@ -1,7 +1,9 @@
 //! Tern's window. It reads the cache and asks the daemon for everything else.
 
+pub mod agenda;
 pub mod art;
 pub mod beside;
+pub mod call;
 pub mod card;
 pub mod cardview;
 pub mod client;
@@ -12,6 +14,7 @@ pub mod drafts;
 pub mod emoji;
 pub mod fit;
 pub mod history;
+pub mod join;
 pub mod list;
 pub mod mark;
 pub mod mention;

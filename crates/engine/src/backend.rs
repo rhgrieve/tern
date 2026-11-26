@@ -109,12 +109,14 @@ const PREVIEW: std::time::Duration = std::time::Duration::from_secs(20);
 pub struct Teams {
     engine: SyncEngine<Graph>,
     pub(crate) pins: chatsvc::Pins,
+    pub(crate) calendar: chatsvc::Calendar,
 }
 
 impl Teams {
     pub fn new(session: Session, store: Arc<Store>) -> Arc<Self> {
         Arc::new(Teams {
             pins: chatsvc::Pins::new(&session),
+            calendar: chatsvc::Calendar::new(&session),
             engine: SyncEngine::new(Graph::new(session), store),
         })
     }
@@ -126,10 +128,15 @@ impl Teams {
         folder: &std::path::Path,
     ) -> Result<Arc<Self>, String> {
         let pins = chatsvc::Pins::new(&session);
+        let calendar = chatsvc::Calendar::new(&session);
         let engine = SyncEngine::new(Graph::new(session), store)
             .with_image_dir(folder, crate::media::IMAGE_BYTES)
             .map_err(|error| error.to_string())?;
-        Ok(Arc::new(Teams { engine, pins }))
+        Ok(Arc::new(Teams {
+            engine,
+            pins,
+            calendar,
+        }))
     }
 
     pub fn engine(&self) -> &SyncEngine<Graph> {
@@ -432,10 +439,10 @@ impl Teams {
         Ok(())
     }
 
-    /// Fetches one picture, if that tells nobody anything.
+    /// Fetches one picture the user looks at.
     pub async fn picture(&self, url: &str) -> Result<(), Failure> {
-        if !crate::media::may_prefetch(url) {
-            return Err(Failure::Permanent("not a picture Teams stores".into()));
+        if !crate::media::may_show(url) {
+            return Err(Failure::Permanent("not a picture of Teams or Giphy".into()));
         }
         let image = teams_core::ImageRef {
             id: url.to_owned(),
@@ -529,6 +536,50 @@ mod tests {
 
     fn post(url: &str, body: serde_json::Value) -> Request {
         Request::with_body(Method::Post, url, body)
+    }
+
+    struct Never;
+
+    impl session::TokenProvider for Never {
+        fn token<'a>(
+            &'a self,
+            _: &'a session::Scope,
+            _: Option<&'a str>,
+            _: bool,
+        ) -> session::BoxFuture<'a, session::Result<String>> {
+            panic!("a token was asked for");
+        }
+    }
+
+    fn without_account(folder: &std::path::Path) -> Arc<Teams> {
+        let session = Session::with_provider(Arc::new(Never), Default::default());
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        Teams::with_pictures(session, store, folder).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_picture_on_any_other_site_is_never_asked_for() {
+        let folder = tempfile::tempdir().unwrap();
+        let teams = without_account(folder.path());
+        for bad in [
+            "https://tracker.example/a.gif",
+            "https://giphy.com.tracker.example/a.gif",
+        ] {
+            let refused = teams.picture(bad).await;
+            assert!(matches!(refused, Err(Failure::Permanent(_))), "{bad}");
+        }
+    }
+
+    /// `cargo test -p tern-engine -- --ignored giphy`
+    #[tokio::test]
+    #[ignore = "needs the network"]
+    async fn giphy_gets_no_token() {
+        let folder = tempfile::tempdir().unwrap();
+        let teams = without_account(folder.path());
+        let url = "https://media.giphy.com/media/3o7aD2saalBwwftBIY/giphy.gif";
+        teams.picture(url).await.unwrap();
+        let file = store::find_image_file(folder.path(), url).unwrap();
+        assert!(std::fs::read(file).unwrap().starts_with(b"GIF8"));
     }
 
     #[test]

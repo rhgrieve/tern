@@ -481,6 +481,17 @@ impl MessageList {
             .collect()
     }
 
+    /// The pictures from Giphy in what is shown, the newest first.
+    pub fn giphy(&self) -> Vec<String> {
+        let shown = self.shown.borrow();
+        let all = crate::model::pictures(shown.iter().map(|item| item.as_ref()));
+        all.into_iter()
+            .rev()
+            .filter(|url| tern_engine::is_giphy(url))
+            .map(str::to_owned)
+            .collect()
+    }
+
     /// An own message is marked as not read by everyone yet.
     pub fn waits_for_readers(&self) -> bool {
         self.shown.borrow().iter().rev().any(|item| {
@@ -739,10 +750,25 @@ mod tests {
                 .unwrap();
         picture.fill(0x1f6f_8bff);
         let bytes = picture.save_to_bufferv("png", &[]).unwrap();
-        files.put(&url("a"), &bytes, "png").unwrap();
+        let gif = crate::moving::tests::gif(3);
+        files.put(&url("a"), &gif, "gif").unwrap();
         list.show_pictures();
         wait(400);
         assert_eq!(count(&root), (1, 1));
+        // It moves.
+        fn moving(within: &gtk::Widget) -> usize {
+            let picture = within.downcast_ref::<gtk::Picture>();
+            let paintable = picture.and_then(|picture| picture.paintable());
+            let mut found =
+                usize::from(paintable.is_some_and(|it| it.is::<crate::moving::Moving>()));
+            let mut child = within.first_child();
+            while let Some(widget) = child {
+                found += moving(&widget);
+                child = widget.next_sibling();
+            }
+            found
+        }
+        assert_eq!(moving(&root), 1);
         for name in ["b", "c"] {
             files.put(&url(name), &bytes, "png").unwrap();
         }
@@ -750,6 +776,7 @@ mod tests {
         list.show_pictures();
         wait(400);
         assert_eq!(count(&root), (4, 0));
+        assert_eq!(moving(&root), 1, "the others do not");
 
         // A reaction changes its message only.
         list.change("99", |item| {

@@ -45,6 +45,23 @@ pub fn may_prefetch(url: &str) -> bool {
     stored || channel
 }
 
+/// Whether a picture may be fetched while the user looks at it: also what Teams offers from Giphy,
+/// which learns that somebody here looks, but not when the message came.
+pub fn may_show(url: &str) -> bool {
+    may_prefetch(url) || is_giphy(url)
+}
+
+/// Also by way of Teams' gateway, which the engine goes past.
+pub fn is_giphy(url: &str) -> bool {
+    teams_core::external_image_url(url)
+        .and_then(|url| url::Url::parse(&url).ok())
+        .and_then(|url| {
+            let host = url.host_str()?;
+            Some(host == "giphy.com" || host.ends_with(".giphy.com"))
+        })
+        .unwrap_or(false)
+}
+
 /// An emoji of the organization's own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Emoji {
@@ -473,6 +490,30 @@ mod tests {
             "http://us-api.asm.skype.com/v1/objects/x",
         ] {
             assert!(!may_prefetch(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn giphy_is_shown_and_nothing_else_from_elsewhere() {
+        for good in [
+            "https://media0.giphy.com/media/a/giphy.gif?cid=x&ct=g",
+            "https://giphy.com/a.gif",
+            "https://us-prod.asyncgw.teams.microsoft.com/urlp/v1/url/content?url=https%3A%2F%2Fmedia1.giphy.com%2Fa.gif",
+        ] {
+            assert!(may_show(good) && !may_prefetch(good), "{good}");
+        }
+        assert!(may_show(
+            "https://us-api.asm.skype.com/v1/objects/0-eus-d1/views/imgo"
+        ));
+        for bad in [
+            "https://tracker.example/giphy.com/a.gif",
+            "https://giphy.com.tracker.example/a.gif",
+            "https://evilgiphy.com/a.gif",
+            "http://media0.giphy.com/a.gif",
+            "https://giphy.com@tracker.example/a.gif",
+            "https://us-prod.asyncgw.teams.microsoft.com/urlp/v1/url/content?url=https%3A%2F%2Ftracker.example",
+        ] {
+            assert!(!may_show(bad), "{bad}");
         }
     }
 

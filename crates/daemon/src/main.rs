@@ -1,9 +1,11 @@
 //! Tern's background service: keeps the user's Teams presence true to what they do at this
 //! computer, keeps the message cache complete, sends queued messages and shows notifications.
 
+mod calls;
 mod link;
 mod messages;
 mod notify;
+mod ringtone;
 mod tray;
 
 use std::collections::HashSet;
@@ -13,9 +15,10 @@ use std::time::Duration;
 
 use chatsvc::realtime::{Realtime, RealtimeConfig, RealtimeEvent, StatusKind};
 use chatsvc::{PresenceService, PresenceStatus};
+use chrono::Utc;
 use session::{Session, SessionConfig};
 use tern_auth::{Broker, HttpEndpoint, KeyringStore};
-use tern_engine::{Act, Draft, Failure, Teams};
+use tern_engine::{Act, Draft, Failure, Meeting, Reminders, Teams};
 use tern_ipc::{Event as Change, Request, Response, Status};
 use tern_presence::{Config, Event, Input, Machine, Sensors, Source, State};
 use tokio::net::UnixStream;
@@ -24,6 +27,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, interval, sleep_until, timeout};
 
+use calls::{Calls, RINGING, Ring};
 use link::{Link, contradicts};
 use messages::{Messages, News};
 use notify::{Action, Notifier, Target};
@@ -52,6 +56,8 @@ struct Online {
     object_id: String,
     session: Session,
     region: String,
+    /// Where calls are told, if that works.
+    calls: Option<Calls>,
 }
 
 enum Connect {
@@ -61,7 +67,11 @@ enum Connect {
     Failed(String),
 }
 
-async fn connect(broker: Arc<Broker>, active: bool) -> Connect {
+async fn connect(
+    broker: Arc<Broker>,
+    active: bool,
+    rings: Option<mpsc::UnboundedSender<Ring>>,
+) -> Connect {
     use tern_auth::Error::{Blocked, InteractionRequired, SignedOut};
     let identity = match broker.identity().await {
         Some(identity) => identity,
@@ -95,7 +105,7 @@ async fn connect(broker: Arc<Broker>, active: bool) -> Connect {
         service = service.at(base);
     }
     let config = RealtimeConfig {
-        host: regions.trouter_host,
+        host: regions.trouter_host.clone(),
         // Discovery needs a web page; the host came with the regions.
         discover_host: false,
         initially_active: active,
@@ -104,13 +114,23 @@ async fn connect(broker: Arc<Broker>, active: bool) -> Connect {
     };
     let region = regions.region;
     match Realtime::start_with(&session, config).await {
-        Ok(realtime) => Connect::Up(Box::new(Online {
-            realtime,
-            service,
-            object_id: identity.object_id,
-            session,
-            region,
-        })),
+        Ok(realtime) => {
+            let calls = match rings {
+                Some(rings) => Calls::start(&session, regions.trouter_host, active, rings)
+                    .await
+                    .inspect_err(|error| tracing::warn!(error, "calls will not ring"))
+                    .ok(),
+                None => None,
+            };
+            Connect::Up(Box::new(Online {
+                realtime,
+                service,
+                object_id: identity.object_id,
+                session,
+                region,
+                calls,
+            }))
+        }
         Err(error) => Connect::Failed(error.to_string()),
     }
 }
@@ -218,6 +238,12 @@ struct Daemon {
     watched: HashSet<String>,
     /// What the user has in front of them, and when a window last said so.
     viewing: Option<(String, Instant)>,
+    meetings: Vec<Meeting>,
+    reminders: Reminders,
+    rings: mpsc::UnboundedSender<Ring>,
+    /// Who is calling, in which chat, and until when that is assumed.
+    ringing: Vec<(Ring, Option<String>, Instant)>,
+    ringtone: ringtone::Ringtone,
 }
 
 impl Daemon {
@@ -227,6 +253,7 @@ impl Daemon {
         changes: broadcast::Sender<Change>,
         notifier: Notifier,
         tray: TrayIcon,
+        rings: mpsc::UnboundedSender<Ring>,
     ) -> Self {
         let now = Instant::now();
         Daemon {
@@ -254,6 +281,11 @@ impl Daemon {
             tray,
             paused_until: None,
             viewing: None,
+            meetings: Vec::new(),
+            reminders: Reminders::default(),
+            rings,
+            ringing: Vec::new(),
+            ringtone: ringtone::Ringtone::default(),
             watched: HashSet::new(),
         }
     }
@@ -266,6 +298,9 @@ impl Daemon {
         if let Some(online) = self.online.as_ref().filter(|_| self.presence) {
             let desired = self.machine.desired();
             online.realtime.set_activity(desired.active);
+            if let Some(calls) = &online.calls {
+                calls.set_activity(desired.active);
+            }
             // Bounded, so a hanging request cannot hold up the next sensor event (sleep above all).
             let step = self
                 .link
@@ -312,10 +347,23 @@ impl Daemon {
         }
         if let Some(online) = self.online.take() {
             online.realtime.set_activity(false);
+            if let Some(calls) = &online.calls {
+                calls.set_activity(false);
+            }
             let online = *online;
             // Side by side: each is worth doing even if the other hangs.
-            let goodbye =
-                async { tokio::join!(self.link.withdraw(&online.service), online.realtime.stop()) };
+            let quiet = async {
+                if let Some(calls) = online.calls {
+                    calls.stop().await;
+                }
+            };
+            let goodbye = async {
+                tokio::join!(
+                    self.link.withdraw(&online.service),
+                    online.realtime.stop(),
+                    quiet
+                )
+            };
             if timeout(BEFORE_SLEEP, goodbye).await.is_err() {
                 tracing::warn!("leaving took too long");
             }
@@ -461,6 +509,7 @@ impl Daemon {
         ) {
             Ok(messages) => {
                 messages.remember_region(&online.region);
+                self.meetings = messages.meetings();
                 self.messages = Some(messages);
             }
             Err(error) => {
@@ -490,10 +539,81 @@ impl Daemon {
             self.changes.clone(),
         )
         .ok();
+        if let Some(messages) = &self.messages {
+            self.meetings = messages.meetings();
+        }
+    }
+
+    /// Tells of meetings that are due.
+    async fn remind(&mut self) {
+        if self.machine.state() == State::Sleeping {
+            return;
+        }
+        for due in self.reminders.due(&self.meetings, Utc::now()) {
+            // Decided either way, so that nothing is told later.
+            if !self.quiet() {
+                self.notifier.remind(&due).await;
+            }
+        }
+    }
+
+    async fn rang(&mut self, ring: Ring) {
+        // Neither the caller nor the chat is for the log.
+        tracing::info!(group = ring.chat.is_some(), "a call");
+        if self.quiet() {
+            return;
+        }
+        let chat = ring.chat.clone().or_else(|| {
+            let messages = self.messages.as_ref()?;
+            messages.chat_with(ring.from.as_deref()?)
+        });
+        self.notifier.ring(&ring, chat.clone()).await;
+        self.ringtone.start();
+        self.ringing.push((ring, chat, Instant::now() + RINGING));
+    }
+
+    /// Takes down what rings for too long, or, with a chat, what has ended there.
+    async fn stop_ringing(&mut self, ended: Option<&str>) {
+        let now = Instant::now();
+        let over = |(_, chat, until): &(Ring, Option<String>, Instant)| {
+            *until <= now || ended.is_some_and(|ended| chat.as_deref() == Some(ended))
+        };
+        let (over, still) = std::mem::take(&mut self.ringing)
+            .into_iter()
+            .partition(over);
+        self.ringing = still;
+        if self.ringing.is_empty() {
+            self.ringtone.stop();
+        }
+        let over: Vec<_> = over;
+        for (ring, ..) in over {
+            self.notifier.stop_ringing(&ring).await;
+        }
+    }
+
+    /// The user wants no notifications now.
+    fn quiet(&self) -> bool {
+        self.paused()
+            || self
+                .shown
+                .as_ref()
+                .is_some_and(|(_, status)| status.availability == "DoNotDisturb")
     }
 
     async fn news(&mut self, news: News) {
-        let paused = self.paused();
+        if let News::Agenda = &news {
+            if let Some(messages) = &self.messages {
+                self.meetings = messages.meetings();
+            }
+            return self.remind().await;
+        }
+        if let News::Arrived(arrived) = &news
+            && let Some(event) = arrived.messages.iter().find_map(teams_core::call_event)
+            && event.phase == teams_core::CallPhase::Ended
+        {
+            self.stop_ringing(Some(&arrived.conversation)).await;
+        }
+        let quiet = self.quiet();
         let Some(messages) = &mut self.messages else {
             return;
         };
@@ -506,15 +626,10 @@ impl Daemon {
         };
         match news {
             News::Arrived(_) | News::Changed { .. } => {
-                let quiet = paused
-                    || self
-                        .shown
-                        .as_ref()
-                        .is_some_and(|(_, status)| status.availability == "DoNotDisturb");
                 let notices = match &news {
                     News::Arrived(arrived) => messages.notices(arrived),
                     News::Changed { conversation } => messages.reactions(conversation),
-                    News::Failed { .. } | News::Presence => Vec::new(),
+                    News::Failed { .. } | News::Presence | News::Agenda => Vec::new(),
                 };
                 for notice in notices {
                     // Decided either way, so that nothing is told later.
@@ -524,6 +639,7 @@ impl Daemon {
                 }
             }
             News::Failed { reason, .. } => self.notifier.failed(&reason).await,
+            News::Agenda => {}
             News::Presence => {
                 let people = messages.presence(&self.watched);
                 let _ = self.changes.send(Change::Presence { people });
@@ -539,6 +655,14 @@ impl Daemon {
                     async move { notify::open(&target, token).await },
                 ));
             }
+            Action::Go(place, token) => {
+                // Whatever the user did about a call, it has been heard.
+                if !self.ringing.is_empty() {
+                    self.ringtone.stop();
+                }
+                drop(tokio::spawn(async move { notify::go(&place, token).await }));
+            }
+            Action::Silence => self.ringtone.stop(),
             Action::Reply { conversation, text } => {
                 let queued = match &self.messages {
                     Some(messages) => messages.send(&conversation, &Draft::text(&text), &[]),
@@ -758,6 +882,12 @@ impl Daemon {
                 }
                 Response::Done
             }
+            Request::Agenda => {
+                if let Some(messages) = &self.messages {
+                    messages.read_agenda();
+                }
+                Response::Done
+            }
             Request::MarkRead { conversation } => {
                 if let Some(messages) = &self.messages {
                     messages.mark_read(conversation);
@@ -834,6 +964,7 @@ impl Daemon {
             Request::Reload => {
                 self.leave().await;
                 self.messages = None;
+                self.meetings = Vec::new();
                 self.shown = None;
                 match self.broker.load().await {
                     Ok(_) => {
@@ -856,6 +987,7 @@ impl Daemon {
         mut news: mpsc::UnboundedReceiver<News>,
         mut actions: mpsc::UnboundedReceiver<Action>,
         mut picks: mpsc::UnboundedReceiver<Pick>,
+        mut rings: mpsc::UnboundedReceiver<Ring>,
     ) -> std::io::Result<()> {
         let mut sensors = Sensors::start(Config::default());
         let mut tick = interval(TICK);
@@ -866,6 +998,7 @@ impl Daemon {
             self.update_tray().await;
             self.tell_status().await;
             let connect_at = self.connect_at;
+            let stop_at = self.ringing.iter().map(|(.., until)| *until).min();
             tokio::select! {
                 Some(event) = sensors.recv() => self.sensor(event).await,
                 event = async {
@@ -891,13 +1024,26 @@ impl Daemon {
                 }, if self.connecting.is_none() => {
                     self.connect_at = None;
                     self.push = "connecting".into();
-                    self.connecting = Some(tokio::spawn(connect(self.broker.clone(), self.active())));
+                    self.connecting = Some(tokio::spawn(connect(
+                        self.broker.clone(),
+                        self.active(),
+                        // A development instance leaves calls to the installed one, too.
+                        self.presence.then(|| self.rings.clone()),
+                    )));
                 }
                 () = sleep_until(self.read_at) => self.read_back().await,
                 _ = tick.tick() => {
                     self.reconcile().await;
                     self.sweep().await;
+                    self.remind().await;
                 }
+                Some(ring) = rings.recv() => self.rang(ring).await,
+                () = async {
+                    match stop_at {
+                        Some(at) => sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => self.stop_ringing(None).await,
                 Some(item) = news.recv() => self.news(item).await,
                 Some(action) = actions.recv() => self.acted(action).await,
                 Some(pick) = picks.recv() => {
@@ -1041,8 +1187,9 @@ async fn start() -> Result<(), String> {
     tokio::spawn(notify::at_login());
     let (notifier, actions) = Notifier::start();
     let (tray, picks) = TrayIcon::start().await;
-    let outcome = Daemon::new(broker, news, changes, notifier, tray)
-        .run(asked, news_queue, actions, picks)
+    let (ring, rings) = mpsc::unbounded_channel();
+    let outcome = Daemon::new(broker, news, changes, notifier, tray, ring)
+        .run(asked, news_queue, actions, picks, rings)
         .await
         .map_err(|error| error.to_string());
     if let Ok(path) = tern_ipc::socket_path() {

@@ -103,6 +103,8 @@ pub enum Request {
         conversation: String,
         on: bool,
     },
+    /// Read the calendar.
+    Agenda,
     /// Read how far the others have read.
     Receipts {
         conversation: String,
@@ -127,6 +129,8 @@ pub enum Event {
     },
     Pictures,
     Faces,
+    /// The calendar changed.
+    Agenda,
     /// Whether people are there, of those that were asked for.
     Presence {
         people: Vec<(String, Availability)>,

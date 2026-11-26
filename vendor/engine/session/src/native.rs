@@ -251,8 +251,8 @@ impl NativeHttp {
     }
 }
 
-// Tern patch: "/ups/" is the regional presence service, which takes a bearer.
-const TEAMS_BEARER_PATHS: [&str; 3] = ["/api/", "/registrar/", "/ups/"];
+// Tern patch: "/ups/" is the regional presence service, and "/trap/tokens" hands out relays for calls; both take a bearer.
+const TEAMS_BEARER_PATHS: [&str; 4] = ["/api/", "/registrar/", "/ups/", "/trap/tokens"];
 
 /// Both rustls providers end up compiled in through dependencies, and then rustls refuses to pick one on its own.
 pub fn ensure_crypto_provider() {

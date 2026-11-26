@@ -16,6 +16,8 @@ pub const WIDTH: i32 = 420;
 pub const HEIGHT: i32 = 320;
 /// Decoded pictures kept; a screen shows a handful.
 const KEEP: usize = 60;
+/// Those that move are many pictures each.
+const KEEP_MOVING: usize = 2;
 /// A picture claiming more pixels than this is not decoded.
 const MAX_PIXELS: i64 = 80_000_000;
 
@@ -27,6 +29,7 @@ struct Art {
     pictures: HashMap<String, gdk::Texture>,
     order: Vec<String>,
     emoji: HashMap<String, Frames>,
+    moving: Vec<(String, Frames)>,
     /// Since when pictures are waited for; none where that was given up.
     waiting: HashMap<String, Option<Instant>>,
     scale: i32,
@@ -183,6 +186,51 @@ pub fn emoji(url: &str, show: impl FnOnce(Option<Frames>) + 'static) {
     };
     let size = EMOJI * scale();
     let url = url.to_owned();
+    frames(path, (size, size), move |frames| {
+        if let Some(frames) = &frames {
+            ART.with_borrow_mut(|art| art.emoji.insert(url, frames.clone()));
+        }
+        show(frames);
+    });
+}
+
+/// The pictures of a file that moves, at the size of a message; none when it does not.
+pub fn moving(url: &str, show: impl FnOnce(Frames) + 'static) {
+    if let Some(known) = ART.with_borrow(|art| art.moving.iter().find(|(of, _)| of == url).cloned())
+    {
+        return show(known.1);
+    }
+    let Some(path) = file(url) else { return };
+    let (url, scale) = (url.to_owned(), scale());
+    moving_file(path, (WIDTH * scale, HEIGHT * scale), move |frames| {
+        ART.with_borrow_mut(|art| {
+            art.moving.push((url, frames.clone()));
+            if art.moving.len() > KEEP_MOVING {
+                art.moving.remove(0);
+            }
+        });
+        show(frames);
+    });
+}
+
+/// As `moving`, of a file and in another size.
+pub fn moving_file(path: PathBuf, size: (i32, i32), show: impl FnOnce(Frames) + 'static) {
+    glib::spawn_future_local(async move {
+        let of = path.clone();
+        if gio::spawn_blocking(move || crate::moving::moves(&of))
+            .await
+            .unwrap_or(false)
+        {
+            frames(path, size, move |frames| {
+                if let Some(frames) = frames {
+                    show(frames);
+                }
+            });
+        }
+    });
+}
+
+fn frames(path: PathBuf, size: (i32, i32), show: impl FnOnce(Option<Frames>) + 'static) {
     glib::spawn_future_local(async move {
         let decoded = gio::spawn_blocking(move || {
             let frames = crate::moving::decode(&path, size)?;
@@ -200,9 +248,6 @@ pub fn emoji(url: &str, show: impl FnOnce(Option<Frames>) + 'static) {
                 .map(|(picture, delay)| (picture.texture(), delay));
             Frames::new(frames.collect())
         });
-        if let Some(frames) = &frames {
-            ART.with_borrow_mut(|art| art.emoji.insert(url, frames.clone()));
-        }
         show(frames);
     });
 }

@@ -1,7 +1,7 @@
 //! The main window.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,12 +20,12 @@ use crate::composer::{Aim, Composer, Written};
 use crate::desk::{self, Desk};
 use crate::history::{History, Need};
 use crate::list::MessageList;
-use crate::model::{self, Conversation, Filter, OUTGOING, Reacting};
+use crate::model::{self, ChatRow, Conversation, Filter, OUTGOING, Reacting};
 use crate::row::{Item, say};
 use crate::sidebar::Sidebar;
 use crate::tools::{Tool, Tools};
 use crate::viewer::Viewer;
-use crate::{art, mention, palette, presence, service};
+use crate::{agenda, art, call, mention, palette, presence, service};
 
 const CHATS: usize = 400;
 
@@ -65,12 +65,20 @@ pub struct Window {
     sign_in: adw::Banner,
     toasts: adw::ToastOverlay,
     pages: gtk::Stack,
+    agenda: agenda::View,
     back: gtk::Button,
     writing: gtk::Label,
     desk: Rc<Desk>,
     /// Shows one conversation, without the list of chats.
     own: bool,
     out: gtk::Button,
+    /// Calls the other person of a 1:1 chat.
+    call_button: gtk::Button,
+    call_bar: Rc<call::Bar>,
+    /// The call above the chats, when they are all there is to see.
+    side_call: Rc<call::Bar>,
+    /// Whom the call button calls.
+    callable: RefCell<Option<model::Callable>>,
     /// Shown while older messages are fetched.
     loading: gtk::Box,
     tools: RefCell<Option<Rc<Tools>>>,
@@ -83,6 +91,8 @@ pub struct Window {
     connected: Cell<bool>,
     client: Client,
     state: RefCell<State>,
+    /// The calendar is shown instead of a conversation.
+    calendar: Cell<bool>,
     /// Counts reads, so that a slow one does not replace a newer.
     chats_turn: Cell<u64>,
     open_turn: Cell<u64>,
@@ -163,6 +173,16 @@ impl Window {
                 .title_widget(&adw::WindowTitle::new("Tern", ""))
                 .build();
             side_header.pack_start(&search);
+            let calendar = gtk::Button::builder()
+                .icon_name("x-office-calendar-symbolic")
+                .tooltip_text("Calendar (Ctrl+E)")
+                .build();
+            say(&calendar, "Calendar");
+            calendar.connect_clicked({
+                let calendar = later(Window::calendar);
+                move |_| calendar()
+            });
+            side_header.pack_start(&calendar);
             let filters = gtk::Box::new(gtk::Orientation::Horizontal, 0);
             filters.add_css_class("linked");
             filters.set_halign(gtk::Align::Center);
@@ -203,6 +223,8 @@ impl Window {
                 move |_| sign_in()
             });
             side.add_top_bar(&side_header);
+            let side_call = call::Bar::new();
+            side.add_top_bar(&side_call.root);
             side.add_top_bar(&sign_in);
             side.add_top_bar(&filters);
 
@@ -290,6 +312,8 @@ impl Window {
                 .build();
             pages.add_named(&nothing, Some("nothing"));
             pages.add_named(&talk, Some("talk"));
+            let agenda = agenda::View::default();
+            pages.add_named(&agenda.root, Some("calendar"));
             let title = adw::WindowTitle::new("", "");
             let header = adw::HeaderBar::builder().title_widget(&title).build();
             let back = gtk::Button::builder()
@@ -314,9 +338,20 @@ impl Window {
                 move |_| out()
             });
             header.pack_end(&out);
+            let call_button = gtk::Button::builder()
+                .icon_name("call-start-symbolic")
+                .visible(false)
+                .build();
+            call_button.connect_clicked({
+                let call = later(Window::call);
+                move |_| call()
+            });
+            header.pack_end(&call_button);
+            let call_bar = call::Bar::new();
             let banner = adw::Banner::new("");
             let main = adw::ToolbarView::builder().content(&pages).build();
             main.add_top_bar(&header);
+            main.add_top_bar(&call_bar.root);
             main.add_top_bar(&banner);
 
             let content = adw::NavigationPage::new(&main, "Conversation");
@@ -330,6 +365,16 @@ impl Window {
                 .max_sidebar_width(360.0)
                 .sidebar_width_fraction(0.3)
                 .build();
+            // Side by side, the call is above the conversation already.
+            split
+                .bind_property("collapsed", &side_call.root, "visible")
+                .sync_create()
+                .build();
+            // Back at the list of a narrow window, what was being written is a draft.
+            for property in ["show-content", "collapsed"] {
+                let drafts = later(Window::drafts_changed);
+                split.connect_notify_local(Some(property), move |_, _| drafts());
+            }
             let toasts = adw::ToastOverlay::new();
             toasts.set_child(Some(&split));
             let window = adw::ApplicationWindow::builder()
@@ -355,9 +400,10 @@ impl Window {
             }
 
             // Keys
-            let keys: [(&str, &[&str], Run); 11] = [
+            let keys: [(&str, &[&str], Run); 12] = [
                 ("leave", &["Escape"], Window::escape),
                 ("search", &["<Ctrl>k", "<Ctrl>f"], Window::search),
+                ("calendar", &["<Ctrl>e"], Window::calendar),
                 ("next", &["<Alt>Down"], |window| window.step(1)),
                 ("previous", &["<Alt>Up"], |window| window.step(-1)),
                 ("write", &["<Ctrl>r"], |window| window.composer.focus()),
@@ -414,6 +460,18 @@ impl Window {
                 }
             });
             window.add_action(&pin);
+            let show = gio::SimpleAction::new("show", Some(glib::VariantTy::STRING));
+            show.connect_activate({
+                let weak = weak.clone();
+                move |_, id| {
+                    if let (Some(window), Some(id)) =
+                        (weak.upgrade(), id.and_then(|id| id.get::<String>()))
+                    {
+                        window.choose(&id);
+                    }
+                }
+            });
+            window.add_action(&show);
             let apart = gio::SimpleAction::new("apart", Some(glib::VariantTy::STRING));
             apart.connect_activate({
                 let weak = weak.clone();
@@ -450,11 +508,16 @@ impl Window {
                 move || match weak.upgrade() {
                     Some(window) => {
                         window.save_drafts();
+                        window.show_drafts();
                         window.show_typing();
                         ticks.set(ticks.get() + 1);
                         if ticks.get().is_multiple_of(RECEIPTS) {
                             window.ask_receipts();
                             window.tell_viewing();
+                        }
+                        if ticks.get().is_multiple_of(RECEIPTS) {
+                            // Meetings begin and end.
+                            window.read_agenda();
                         }
                         if ticks.get().is_multiple_of(PRESENCE) && window.window.is_active() {
                             window.ask_presence(true);
@@ -474,8 +537,10 @@ impl Window {
             });
             window.connect_is_active_notify({
                 let (seen, viewing) = (later(Window::seen), later(Window::tell_viewing));
+                let giphy = later(Window::want_giphy);
                 move |_| {
                     seen();
+                    giphy();
                     viewing();
                 }
             });
@@ -495,11 +560,16 @@ impl Window {
                 sign_in,
                 toasts,
                 pages,
+                agenda,
                 back,
                 writing,
                 desk: desk.clone(),
                 own,
                 out,
+                call_button,
+                call_bar,
+                side_call,
+                callable: RefCell::default(),
                 loading,
                 tools: RefCell::default(),
                 viewer: RefCell::default(),
@@ -508,6 +578,7 @@ impl Window {
                 connected: Cell::new(false),
                 client,
                 state: RefCell::default(),
+                calendar: Cell::new(false),
                 chats_turn: Cell::new(0),
                 open_turn: Cell::new(0),
             }
@@ -619,6 +690,39 @@ impl Window {
         }
     }
 
+    /// Marks the chats that have something written in them, but the one being written in here.
+    fn mark_drafts(&self, rows: &mut [ChatRow]) {
+        let lines: HashMap<String, String> = self
+            .desk
+            .drafts
+            .borrow()
+            .iter()
+            .filter_map(|(key, written)| Some((key.clone(), written.line()?)))
+            .collect();
+        // Behind the list of a narrow window, the open one is not being written in.
+        let writing = self.composer.opened().filter(|_| self.is_reading());
+        model::mark_drafts(rows, &lines, writing.as_deref());
+    }
+
+    /// The draft of the open conversation may have come into view, or gone out of it.
+    fn drafts_changed(self: &Rc<Self>) {
+        self.save_drafts();
+        self.show_drafts();
+    }
+
+    /// Shows in the list of chats the drafts as they are now.
+    fn show_drafts(&self) {
+        if self.own {
+            return;
+        }
+        let before = self.sidebar.rows();
+        let mut rows = before.clone();
+        self.mark_drafts(&mut rows);
+        if rows != before {
+            self.sidebar.set(rows);
+        }
+    }
+
     fn save_drafts(self: &Rc<Self>) {
         if self.desk.is_account(self.state.borrow().account.as_deref()) {
             self.composer.keep();
@@ -655,8 +759,100 @@ impl Window {
         }
     }
 
+    pub fn toast(&self, text: &str) {
+        self.toasts
+            .add_toast(adw::Toast::new(&glib::markup_escape_text(text)));
+    }
+
+    fn calendar(self: &Rc<Self>) {
+        self.desk.show_calendar();
+    }
+
+    /// Whom the call button calls, if anyone.
+    fn set_callable(&self, who: Option<model::Callable>) {
+        if let Some(who) = &who {
+            let tip = format!("Call {}", who.name);
+            self.call_button.set_tooltip_text(Some(&tip));
+            say(&self.call_button, &tip);
+        }
+        self.call_button
+            .set_visible(who.is_some() && !self.desk.demo);
+        self.call_button
+            .set_sensitive(self.desk.call_on().is_none());
+        self.callable.replace(who);
+    }
+
+    fn call(self: &Rc<Self>) {
+        let who = self.callable.borrow().clone();
+        if let Some(who) = who {
+            self.desk.call(&who, self);
+        }
+    }
+
+    /// Shows a call with someone in this chat, connected for a while, without calling: for
+    /// trying things out.
+    pub fn pretend_call(&self) {
+        let name = self.title.title().to_string();
+        self.set_callable(Some(model::Callable {
+            thread: String::new(),
+            name: name.clone(),
+            people: Vec::new(),
+        }));
+        self.call_button.set_visible(true);
+        // A screenshot may come before any animation runs.
+        let people = ["Ada Quill", "Bo Lindqvist", "Cyrus Amadi", "Robin Vale"];
+        for bar in [&self.call_bar, &self.side_call] {
+            bar.root
+                .set_transition_type(gtk::RevealerTransitionType::None);
+            bar.draw(Some(call::Shown {
+                name: name.clone(),
+                stage: call::Stage::Connected(Instant::now() - Duration::from_secs(754)),
+                muted: true,
+                waiting: false,
+                people: people.map(str::to_owned).to_vec(),
+            }));
+        }
+    }
+
+    /// Shows the call that is on, if any.
+    pub fn show_call(&self, call: Option<&Rc<call::Call>>) {
+        self.call_bar.show(call);
+        self.side_call.show(call);
+        self.call_button.set_sensitive(call.is_none());
+    }
+
+    /// Shows the calendar instead of a conversation.
+    pub fn show_calendar(self: &Rc<Self>) {
+        if !self.calendar.get() {
+            self.leave();
+            self.calendar.set(true);
+            self.set_titles("Calendar", "");
+            self.pages.set_visible_child_name("calendar");
+            self.read_agenda();
+            if !self.desk.demo {
+                self.client.ask(Request::Agenda);
+            }
+        }
+        self.split.set_show_content(true);
+    }
+
+    fn read_agenda(self: &Rc<Self>) {
+        let store = self.state.borrow().store.clone();
+        let Some(store) = store.filter(|_| self.calendar.get()) else {
+            return;
+        };
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let agenda = gio::spawn_blocking(move || tern_engine::agenda(&store)).await;
+            if let (Some(window), Ok(agenda)) = (weak.upgrade(), agenda) {
+                window.agenda.set(agenda.as_ref());
+            }
+        });
+    }
+
     /// Shows no conversation.
     pub fn leave(self: &Rc<Self>) {
+        self.calendar.set(false);
         {
             let mut state = self.state.borrow_mut();
             state.open = None;
@@ -674,12 +870,14 @@ impl Window {
         self.writing.set_text("");
         self.back.set_visible(false);
         self.out.set_visible(false);
+        self.set_callable(None);
         self.pages.set_visible_child_name("nothing");
         self.set_titles("", "");
         if !self.own {
             self.split.set_show_content(false);
         }
         self.sidebar.select("");
+        self.show_drafts();
     }
 
     fn set_titles(&self, title: &str, subtitle: &str) {
@@ -917,7 +1115,7 @@ impl Window {
 
     /// A picture that is not here: asks for it again, or opens it where it is.
     fn find_picture(self: &Rc<Self>, url: &str) {
-        if tern_engine::may_prefetch(url) {
+        if tern_engine::may_show(url) {
             // Already on its way.
             if art::wait_for(url).is_none() && !self.desk.demo {
                 art::wait_again(url);
@@ -939,6 +1137,26 @@ impl Window {
         }
     }
 
+    /// Asks for pictures from elsewhere, only while the user looks at the conversation: who has
+    /// them is not to learn when a message arrives.
+    fn want_giphy(self: &Rc<Self>) {
+        if self.desk.demo || !self.window.is_active() || !self.is_reading() {
+            return;
+        }
+        let mut wanted = false;
+        for url in self.list.giphy() {
+            let new = self.state.borrow_mut().asked.insert(url.clone());
+            if new && !art::has_picture(&url) {
+                art::wait_again(&url);
+                self.client.ask(Request::Picture { url });
+                wanted = true;
+            }
+        }
+        if wanted {
+            self.list.show_pictures();
+        }
+    }
+
     /// Asks for pictures of what is shown that nobody asked for yet.
     fn want_pictures(self: &Rc<Self>, items: &[Item]) {
         if self.desk.demo {
@@ -947,6 +1165,9 @@ impl Window {
         let mut state = self.state.borrow_mut();
         let mut missing = false;
         for url in model::pictures(items) {
+            if tern_engine::is_giphy(url) {
+                continue;
+            }
             if !state.asked.contains(url) {
                 state.asked.insert(url.to_owned());
                 missing |= !art::has_picture(url);
@@ -1029,6 +1250,7 @@ impl Window {
             None => conversation.clone(),
         };
         self.composer.open(&key);
+        self.show_drafts();
         self.loading.set_visible(false);
         self.read(true);
         if !self.desk.demo {
@@ -1120,6 +1342,7 @@ impl Window {
                     self.read_open();
                 }
             }
+            News::Event(Event::Agenda) => self.read_agenda(),
             News::Event(Event::Pictures) => self.list.show_pictures(),
             News::Event(Event::Faces) => {
                 art::forget_faces();
@@ -1239,9 +1462,10 @@ impl Window {
                 model::chat_rows(&chats, &pinned, filter, me.as_deref(), now)
             })
             .await;
-            if let (Some(window), Ok(rows)) = (weak.upgrade(), rows)
+            if let (Some(window), Ok(mut rows)) = (weak.upgrade(), rows)
                 && window.chats_turn.get() == turn
             {
+                window.mark_drafts(&mut rows);
                 window.sidebar.set(rows);
                 if window.connected.get() {
                     window.ask_presence(false);
@@ -1312,6 +1536,7 @@ impl Window {
             }
             already
         };
+        self.calendar.set(false);
         self.split.set_show_content(true);
         self.sidebar.select(id);
         if already {
@@ -1376,6 +1601,7 @@ impl Window {
         }
         self.want_pictures(&conversation.items);
         self.set_titles(&conversation.title, &conversation.subtitle);
+        self.set_callable(conversation.call.clone());
         let people = conversation
             .items
             .iter()
@@ -1419,6 +1645,7 @@ impl Window {
         }
         self.pages.set_visible_child_name("talk");
         self.seen();
+        self.want_giphy();
         if fresh {
             self.tell_viewing();
         }
@@ -1610,6 +1837,7 @@ impl Window {
                 "Moving around",
                 &[
                     ("Search", "<Ctrl>k"),
+                    ("Calendar", "<Ctrl>e"),
                     ("Next chat", "<Alt>Down"),
                     ("Previous chat", "<Alt>Up"),
                     ("Chats, messages, writing", "F6"),

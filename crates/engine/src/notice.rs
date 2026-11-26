@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 
 use chrono::{DateTime, Utc};
 use store::{ChatRecord, MessageRecord};
-use teams_core::{mentions, mentions_whole_chat, reactions, readable_text};
+use teams_core::{call_event, mentions, mentions_whole_chat, reactions, readable_text};
 
 const REMEMBERED: usize = 500;
 const MAX_TEXT: usize = 300;
@@ -48,8 +48,11 @@ impl Rules {
         let sender = message.sender_id.as_deref()?;
         let own = me.is_none_or(|me| me == sender);
         let stale = message.created_at < self.started || now - message.created_at > NEWS;
-        if own || stale || message.deleted || message.call_event_json.is_some() {
+        if own || stale || message.deleted {
             return None;
+        }
+        if message.call_event_json.is_some() {
+            return self.missed(message, chat?, me);
         }
         let mentioned = mentions(message)
             .iter()
@@ -88,6 +91,38 @@ impl Rules {
             },
             text,
             can_reply: chat.is_some(),
+            reaction: false,
+        })
+    }
+
+    /// A call nobody answered. Those of the user are no news, and answered ones neither.
+    fn missed(
+        &mut self,
+        message: &MessageRecord,
+        chat: &ChatRecord,
+        me: Option<&str>,
+    ) -> Option<Notice> {
+        let event = call_event(message).filter(|event| event.missed(me))?;
+        let read = chat
+            .last_read_at
+            .is_some_and(|read| read >= message.created_at);
+        if read || chat.muted || self.shown.contains(&message.message_id) {
+            return None;
+        }
+        self.remember(message.message_id.clone());
+        let text = match event.initiator_name {
+            Some(name) if !chat.kind.eq_ignore_ascii_case("oneOnOne") => {
+                format!("{name} in {}", chat.display_title())
+            }
+            Some(name) => name,
+            None => chat.display_title(),
+        };
+        Some(Notice {
+            conversation: message.conversation_id.clone(),
+            message: message.message_id.clone(),
+            title: "Missed call".into(),
+            text,
+            can_reply: true,
             reaction: false,
         })
     }
@@ -232,6 +267,34 @@ mod tests {
 
     fn decide(message: &MessageRecord, chat: Option<&ChatRecord>) -> Option<Notice> {
         Rules::new(at(0)).decide(message, chat, Some("me"), at(6))
+    }
+
+    #[test]
+    fn only_a_call_the_user_missed_notifies() {
+        let call = |by: &str, people: &[&str], phase: &str| {
+            let mut message = message("1");
+            message.sender_id = Some(by.into());
+            message.call_event_json = Some(
+                serde_json::json!({
+                    "phase": phase, "call_type": "Call", "call_id": "x",
+                    "duration_seconds": null, "initiator_id": by, "initiator_name": "Ann",
+                    "participant_ids": people,
+                })
+                .to_string(),
+            );
+            message
+        };
+        let notice = decide(&call("ann", &["ann"], "Ended"), Some(&chat())).unwrap();
+        assert_eq!(notice.title, "Missed call");
+        assert!(notice.text.starts_with("Ann"));
+        for other in [
+            call("ann", &["ann", "me"], "Ended"),
+            call("me", &["me"], "Ended"),
+            call("ann", &["ann"], "Started"),
+        ] {
+            assert_eq!(decide(&other, Some(&chat())), None);
+        }
+        assert_eq!(decide(&call("ann", &["ann"], "Ended"), None), None);
     }
 
     #[test]

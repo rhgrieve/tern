@@ -49,6 +49,9 @@ for nothing else.
 | **Windows** | Any chat can have its own (Ctrl+Shift+O, or a double click). One pane when narrow. Made for tiling, too |
 | **Cards** | Adaptive Cards are shown. Answering one opens Teams |
 | **Notifications** | For messages, mentions and reactions to yours. With actions and replies, where your desktop offers them. A tray icon with your status and unread chats |
+| **Calendar** | Today and the two weeks ahead, also offline. Reminders when you set them in Teams, and as a meeting begins |
+| **Meetings** | Join takes you in with sound, muted; for video and sharing it opens the meeting in a browser window of its own, with a profile just for Teams. Opens `msteams:` links; installing can make Tern the default for them if you have not chosen an app |
+| **Calls** | Call from a 1:1 or group chat, with sound; mute and hang up from a bar in every window. Answer or decline when somebody calls. Shows calls you missed. Video is for Teams in the browser, or another device |
 | **Keyboard and screen readers** | Everything is reachable; Ctrl+K searches, Ctrl+? lists the keys |
 
 <div align="center">
@@ -65,7 +68,7 @@ for nothing else.
 
 <div align="center"><sub>Everyone in these pictures is invented: <code>tern --demo</code></sub></div>
 
-**Next:** calendar, reminders and joining meetings (in a browser at first), then calls in Tern itself.
+**Next:** calls in Tern itself.
 
 ## Try it
 

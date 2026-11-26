@@ -24,6 +24,7 @@ struct RowWidgets {
     title: gtk::Label,
     when: gtk::Label,
     preview: gtk::Label,
+    draft: gtk::Label,
     dot: gtk::Box,
 }
 
@@ -46,6 +47,13 @@ fn build() -> RowWidgets {
     let preview = label("caption");
     preview.add_css_class("dim-label");
     preview.set_hexpand(true);
+    let draft = gtk::Label::new(Some("Draft"));
+    draft.add_css_class("caption");
+    draft.add_css_class("draft");
+    draft.set_visible(false);
+    // On the line of the text beside it, not centred on it: it is bold.
+    draft.set_valign(gtk::Align::BaselineFill);
+    preview.set_valign(gtk::Align::BaselineFill);
     let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     dot.add_css_class("unread-dot");
     dot.set_valign(gtk::Align::Center);
@@ -53,6 +61,7 @@ fn build() -> RowWidgets {
     top.append(&title);
     top.append(&when);
     let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    bottom.append(&draft);
     bottom.append(&preview);
     bottom.append(&dot);
     let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -69,6 +78,7 @@ fn build() -> RowWidgets {
         title,
         when,
         preview,
+        draft,
         dot,
     }
 }
@@ -84,7 +94,10 @@ fn bind(widgets: &RowWidgets, row: &ChatRow) {
     presence::set(&widgets.there, row.person.as_deref());
     widgets.title.set_text(&row.title);
     widgets.when.set_text(&row.when);
-    widgets.preview.set_text(&row.preview);
+    widgets
+        .preview
+        .set_text(row.draft.as_deref().unwrap_or(&row.preview));
+    widgets.draft.set_visible(row.draft.is_some());
     widgets.dot.set_visible(row.unread || row.mentions);
     let set = |class: &str, on: bool| {
         if on {
@@ -109,8 +122,12 @@ fn spoken(row: &ChatRow) -> String {
         .and_then(presence::of)
         .map(|availability| format!(", {}", presence::words(availability).to_lowercase()))
         .unwrap_or_default();
+    let draft = match &row.draft {
+        Some(draft) => format!(" Draft: {draft}."),
+        None => String::new(),
+    };
     format!(
-        "{}{there}{pinned}{unread}{mentions}{muted}. {} {}",
+        "{}{there}{pinned}{unread}{mentions}{muted}.{draft} {} {}",
         row.title, row.preview, row.when
     )
 }
@@ -403,6 +420,14 @@ impl Sidebar {
 
     /// Shows `rows`, changing as little as possible so the list keeps its place. Waits while the
     /// user scrolls: rows that move under the pointer are worse than rows a moment late.
+    /// The rows as they are, or as they will be once scrolling ends.
+    pub fn rows(&self) -> Vec<ChatRow> {
+        match &*self.later.borrow() {
+            Some(rows) => rows.clone(),
+            None => self.rows.borrow().clone(),
+        }
+    }
+
     pub fn set(&self, rows: Vec<ChatRow>) {
         let waits = self.later.replace(Some(rows)).is_some();
         if self.scrolling() {

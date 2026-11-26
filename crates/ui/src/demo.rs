@@ -238,6 +238,7 @@ pub fn store() -> Store {
             read_at: None,
         })
         .collect();
+    calendar(&store);
     let _ = store.set_read_horizons("c2", &read);
     let _ = store.set_read_horizons("c1", &read[..1]);
     channel(&store);
@@ -265,6 +266,66 @@ pub fn store() -> Store {
         None,
     ));
     store
+}
+
+fn calendar(store: &Store) {
+    use tern_engine::{Agenda, Answer, Meeting};
+    let now = Utc::now();
+    // Meetings begin on the half hour.
+    let half = now - Duration::seconds(now.timestamp() % 1800);
+    let meeting = |subject: &str, from: i64, minutes: i64, answer: Answer| Meeting {
+        id: format!("{subject} {from}"),
+        subject: subject.into(),
+        start: half + Duration::minutes(from),
+        end: half + Duration::minutes(from + minutes),
+        all_day: false,
+        cancelled: false,
+        join: Some("https://teams.microsoft.com/l/meetup-join/demo/0".into()),
+        chat: Some("c2".into()),
+        organizer: Some("Ada Quill".into()),
+        location: None,
+        answer,
+        free: false,
+        remind: None,
+    };
+    let day = 60 * 24;
+    let midnight = now.date_naive().and_time(Default::default()).and_utc();
+    let meetings = vec![
+        Meeting {
+            join: None,
+            chat: None,
+            organizer: None,
+            all_day: true,
+            start: midnight + Duration::days(1),
+            end: midnight + Duration::days(3),
+            ..meeting("Regatta", 0, 0, Answer::None)
+        },
+        meeting("Tide report", -60, 30, Answer::Accepted),
+        Meeting {
+            location: Some("Boathouse".into()),
+            ..meeting("Harbour launch", 0, 60, Answer::Organizer)
+        },
+        meeting("Berth numbers with the pilot", 90, 30, Answer::Tentative),
+        Meeting {
+            cancelled: true,
+            ..meeting("Buoy painting", 150, 30, Answer::Accepted)
+        },
+        Meeting {
+            join: None,
+            chat: None,
+            location: Some("Lighthouse".into()),
+            organizer: Some("Dee Okafor".into()),
+            ..meeting("Lamp inspection", day, 45, Answer::None)
+        },
+        meeting("Regatta planning", day * 2 + 60, 60, Answer::Declined),
+    ];
+    let _ = tern_engine::keep_agenda(
+        store,
+        &Agenda {
+            read: now,
+            meetings,
+        },
+    );
 }
 
 fn channel(store: &Store) {

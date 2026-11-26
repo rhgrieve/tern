@@ -1,9 +1,10 @@
 //! The connection to the daemon, on its own thread.
 
+use std::rc::Rc;
 use std::time::Duration;
 
 use tern_ipc::{Availability, Event, Request, Response};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 
 #[derive(Debug, Clone)]
 pub enum News {
@@ -50,6 +51,8 @@ pub struct Client {
 }
 
 const GONE: &str = "the background service is not running";
+/// Pictures fetched at once; a chat can have many.
+const PICTURES: usize = 4;
 const RETRY: Duration = Duration::from_secs(2);
 /// Some requests go to the service and back.
 const PATIENCE: Duration = Duration::from_secs(60);
@@ -99,6 +102,7 @@ async fn run(mut queue: mpsc::UnboundedReceiver<Request>, news: mpsc::UnboundedS
             answer(request, reacted.clone()).await;
         }
     });
+    let pictures = Rc::new(Semaphore::new(PICTURES));
     let ask = async {
         while let Some(request) = queue.recv().await {
             let news = news.clone();
@@ -107,6 +111,12 @@ async fn run(mut queue: mpsc::UnboundedReceiver<Request>, news: mpsc::UnboundedS
             } else if matches!(request, Request::Send { .. }) {
                 // In the order they were written.
                 answer(request, news).await;
+            } else if matches!(request, Request::Picture { .. }) {
+                let pictures = pictures.clone();
+                tokio::task::spawn_local(async move {
+                    let _turn = pictures.acquire().await;
+                    answer(request, news).await;
+                });
             } else {
                 tokio::task::spawn_local(answer(request, news));
             }
@@ -187,6 +197,7 @@ async fn answer(request: Request, news: mpsc::UnboundedSender<News>) {
     if !matches!(
         request,
         Request::MarkRead { .. }
+            | Request::Agenda
             | Request::Look { .. }
             | Request::Pictures { .. }
             | Request::Receipts { .. }

@@ -40,6 +40,17 @@ pub struct Written {
 }
 
 impl Written {
+    /// What it says on one line, for the list of chats: nothing when there is nothing.
+    pub fn line(&self) -> Option<String> {
+        let text = self.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        match self.files.len() {
+            _ if !text.is_empty() => Some(text),
+            0 => None,
+            1 => Some("1 file".into()),
+            many => Some(format!("{many} files")),
+        }
+    }
+
     /// Both, this first.
     pub fn before(mut self, newer: Written) -> Written {
         if !newer.text.is_empty() {
@@ -685,6 +696,11 @@ impl Composer {
         } else {
             drafts.insert(id, written);
         }
+    }
+
+    /// What is being written in: a conversation, or `conversation/post` for a thread.
+    pub fn opened(&self) -> Option<String> {
+        self.open.borrow().clone()
     }
 
     pub fn is_open(&self, id: &str) -> bool {

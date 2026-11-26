@@ -36,6 +36,32 @@ pub struct ChatRow {
     pub pinned: bool,
     /// Listed above the others, for being pinned.
     pub apart: bool,
+    /// What the user has written there and not sent, on one line.
+    pub draft: Option<String>,
+}
+
+/// Marks the rows that have drafts, by the drafts' keys: a conversation, or one of its threads as
+/// `conversation/post`. `open` is being written in, and is not marked.
+pub fn mark_drafts(
+    rows: &mut [ChatRow],
+    drafts: &std::collections::HashMap<String, String>,
+    open: Option<&str>,
+) {
+    for row in rows {
+        let id = row.id.as_str();
+        let of_row = |key: &str| {
+            key == id
+                || key
+                    .strip_prefix(id)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        };
+        row.draft = drafts
+            .iter()
+            .filter(|(key, _)| Some(key.as_str()) != open && of_row(key))
+            // The conversation's own first, then threads in a steady order.
+            .min_by_key(|(key, _)| (key.as_str() != id, key.as_str()))
+            .map(|(_, line)| line.clone());
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -464,7 +490,7 @@ fn size_pictures(blocks: &mut [Block], message: &MessageRecord) {
 }
 
 /// The pictures messages show, of the messages and of reactions to them.
-pub fn pictures(items: &[Item]) -> Vec<&str> {
+pub fn pictures<'a>(items: impl IntoIterator<Item = &'a Item>) -> Vec<&'a str> {
     fn within<'a>(blocks: &'a [Block], out: &mut Vec<&'a str>) {
         for block in blocks {
             match block {
@@ -662,6 +688,70 @@ pub struct Conversation {
     pub title: String,
     pub subtitle: String,
     pub channel: bool,
+    /// Whom a call from here would ring.
+    pub call: Option<Callable>,
+}
+
+/// Whom a call from a chat rings: the other person of a 1:1 chat, or the others of a group chat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Callable {
+    /// The chat: `19:…@unq.gbl.spaces` for two people, else a group chat.
+    pub thread: String,
+    pub name: String,
+    /// As Teams names them, `8:orgid:…`, with their names.
+    pub people: Vec<(String, String)>,
+}
+
+impl Callable {
+    pub fn is_group(&self) -> bool {
+        !self.thread.ends_with("@unq.gbl.spaces")
+    }
+}
+
+/// The most people a call from a group chat rings.
+const MOST_CALLED: usize = 100;
+
+/// Whom a call from this chat would ring, if Teams can call them: people of the same
+/// organisation; guests, bots and the like are not called from here.
+pub fn callable(chat: &ChatRecord, me: Option<&str>) -> Option<Callable> {
+    let two = chat.kind.eq_ignore_ascii_case("oneOnOne") && chat.id.ends_with("@unq.gbl.spaces");
+    let group = chat.kind.eq_ignore_ascii_case("group") && chat.id.ends_with("@thread.v2");
+    if !two && !group {
+        return None;
+    }
+    let me = me?;
+    let mine = |id: &str| id == me || id.strip_prefix("8:orgid:") == Some(me);
+    let others: Vec<_> = chat
+        .members
+        .iter()
+        .filter(|member| member.user_id.as_deref().is_some_and(|id| !mine(id)))
+        .collect();
+    let person = |member: &store::MemberRecord| {
+        if member.is_bot() {
+            return None;
+        }
+        let id = member.user_id.as_deref()?;
+        let mri = match id.strip_prefix("8:orgid:") {
+            Some(_) => id.to_owned(),
+            None if !id.contains(':') => format!("8:orgid:{id}"),
+            None => return None,
+        };
+        Some((mri, one_line(&member.display_name)))
+    };
+    let people: Vec<(String, String)> = if two {
+        // The one other person, or nobody to call.
+        vec![person(others.first()?)?]
+    } else {
+        others.iter().filter_map(|member| person(member)).collect()
+    };
+    if people.is_empty() || people.len() > MOST_CALLED {
+        return None;
+    }
+    Some(Callable {
+        thread: chat.id.clone(),
+        name: one_line(&chat.display_title()),
+        people,
+    })
 }
 
 /// `thread` is the post whose replies are shown, in a channel.
@@ -752,6 +842,10 @@ pub fn conversation(
             title
         },
         channel,
+        call: chat
+            .as_ref()
+            .filter(|_| thread.is_none())
+            .and_then(|chat| callable(chat, me.as_deref())),
     }
 }
 
@@ -852,6 +946,27 @@ pub fn now() -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chats_with_drafts_are_marked_but_the_open_one() {
+        let row = |id: &str| ChatRow {
+            id: id.into(),
+            ..Default::default()
+        };
+        let mut rows = vec![row("a"), row("b"), row("c"), row("ab")];
+        let drafts = std::collections::HashMap::from([
+            ("a".to_owned(), "half a".to_owned()),
+            ("a/m1".to_owned(), "a reply".to_owned()),
+            ("b/m2".to_owned(), "b reply".to_owned()),
+            ("c".to_owned(), "open".to_owned()),
+        ]);
+        mark_drafts(&mut rows, &drafts, Some("c"));
+        let marked: Vec<Option<&str>> = rows.iter().map(|row| row.draft.as_deref()).collect();
+        assert_eq!(marked, [Some("half a"), Some("b reply"), None, None]);
+        mark_drafts(&mut rows, &std::collections::HashMap::new(), None);
+        assert!(rows.iter().all(|row| row.draft.is_none()), "sent ones go");
+    }
+    use store::MemberRecord;
 
     fn reacted(all: &[(&str, usize, bool)]) -> Vec<Reaction> {
         all.iter()
@@ -1213,6 +1328,75 @@ mod tests {
             "Ann and Bo are writing…"
         );
         assert_eq!(writing(&["a", "b", "c"]), "3 people are writing…");
+    }
+
+    #[test]
+    fn a_call_rings_the_others_of_the_chat() {
+        let member = |id: &str, name: &str| MemberRecord {
+            user_id: Some(id.into()),
+            display_name: name.into(),
+        };
+        let chat = |id: &str, kind: &str, members| ChatRecord {
+            id: id.into(),
+            kind: kind.into(),
+            title: "Ann Example".into(),
+            members,
+            ..Default::default()
+        };
+        let both = vec![member("me", "Me"), member("ann", "Ann Example")];
+        let call = callable(
+            &chat("19:ann_me@unq.gbl.spaces", "oneOnOne", both.clone()),
+            Some("me"),
+        );
+        assert_eq!(
+            call,
+            Some(Callable {
+                thread: "19:ann_me@unq.gbl.spaces".into(),
+                name: "Ann Example".into(),
+                people: vec![("8:orgid:ann".into(), "Ann Example".into())],
+            })
+        );
+        assert!(!call.unwrap().is_group());
+        let mut many = both.clone();
+        many.push(member("28:bot", "Bot"));
+        many.push(member("8:live:guest", "Guest"));
+        many.push(member("8:orgid:bo", "Bo Li"));
+        let group = callable(&chat("19:x@thread.v2", "group", many), Some("me")).unwrap();
+        assert!(group.is_group());
+        assert_eq!(
+            group.people,
+            [
+                ("8:orgid:ann".to_owned(), "Ann Example".to_owned()),
+                ("8:orgid:bo".to_owned(), "Bo Li".to_owned())
+            ]
+        );
+        assert_eq!(
+            callable(
+                &chat("19:x@thread.v2", "oneOnOne", both.clone()),
+                Some("me")
+            ),
+            None
+        );
+        assert_eq!(
+            callable(&chat("19:x@thread.v2", "meeting", both.clone()), Some("me")),
+            None
+        );
+        assert_eq!(
+            callable(&chat("19:ann_me@unq.gbl.spaces", "oneOnOne", both), None),
+            None
+        );
+        let alone = vec![member("me", "Me")];
+        assert_eq!(
+            callable(
+                &chat("19:me_me@unq.gbl.spaces", "oneOnOne", alone.clone()),
+                Some("me")
+            ),
+            None
+        );
+        assert_eq!(
+            callable(&chat("19:x@thread.v2", "group", alone), Some("me")),
+            None
+        );
     }
 
     #[test]

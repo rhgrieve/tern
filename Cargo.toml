@@ -1,5 +1,6 @@
 [workspace]
-members = ["crates/*", "vendor/engine/session", "vendor/engine/chatsvc", "vendor/engine/graph", "vendor/engine/core", "vendor/engine/store"]
+members = ["crates/*", "vendor/engine/session", "vendor/engine/chatsvc", "vendor/engine/graph", "vendor/engine/core", "vendor/engine/store", "vendor/engine/calling"]
+exclude = ["vendor/native"]
 resolver = "2"
 
 [workspace.package]
@@ -39,7 +40,12 @@ session = { path = "vendor/engine/session" }
 chatsvc = { path = "vendor/engine/chatsvc" }
 graph = { path = "vendor/engine/graph" }
 store = { path = "vendor/engine/store" }
+calling = { path = "vendor/engine/calling" }
 teams-core = { path = "vendor/engine/core" }
+
+[patch.crates-io]
+webrtc-sys = { path = "vendor/native/webrtc-sys" }
+libwebrtc = { path = "vendor/native/libwebrtc" }
 
 [profile.dev]
 debug = "line-tables-only"

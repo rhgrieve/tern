@@ -1,20 +1,24 @@
-//! Emoji that move.
+//! Emoji and pictures that move.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::io::Read;
 use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 
 use gtk4 as gtk;
 use gtk4::prelude::*;
+use gtk4::subclass::prelude::*;
 use gtk4::{gdk, gdk_pixbuf, glib};
 
 /// Pictures and how long each is shown.
 pub type Frames = Rc<Vec<(gdk::Texture, Duration)>>;
 
 const MOST: usize = 200;
-/// An emoji claiming more pixels than this is not decoded.
+/// What claims more pixels than this is not decoded.
 const MAX_PIXELS: i64 = 1_000_000;
+/// All pictures of one file may take this much memory; with more, it does not move.
+const MOST_BYTES: usize = 48 << 20;
 /// How often a window nobody sees is looked at again.
 const HIDDEN: Duration = Duration::from_secs(1);
 /// What says nothing of its speed, or more than can be seen.
@@ -68,19 +72,32 @@ fn frames_of(data: &[u8]) -> Option<usize> {
     }
 }
 
-/// The pictures of a file, no larger than `size`, as pixels and how long each is shown.
-pub fn decode(path: &Path, size: i32) -> Option<Vec<(gdk_pixbuf::Pixbuf, Duration)>> {
+/// Whether a file is made of several pictures.
+pub fn moves(path: &Path) -> bool {
+    let mut signature = [0; 4];
+    let gif = std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut signature))
+        .is_ok_and(|()| signature == *b"GIF8");
+    gif && std::fs::read(path).is_ok_and(|bytes| count(&bytes) > 1)
+}
+
+/// The pictures of a file, no wider and higher than `size`, as pixels and how long each is shown.
+pub fn decode(
+    path: &Path,
+    (wide, high): (i32, i32),
+) -> Option<Vec<(gdk_pixbuf::Pixbuf, Duration)>> {
     let (_, width, height) = gdk_pixbuf::Pixbuf::file_info(path)?;
     if i64::from(width) * i64::from(height) > MAX_PIXELS {
         return None;
     }
     let count = count(&std::fs::read(path).ok()?);
     let small = |picture: gdk_pixbuf::Pixbuf| {
-        let most = picture.width().max(picture.height()).max(1);
-        if most <= size {
+        let fit = (f64::from(wide) / f64::from(picture.width().max(1)))
+            .min(f64::from(high) / f64::from(picture.height().max(1)));
+        if fit >= 1.0 {
             return Some(picture);
         }
-        let scaled = |length: i32| (length * size / most).max(1);
+        let scaled = |length: i32| ((f64::from(length) * fit) as i32).max(1);
         picture.scale_simple(
             scaled(picture.width()),
             scaled(picture.height()),
@@ -99,11 +116,111 @@ pub fn decode(path: &Path, size: i32) -> Option<Vec<(gdk_pixbuf::Pixbuf, Duratio
         let delay = at.delay_time().unwrap_or(USUAL);
         let delay = if delay < FASTEST { USUAL } else { delay };
         // A copy: the next frame may be drawn into the same place.
-        frames.push((small(at.pixbuf().copy()?)?, delay));
+        let picture = small(at.pixbuf().copy()?)?;
+        if picture.byte_length() * count > MOST_BYTES {
+            return None;
+        }
+        frames.push((picture, delay));
         now += delay;
         at.advance(now);
     }
     Some(frames)
+}
+
+mod imp {
+    use super::*;
+
+    #[derive(Default)]
+    pub struct Moving {
+        pub frames: RefCell<Option<Frames>>,
+        pub at: Cell<usize>,
+        pub waiting: Cell<bool>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for Moving {
+        const NAME: &'static str = "TernMoving";
+        type Type = super::Moving;
+        type Interfaces = (gdk::Paintable,);
+    }
+
+    impl ObjectImpl for Moving {}
+
+    impl Moving {
+        fn now(&self) -> Option<gdk::Texture> {
+            let frames = self.frames.borrow();
+            Some(frames.as_ref()?.get(self.at.get())?.0.clone())
+        }
+
+        /// Only what is drawn moves on: nothing happens for what is hidden, or in a window nobody
+        /// sees.
+        fn go_on(&self) {
+            let pause = match self.frames.borrow().as_ref() {
+                Some(frames) if frames.len() > 1 => frames[self.at.get()].1,
+                _ => return,
+            };
+            if self.waiting.replace(true) {
+                return;
+            }
+            let moving = self.obj().downgrade();
+            glib::timeout_add_local_once(pause, move || {
+                let Some(moving) = moving.upgrade() else {
+                    return;
+                };
+                let inner = moving.imp();
+                let count = inner.frames.borrow().as_ref().map_or(1, |all| all.len());
+                inner.waiting.set(false);
+                inner.at.set((inner.at.get() + 1) % count.max(1));
+                moving.invalidate_contents();
+            });
+        }
+    }
+
+    impl PaintableImpl for Moving {
+        fn current_image(&self) -> gdk::Paintable {
+            match self.now() {
+                Some(now) => now.upcast(),
+                None => gdk::Paintable::new_empty(0, 0),
+            }
+        }
+
+        fn flags(&self) -> gdk::PaintableFlags {
+            gdk::PaintableFlags::STATIC_SIZE
+        }
+
+        fn intrinsic_width(&self) -> i32 {
+            self.now().map_or(0, |now| now.width())
+        }
+
+        fn intrinsic_height(&self) -> i32 {
+            self.now().map_or(0, |now| now.height())
+        }
+
+        fn snapshot(&self, snapshot: &gdk::Snapshot, width: f64, height: f64) {
+            if let Some(now) = self.now() {
+                now.snapshot(snapshot, width, height);
+            }
+            self.go_on();
+        }
+    }
+}
+
+glib::wrapper! {
+    /// A picture that moves wherever it is shown.
+    pub struct Moving(ObjectSubclass<imp::Moving>) @implements gdk::Paintable;
+}
+
+impl Moving {
+    pub fn new(frames: Frames) -> Moving {
+        let moving: Moving = glib::Object::new();
+        moving.imp().frames.replace(Some(frames));
+        moving
+    }
+}
+
+/// Who does not want things to move has said so.
+pub fn wanted(widget: &impl IsA<gtk::Widget>) -> bool {
+    widget.settings().is_gtk_enable_animations()
 }
 
 /// Shows the frames one after the other while the image is on screen.
@@ -112,8 +229,7 @@ pub fn play(image: &gtk::Image, frames: Frames) {
         return;
     };
     image.set_paintable(Some(first));
-    // Who does not want things to move has said so.
-    if frames.len() < 2 || !image.settings().is_gtk_enable_animations() {
+    if frames.len() < 2 || !wanted(image) {
         return;
     }
     let running = Rc::new(Cell::new(false));
@@ -146,7 +262,7 @@ fn next(image: glib::WeakRef<gtk::Image>, frames: Frames, at: usize, running: Rc
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A GIF of `frames` one-pixel pictures.
@@ -209,12 +325,44 @@ mod tests {
         assert_eq!(seen, [0, 1, 2]);
     }
 
+    /// As above.
+    #[test]
+    #[ignore = "needs a display"]
+    fn a_picture_moves_while_it_is_drawn_and_only_then() {
+        use std::time::Instant;
+        gtk::init().unwrap();
+        let pixels = gdk_pixbuf::Pixbuf::new(gdk_pixbuf::Colorspace::Rgb, true, 8, 4, 4).unwrap();
+        let frame = || (gdk::Texture::for_pixbuf(&pixels), Duration::from_millis(20));
+        let moving = Moving::new(Rc::new((0..3).map(|_| frame()).collect()));
+        let picture = gtk::Picture::for_paintable(&moving);
+        let window = gtk::Window::builder().child(&picture).build();
+        let steps = |milliseconds: u64| {
+            let mut seen = std::collections::HashSet::new();
+            let end = Instant::now() + Duration::from_millis(milliseconds);
+            while Instant::now() < end {
+                glib::MainContext::default().iteration(false);
+                seen.insert(moving.imp().at.get());
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            seen.len()
+        };
+        assert_eq!(steps(200), 1, "not shown yet");
+        window.present();
+        assert_eq!(steps(3000), 3);
+        window.set_visible(false);
+        steps(100);
+        assert_eq!(steps(300), 1, "hidden");
+        window.present();
+        assert_eq!(steps(3000), 3);
+    }
+
     #[test]
     fn what_moves_is_decoded() {
         let folder = tempfile::tempdir().unwrap();
         let path = folder.path().join("a.gif");
         std::fs::write(&path, gif(3)).unwrap();
-        let frames = decode(&path, 36).unwrap();
+        assert!(moves(&path));
+        let frames = decode(&path, (36, 36)).unwrap();
         assert_eq!(frames.len(), 3);
         assert!(
             frames
@@ -222,6 +370,8 @@ mod tests {
                 .all(|(_, delay)| *delay == Duration::from_millis(50))
         );
         std::fs::write(&path, b"nothing").unwrap();
-        assert!(decode(&path, 36).is_none());
+        assert!(decode(&path, (36, 36)).is_none() && !moves(&path));
+        std::fs::write(&path, gif(1)).unwrap();
+        assert!(!moves(&path));
     }
 }

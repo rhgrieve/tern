@@ -62,6 +62,12 @@ enum Cmd {
     Send { chat: String, text: String },
     /// Look at how the service pages history; reads only, prints counts only
     ProbeHistory,
+    /// Ask once for a relay for calls; prints whether that works, never the credential
+    ProbeRelay,
+    /// Show which regional hosts serve this account; prints names and hosts only
+    ProbeRegions,
+    /// Read the calendar without changing anything; prints counts and field names only
+    ProbeCalendar,
     /// What the background service is doing
     Status,
     /// Watch activity, lock and sleep detection; needs no account
@@ -310,6 +316,150 @@ async fn probe_history() -> Outcome {
             }
         }
         println!("{line}");
+    }
+    Ok(())
+}
+
+async fn probe_regions() -> Outcome {
+    let (broker, _) = signed_in().await?;
+    let regions = broker.regions().await.map_err(text)?;
+    println!("region {}, partition {}", regions.region, regions.partition);
+    for (name, host) in &regions.hosts {
+        println!("{name:40} {host}");
+    }
+    Ok(())
+}
+
+async fn probe_relay() -> Outcome {
+    let (broker, _) = signed_in().await?;
+    let regions = broker.regions().await.map_err(text)?;
+    // Nothing but this one request.
+    const URL: &str = "https://teams.microsoft.com/trap/tokens";
+    let session = Session::with_provider(broker, SessionConfig::default())
+        .with_region(&regions.region)
+        .with_guard(Arc::new(|request| {
+            request.method == session::Method::Get && request.url == URL
+        }));
+    let mut request = session::Request::get(URL);
+    request.headers = vec![
+        ("api-version".into(), "2".into()),
+        ("X-MS-Migration".into(), "True".into()),
+        ("Accept".into(), "application/json, text/javascript".into()),
+    ];
+    let scope = session::Scope::new(session::IC3, "Teams.AccessAsUser.All");
+    match session.send(request, &scope).await {
+        Ok(answer) => {
+            println!("relay: HTTP {}", answer.status);
+            let names = |value: &serde_json::Value| -> String {
+                let names = value
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .map(|(name, _)| name);
+                names.cloned().collect::<Vec<_>>().join(", ")
+            };
+            println!("fields: {}", names(&answer.body));
+            let tokens = answer.body["tokens"].as_array();
+            println!("relays: {}", tokens.map_or(0, Vec::len));
+            if let Some(first) = tokens.and_then(|tokens| tokens.first()) {
+                println!("fields of one: {}", names(first));
+            }
+            println!("lasts: {} s", answer.body["expires"]);
+        }
+        Err(error) => println!(
+            "relay: FAILED {}",
+            error.to_string().chars().take(160).collect::<String>()
+        ),
+    }
+    Ok(())
+}
+
+async fn probe_calendar() -> Outcome {
+    let (broker, _) = signed_in().await?;
+    let regions = broker.regions().await.map_err(text)?;
+    let session = Session::with_provider(broker, SessionConfig::default())
+        .with_region(&regions.region)
+        .with_guard(tern_engine::read_only_guard());
+    let calendar = chatsvc::Calendar::new(&session);
+    let now = chrono::Utc::now();
+    let (from, to) = (
+        now - chrono::Duration::days(1),
+        now + chrono::Duration::days(14),
+    );
+    let mut known = std::collections::HashMap::new();
+    match calendar.view_response(from, to).await {
+        Ok(answer) => {
+            println!("calendar: HTTP {}", answer.status);
+            let entries = answer.body["value"].as_array().cloned().unwrap_or_default();
+            let mut fields = std::collections::BTreeMap::<String, usize>::new();
+            for (name, _) in entries
+                .iter()
+                .filter_map(|entry| entry.as_object())
+                .flatten()
+            {
+                *fields.entry(name.clone()).or_default() += 1;
+            }
+            for (name, count) in fields {
+                println!("  {name}: {count}");
+            }
+            let events = chatsvc::parse_calendar_events(&answer.body);
+            let count = |of: fn(&chatsvc::CalendarEvent) -> bool| {
+                events.iter().filter(|event| of(event)).count()
+            };
+            println!(
+                "{} entries, {} understood, {} all day, {} cancelled, {} with a link, {} with a chat",
+                entries.len(),
+                events.len(),
+                count(|event| event.all_day),
+                count(|event| event.cancelled),
+                count(|event| event.join_url.is_some()),
+                count(|event| event.thread_id.is_some()),
+            );
+            known.extend(
+                events
+                    .into_iter()
+                    .map(|event| (event.object_id, event.start)),
+            );
+        }
+        Err(error) => println!("calendar: FAILED {}", skeleton(&error.to_string())),
+    }
+    match calendar.reminder_view(now, to).await {
+        Ok(reminders) => {
+            let mut ahead = std::collections::BTreeMap::<i64, usize>::new();
+            for reminder in &reminders {
+                if let Some(start) = known.get(&reminder.event_id) {
+                    let minutes = (*start - reminder.fire_time).num_minutes();
+                    *ahead.entry(minutes).or_default() += 1;
+                }
+            }
+            println!(
+                "reminders: {}, minutes ahead of events known: {ahead:?}",
+                reminders.len()
+            );
+        }
+        Err(error) => println!("reminders: FAILED {}", skeleton(&error.to_string())),
+    }
+    let store = Arc::new(store::Store::open_in_memory().map_err(text)?);
+    let teams = tern_engine::Teams::new(session, store.clone());
+    match teams.read_agenda(now).await {
+        Ok(_) => {
+            let kept = tern_engine::agenda(&store).unwrap_or_default().meetings;
+            let count = |of: &dyn Fn(&tern_engine::Meeting) -> bool| {
+                kept.iter().filter(|meeting| of(meeting)).count()
+            };
+            let soon = now + chrono::Duration::days(1);
+            println!(
+                "kept {}, {} can be joined, {} with a reminder; next day: {}, {} with a reminder",
+                kept.len(),
+                count(&|meeting| meeting.join.is_some()),
+                count(&|meeting| meeting.remind.is_some()),
+                count(&|meeting| meeting.start > now && meeting.start < soon),
+                count(&|meeting| {
+                    meeting.start > now && meeting.start < soon && meeting.remind.is_some()
+                }),
+            );
+        }
+        Err(failure) => println!("agenda: FAILED {}", failure.text()),
     }
     Ok(())
 }
@@ -736,6 +886,9 @@ async fn main() -> ExitCode {
         Cmd::Get { chat, number } => get_file(&chat, number).await,
         Cmd::Send { chat, text } => send(&chat, text).await,
         Cmd::ProbeHistory => probe_history().await,
+        Cmd::ProbeRelay => probe_relay().await,
+        Cmd::ProbeRegions => probe_regions().await,
+        Cmd::ProbeCalendar => probe_calendar().await,
         Cmd::ProbeSync => probe_sync().await,
         Cmd::Status => status().await,
         Cmd::Sensors { idle } => sensors(idle).await,

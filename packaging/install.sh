@@ -27,7 +27,7 @@ bin=$HOME/.local/bin
 data=${XDG_DATA_HOME:-$HOME/.local/share}
 units=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
 
-for name in ternd tern tern-cli tern-login; do
+for name in ternd tern tern-cli tern-login tern-call; do
     if [ ! -x "$programs/$name" ]; then
         echo "$programs/$name is missing. In a checkout, build first: cargo build --release --workspace" >&2
         exit 1
@@ -50,7 +50,7 @@ done
 
 mkdir -p "$bin" "$data/applications" "$data/dbus-1/services" \
     "$data/icons/hicolor/scalable/apps" "$units"
-for name in ternd tern tern-cli tern-login; do
+for name in ternd tern tern-cli tern-login tern-call; do
     # Beside and then over it, so that a running one is not disturbed.
     cp "$programs/$name" "$bin/.$name.new"
     chmod 755 "$bin/.$name.new"

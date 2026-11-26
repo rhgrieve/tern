@@ -1,5 +1,30 @@
 # Changes
 
+## Unreleased
+
+**New**
+
+- Calendar, with Ctrl+E or the button above the chats: today and the two weeks ahead, also offline.
+- Reminders of meetings, when you set them in Teams and as they begin, with Join and their chat.
+- Join opens meetings in a Chromium-based browser as a window of its own, with a profile only for
+  Teams, or else in your default browser. The first one takes you through signing in there.
+- `msteams:` links, and links to meetings in messages. Installing can make Tern the default for
+  `msteams:` if you have not chosen an app.
+- Pictures that move do so in messages, and opened, unless your desktop has animations off.
+- GIFs from Giphy load while you look at the chat. They are not fetched when a message arrives.
+- Notifications when somebody calls, and for missed calls. Calls are answered in Tern, with
+  sound, or declined for all your devices.
+- Join takes you into a meeting in Tern, with sound, muted; the bar says while you wait to be let
+  in, and how many are there. The button beside Join opens it in the browser, for video and
+  sharing. Meetings with a meeting ID instead of a link still open in the browser.
+- A ringtone while a call rings: your sound theme's, until you answer, decline or put the
+  notification away. Not in Do Not Disturb.
+- Calls with sound: the button at the top of a 1:1 or group chat rings the others. A bar under it shows the
+  call, with mute and hang up, in every window. Each call runs in a program of its own,
+  `tern-call`, which hangs up when Tern's window goes. Not yet in the Flatpak.
+- In a narrow window the call's bar is also above the list of chats.
+- Chats with something written and not sent say Draft in the list, with what you wrote.
+
 ## 0.2.1
 
 **New**

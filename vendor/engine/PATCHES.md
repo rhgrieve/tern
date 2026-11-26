@@ -1,7 +1,7 @@
 # Vendored engine
 
 From https://github.com/danieldaeschle/rusty-teams (MIT, see `LICENSE`), commit
-`414be8e2046df79b7b42cd49ae0bb555f8a1ca18`. Crates: `session`, `chatsvc`, `graph`, `core`, `store`, plus the one asset
+`414be8e2046df79b7b42cd49ae0bb555f8a1ca18`. Crates: `session`, `chatsvc`, `graph`, `core`, `store`, `calling`, plus the one asset
 `app/assets/emoticons.tsv`. Examples are left out. `tern.patch` is the full difference.
 
 | Change | Where | Why |
@@ -22,5 +22,12 @@ From https://github.com/danieldaeschle/rusty-teams (MIT, see `LICENSE`), commit
 | Skype-token downloads and uploads without a page, in the account's region | `session/src/skype.rs`, `chatsvc/src/ams.rs` | Inline pictures; upstream uploads to Germany |
 | Pictures of linked pages without a page | `core/src/remote.rs` | Link previews; upstream asks a page for them |
 | Reacting with an org's own emoji | `chatsvc/src/reactions.rs` | Upstream only knows the standard ones |
+| `/trap/tokens` counts as a bearer path | `session/src/native.rs` | Calls read their relay credential there |
+| Calls follow the account: `TenantRouting::for_account`, `relay_host_for` | `calling/src/signaling.rs`, `relay.rs` | Upstream is fixed to Europe |
+| An offer may unfold into at most 64 lines | `calling/src/sdp.rs` | The other side could ask for any amount of memory |
+| A call that starts muted mutes both microphone tracks | `calling/src/call/mod.rs` | With noise suppression on Low the unmuted one was sent |
+| Links are parsed before their host is trusted; only call services are reached | `calling/src/signaling.rs` | `https://evil.example#.teams.microsoft.com/` passed, and a push could name any Teams host |
+| `EngineConfig::trouter_host`; `run_call` runs one call with the caller's own options | `calling/src/engine.rs`, `call/mod.rs` | Finding the push host needs a web page; `run_test_call` only knows Europe |
+| WebRTC's build helper pinned to 0.3.19; the build uses our checked copy | `native/webrtc-sys/Cargo.toml`, `.cargo/config.toml` | 0.3.21 named another WebRTC build, downloaded without a check |
 
 Known for later phases: pinned posts still run in a page.

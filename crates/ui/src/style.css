@@ -52,6 +52,7 @@
 .chat { padding: 8px 14px; }
 .chat.unread .title { font-weight: 700; }
 .chat.muted { opacity: 0.6; }
+.chat .draft { color: var(--accent-color); font-weight: 700; }
 .presence { background: var(--window-bg-color); border-radius: 99px; margin-right: -3px; margin-bottom: -2px; }
 .chats .presence { background: var(--sidebar-bg-color); }
 .unread-dot { min-width: 9px; min-height: 9px; border-radius: 99px; background: var(--accent-bg-color); }
@@ -59,4 +60,9 @@
 .composer { background: var(--card-bg-color); border-radius: 14px; margin: 0 16px 16px 16px; padding: 4px; box-shadow: 0 0 0 1px alpha(currentColor, 0.1); }
 .composer scrollbar slider { min-height: 16px; }
 .composer textview, .composer textview text { background: transparent; }
+.meeting.past { opacity: 0.55; }
+.meeting.now { box-shadow: inset 3px 0 0 var(--accent-bg-color); }
 .hit { padding: 6px 4px; }
+
+/* The bar of a call that is on. */
+.call-bar { padding: 6px 12px; background: alpha(var(--success-bg-color), 0.15); border-bottom: 1px solid alpha(currentColor, 0.1); }

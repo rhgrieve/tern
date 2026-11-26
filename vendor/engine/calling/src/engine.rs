@@ -1,0 +1,733 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use chatsvc::{
+    CallbackReplier, InstanceNames, Realtime, RealtimeConfig, RealtimeEvent, TrouterCallback,
+    TrouterEndpoint,
+};
+use session::Session;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
+
+use crate::call::{AcceptMode, CallOptions, CallSpec, IncomingCall, Plan};
+use crate::control::{CallControl, CallHandle, call_channel};
+use crate::devices::DeviceChoice;
+use crate::end::EndKind;
+use crate::error::{Error, Result};
+use crate::mic_processing::MicSettings;
+use crate::push::{CallNotification, Caller, PushEvent, decode_push};
+use crate::relay::{DEFAULT_RELAY_HOST, RelayCache};
+use crate::signaling::{
+    AttachRequest, LeaveReason, MeetingTarget, Participant, SelfIdentity, Signaling, TenantRouting,
+    fetch_self,
+};
+use crate::timeline::Timeline;
+use crate::trouter_events::{
+    CallEvent, CallbackLinks, acceptance_acknowledgement, callback_call_id, classify, decode_body,
+    is_acceptance_callback,
+};
+
+const ENDPOINT_WAIT: Duration = Duration::from_secs(30);
+const PRESENCE_SUFFIX: &str = "unifiedPresenceService";
+const SEEN_WINDOW: Duration = Duration::from_secs(120);
+const RING_ID_START: u64 = 1;
+pub const TRACE_ENV: &str = "CALLING_TRACE";
+
+pub fn calling_instance_names() -> InstanceNames {
+    InstanceNames {
+        global: "__callingTrouter".into(),
+        binding: "__callingRealtime".into(),
+        endpoint_storage_key: "__callingEpid".into(),
+    }
+}
+
+pub fn calling_realtime_config(ringable: bool, instance: InstanceNames) -> RealtimeConfig {
+    RealtimeConfig {
+        instance,
+        forward_callbacks: true,
+        ringable,
+        ..RealtimeConfig::default()
+    }
+}
+
+/// As [`calling_realtime_config`], on a push host already known, such as the authz answer's
+/// `calling_trouterUrl`: finding one needs a web page.
+pub fn calling_realtime_config_on(
+    ringable: bool,
+    instance: InstanceNames,
+    host: Option<String>,
+) -> RealtimeConfig {
+    RealtimeConfig {
+        discover_host: host.is_none(),
+        host,
+        ..calling_realtime_config(ringable, instance)
+    }
+}
+
+pub(crate) fn callback_base(trouter_uri: &str) -> String {
+    let trimmed = trouter_uri
+        .strip_suffix(PRESENCE_SUFFIX)
+        .unwrap_or(trouter_uri)
+        .trim_end_matches('/');
+    format!("{trimmed}/")
+}
+
+#[derive(Debug, Clone)]
+pub struct EngineConfig {
+    pub ringable: bool,
+    pub routing: TenantRouting,
+    pub relay_host: String,
+    pub trace: bool,
+    pub dump_dir: Option<std::path::PathBuf>,
+    /// Page globals of the Trouter client; a second engine in the same tab needs its own.
+    pub instance: InstanceNames,
+    /// The push host, when already known; otherwise it is looked for.
+    pub trouter_host: Option<String>,
+}
+
+const KEPT_CALL_DUMPS: usize = 5;
+
+fn next_call_dump_dir(base: &std::path::Path) -> std::path::PathBuf {
+    let mut earlier: Vec<std::path::PathBuf> = std::fs::read_dir(base)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    earlier.sort();
+    for old in earlier
+        .iter()
+        .take((earlier.len() + 1).saturating_sub(KEPT_CALL_DUMPS))
+    {
+        let _ = std::fs::remove_dir_all(old);
+    }
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    base.join(format!("{:015}", started.as_millis()))
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        EngineConfig {
+            ringable: true,
+            routing: TenantRouting::default(),
+            relay_host: DEFAULT_RELAY_HOST.to_owned(),
+            trace: std::env::var_os(TRACE_ENV).is_some(),
+            dump_dir: None,
+            instance: calling_instance_names(),
+            trouter_host: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IncomingRing {
+    pub ring_id: u64,
+    pub caller: Caller,
+    pub thread_id: Option<String>,
+    pub video: bool,
+    pub is_group: bool,
+    pub subject: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum EngineEvent {
+    Incoming(IncomingRing),
+    RingEnded {
+        ring_id: u64,
+        kind: EndKind,
+        answered_by: Option<String>,
+    },
+}
+
+enum RingCommand {
+    Accept(AcceptMode, oneshot::Sender<Option<CallHandle>>),
+    Decline,
+    Drop,
+}
+
+struct Route {
+    sender: mpsc::UnboundedSender<TrouterCallback>,
+    acceptance_reply: String,
+}
+
+pub(crate) struct Inner {
+    pub(crate) session: Session,
+    pub(crate) poll_session: Session,
+    pub(crate) config: EngineConfig,
+    pub(crate) identity: SelfIdentity,
+    pub(crate) replier: CallbackReplier,
+    pub(crate) gate: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) relay: RelayCache,
+    endpoint: Mutex<TrouterEndpoint>,
+    routes: Mutex<HashMap<String, Route>>,
+    rings: Mutex<HashMap<u64, mpsc::UnboundedSender<RingCommand>>>,
+    seen: Mutex<HashMap<(String, String), Instant>>,
+    next_ring_id: AtomicU64,
+    default_camera: Mutex<DeviceChoice>,
+    default_mic: Mutex<MicSettings>,
+    runtime: tokio::runtime::Handle,
+    events: mpsc::UnboundedSender<EngineEvent>,
+    stop: Mutex<Option<oneshot::Sender<()>>>,
+    tasks: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl Inner {
+    pub(crate) fn endpoint(&self) -> TrouterEndpoint {
+        self.endpoint.lock().expect("endpoint lock").clone()
+    }
+
+    pub(crate) fn register_route(
+        &self,
+        links: &CallbackLinks,
+    ) -> mpsc::UnboundedReceiver<TrouterCallback> {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let route = Route {
+            sender,
+            acceptance_reply: acceptance_acknowledgement(links).to_string(),
+        };
+        self.routes
+            .lock()
+            .expect("routes lock")
+            .insert(links.call_id().to_owned(), route);
+        receiver
+    }
+
+    pub(crate) fn unregister_route(&self, call_id: &str) {
+        self.routes.lock().expect("routes lock").remove(call_id);
+    }
+
+    pub(crate) fn participant(&self, participant_id: &str) -> Participant {
+        Participant {
+            mri: format!("8:orgid:{}", self.identity.object_id),
+            display_name: self.identity.display_name.clone(),
+            endpoint_id: self.endpoint().endpoint_id,
+            participant_id: participant_id.to_owned(),
+            language_id: "en-gb".into(),
+        }
+    }
+
+    pub(crate) fn callback_links(&self) -> CallbackLinks {
+        CallbackLinks::new(
+            &callback_base(&self.endpoint().trouter_uri),
+            &uuid::Uuid::new_v4().to_string(),
+        )
+    }
+
+    pub(crate) fn signaling(&self, timeline: Timeline) -> Signaling {
+        Signaling::new(
+            self.session.clone(),
+            self.poll_session.clone(),
+            self.config.routing.clone(),
+            timeline,
+        )
+    }
+
+    pub(crate) fn call_options(&self) -> CallOptions {
+        CallOptions {
+            relay_host: self.config.relay_host.clone(),
+            routing: self.config.routing.clone(),
+            trace: self.config.trace,
+            sdp_dump_dir: self.config.dump_dir.as_deref().map(next_call_dump_dir),
+            camera: self
+                .default_camera
+                .lock()
+                .expect("default camera lock")
+                .clone(),
+            mic: *self.default_mic.lock().expect("default mic lock"),
+            ..CallOptions::default()
+        }
+    }
+
+    fn route(&self, callback: TrouterCallback) {
+        let Some(call_id) = callback_call_id(&callback.path) else {
+            self.replier.reply(callback.request_id, 200, "");
+            return;
+        };
+        let route = self
+            .routes
+            .lock()
+            .expect("routes lock")
+            .get(&call_id)
+            .map(|route| {
+                let reply = if is_acceptance_callback(&callback.path) {
+                    route.acceptance_reply.clone()
+                } else {
+                    String::new()
+                };
+                (route.sender.clone(), reply)
+            });
+        match route {
+            Some((sender, reply)) => {
+                self.replier.reply(callback.request_id, 200, reply);
+                let _ = sender.send(callback);
+            }
+            None => self.replier.reply(callback.request_id, 200, ""),
+        }
+    }
+
+    fn already_seen(&self, notification: &CallNotification) -> bool {
+        let mut seen = self.seen.lock().expect("seen lock");
+        let now = Instant::now();
+        seen.retain(|_, at| now.duration_since(*at) < SEEN_WINDOW);
+        seen.insert(notification.dedupe_key(), now).is_some()
+    }
+
+    fn emit(&self, event: EngineEvent) {
+        let _ = self.events.send(event);
+    }
+}
+
+#[derive(Clone)]
+pub struct CallEngine {
+    pub(crate) inner: Arc<Inner>,
+}
+
+impl CallEngine {
+    pub async fn start(
+        session: Session,
+        poll_session: Session,
+        config: EngineConfig,
+    ) -> Result<(CallEngine, mpsc::UnboundedReceiver<EngineEvent>)> {
+        let mut realtime = Realtime::start_with(
+            &session,
+            calling_realtime_config_on(
+                config.ringable,
+                config.instance.clone(),
+                config.trouter_host.clone(),
+            ),
+        )
+        .await?;
+        let callbacks = realtime
+            .take_callbacks()
+            .ok_or_else(|| Error::Callback("callback stream already taken".into()))?;
+        let replier = realtime.callback_replier();
+        let mut last_status = None;
+        let endpoint = timeout(ENDPOINT_WAIT, async {
+            while let Some(event) = realtime.recv().await {
+                match event {
+                    RealtimeEvent::Endpoint(endpoint) => return Some(endpoint),
+                    RealtimeEvent::Status(status) => {
+                        last_status = Some(format!("{:?} {}", status.kind, status.detail))
+                    }
+                    _ => {}
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten();
+        let Some(endpoint) = endpoint else {
+            realtime.stop().await;
+            let seen = last_status.map_or_else(
+                || "no status".to_owned(),
+                |status| format!("last status: {status}"),
+            );
+            return Err(Error::Callback(format!(
+                "Trouter socket never announced its endpoint ({seen})"
+            )));
+        };
+        let identity = match fetch_self(&session).await {
+            Ok(identity) => identity,
+            Err(error) => {
+                realtime.stop().await;
+                return Err(error);
+            }
+        };
+        let (events, event_receiver) = mpsc::unbounded_channel();
+        let (stop, stop_receiver) = oneshot::channel();
+        let inner = Arc::new(Inner {
+            session,
+            poll_session,
+            config,
+            identity,
+            replier,
+            gate: Arc::new(tokio::sync::Mutex::new(())),
+            endpoint: Mutex::new(endpoint),
+            routes: Mutex::default(),
+            rings: Mutex::default(),
+            seen: Mutex::default(),
+            next_ring_id: AtomicU64::new(RING_ID_START),
+            relay: RelayCache::default(),
+            default_camera: Mutex::new(DeviceChoice::SystemDefault),
+            default_mic: Mutex::new(MicSettings::default()),
+            runtime: tokio::runtime::Handle::current(),
+            events,
+            stop: Mutex::new(Some(stop)),
+            tasks: Mutex::default(),
+        });
+        let engine = CallEngine {
+            inner: inner.clone(),
+        };
+        let pump = tokio::spawn(pump_realtime(realtime, inner.clone(), stop_receiver));
+        let router = tokio::spawn(route_callbacks(callbacks, engine.clone()));
+        let relay = prefetch_relay(inner.clone());
+        inner
+            .tasks
+            .lock()
+            .expect("tasks lock")
+            .extend([pump, router, relay]);
+        Ok((engine, event_receiver))
+    }
+
+    pub fn session(&self) -> Session {
+        self.inner.session.clone()
+    }
+
+    pub fn start_call(&self, spec: CallSpec) -> CallHandle {
+        self.start_call_with(spec, false, false)
+    }
+
+    pub fn start_video_call(&self, spec: CallSpec) -> CallHandle {
+        self.start_call_with(spec, false, true)
+    }
+
+    pub fn start_consult(&self, spec: CallSpec) -> CallHandle {
+        self.start_call_with(spec, true, false)
+    }
+
+    fn start_call_with(&self, spec: CallSpec, concurrent: bool, start_camera: bool) -> CallHandle {
+        let (handle, control) = call_channel();
+        self.start_call_on(spec, concurrent, start_camera, control);
+        handle
+    }
+
+    pub fn start_call_on(
+        &self,
+        spec: CallSpec,
+        concurrent: bool,
+        start_camera: bool,
+        control: CallControl,
+    ) {
+        let engine = self.clone();
+        self.inner.runtime.spawn(async move {
+            let options = CallOptions {
+                concurrent,
+                start_camera,
+                ..engine.inner.call_options()
+            };
+            let _ = engine.run(Plan::Outgoing(spec), options, control).await;
+        });
+    }
+
+    pub async fn accept_ring(&self, ring_id: u64, mode: AcceptMode) -> Option<CallHandle> {
+        let commands = self
+            .inner
+            .rings
+            .lock()
+            .expect("rings lock")
+            .get(&ring_id)
+            .cloned()?;
+        let (answer, handle) = oneshot::channel();
+        commands.send(RingCommand::Accept(mode, answer)).ok()?;
+        handle.await.ok().flatten()
+    }
+
+    /// Only for a click on Decline: it ends the call for all of the user's devices.
+    pub fn set_default_camera(&self, camera: DeviceChoice) {
+        *self
+            .inner
+            .default_camera
+            .lock()
+            .expect("default camera lock") = camera;
+    }
+
+    pub fn set_default_mic(&self, mic: MicSettings) {
+        *self.inner.default_mic.lock().expect("default mic lock") = mic;
+    }
+
+    pub fn decline_ring(&self, ring_id: u64) {
+        self.send_ring_command(ring_id, RingCommand::Decline);
+    }
+
+    /// Stops ringing locally without telling Teams; the call keeps ringing elsewhere.
+    pub fn drop_ring(&self, ring_id: u64) {
+        self.send_ring_command(ring_id, RingCommand::Drop);
+    }
+
+    fn send_ring_command(&self, ring_id: u64, command: RingCommand) {
+        let commands = self
+            .inner
+            .rings
+            .lock()
+            .expect("rings lock")
+            .get(&ring_id)
+            .cloned();
+        if let Some(commands) = commands {
+            let _ = commands.send(command);
+        }
+    }
+
+    pub async fn resolve_meeting(&self, meeting_data: &serde_json::Value) -> Result<MeetingTarget> {
+        let signaling = self.inner.signaling(Timeline::new(self.inner.config.trace));
+        let from = self.inner.participant(&uuid::Uuid::new_v4().to_string());
+        let (target, conversation) = signaling
+            .resolve_meeting(&from, &self.inner.callback_links(), meeting_data)
+            .await?;
+        let _ = signaling
+            .leave(&conversation, &from, LeaveReason::Cancel)
+            .await;
+        Ok(target)
+    }
+
+    pub async fn stop(&self) {
+        let stop = self.inner.stop.lock().expect("stop lock").take();
+        if let Some(stop) = stop {
+            let _ = stop.send(());
+        }
+        let tasks: Vec<JoinHandle<()>> =
+            std::mem::take(&mut *self.inner.tasks.lock().expect("tasks lock"));
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+}
+
+async fn pump_realtime(mut realtime: Realtime, inner: Arc<Inner>, mut stop: oneshot::Receiver<()>) {
+    let mut last_status = None;
+    loop {
+        tokio::select! {
+            event = realtime.recv() => match event {
+                Some(RealtimeEvent::Endpoint(endpoint)) => *inner.endpoint.lock().expect("endpoint lock") = endpoint,
+                Some(RealtimeEvent::Status(status)) => {
+                    if last_status.as_ref() != Some(&status) {
+                        eprintln!("calls: trouter {:?} {}", status.kind, status.detail);
+                        last_status = Some(status);
+                    }
+                }
+                Some(_) => {}
+                None => return,
+            },
+            _ = &mut stop => {
+                realtime.stop().await;
+                return;
+            }
+        }
+    }
+}
+
+async fn route_callbacks(
+    mut callbacks: mpsc::UnboundedReceiver<TrouterCallback>,
+    engine: CallEngine,
+) {
+    while let Some(callback) = callbacks.recv().await {
+        if callback.path.is_empty() {
+            engine.handle_push(callback);
+        } else {
+            engine.inner.route(callback);
+        }
+    }
+}
+
+impl CallEngine {
+    fn handle_push(&self, callback: TrouterCallback) {
+        self.inner.replier.reply(callback.request_id, 200, "");
+        if !self.inner.config.ringable {
+            return;
+        }
+        let Ok(PushEvent::IncomingCall(notification)) = decode_push(&callback.body) else {
+            return;
+        };
+        let notification = *notification;
+        if self.inner.already_seen(&notification) {
+            return;
+        }
+        self.ring_for(notification);
+    }
+
+    fn ring_for(&self, notification: CallNotification) -> u64 {
+        let ring_id = self.inner.next_ring_id.fetch_add(1, Ordering::SeqCst);
+        let (commands, receiver) = mpsc::unbounded_channel();
+        self.inner
+            .rings
+            .lock()
+            .expect("rings lock")
+            .insert(ring_id, commands);
+        tokio::spawn(ring_task(self.clone(), notification, ring_id, receiver));
+        ring_id
+    }
+
+    /// A ring that another program's push connection heard, given as that push. The engine
+    /// attaches to the call as if it had rung here, and says so with `EngineEvent::Incoming`;
+    /// then it can be accepted or declined by the id answered.
+    pub fn take_ring(&self, push: &str) -> Result<u64> {
+        match decode_push(push)? {
+            PushEvent::IncomingCall(notification) => Ok(self.ring_for(*notification)),
+            PushEvent::Other(_) => Err(Error::Callback("that push is not a call".into())),
+        }
+    }
+}
+
+fn prefetch_relay(inner: Arc<Inner>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let _ = inner.relay.grant(&inner.session).await;
+    })
+}
+
+async fn ring_task(
+    engine: CallEngine,
+    notification: CallNotification,
+    ring_id: u64,
+    mut commands: mpsc::UnboundedReceiver<RingCommand>,
+) {
+    let inner = engine.inner.clone();
+    prefetch_relay(inner.clone());
+    let links = inner.callback_links();
+    let route_id = links.call_id().to_owned();
+    let mut callbacks = inner.register_route(&links);
+    let timeline = Timeline::new(inner.config.trace);
+    let signaling = inner.signaling(timeline.clone());
+    let participant_id = if notification.participant_id.is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        notification.participant_id.clone()
+    };
+    let participant = inner.participant(&participant_id);
+    let cleanup = |inner: &Inner| {
+        inner.unregister_route(&route_id);
+        inner.rings.lock().expect("rings lock").remove(&ring_id);
+    };
+    let Some(attach_url) = notification.links.get("attach") else {
+        cleanup(&inner);
+        return;
+    };
+    let request = AttachRequest {
+        from: &participant,
+        callbacks: &links,
+        controller: notification.conversation_controller.as_deref(),
+        needs_media: notification.offer_sdp.is_none(),
+    };
+    let mut attached = match signaling.attach(attach_url, &request).await {
+        Ok(attached) => attached,
+        Err(error) => {
+            timeline.record("attach failed", error.to_string());
+            cleanup(&inner);
+            return;
+        }
+    };
+    if attached.offer_sdp.is_none() {
+        attached.offer_sdp = notification.offer_sdp.clone();
+    }
+    if let Some(progress) = attached.links.get("progress")
+        && let Err(error) = signaling.send_ringing(progress, &participant).await
+    {
+        timeline.record("ringing progress failed", error.to_string());
+    }
+    inner.emit(EngineEvent::Incoming(IncomingRing {
+        ring_id,
+        caller: notification.caller.clone(),
+        thread_id: notification.thread_id.clone(),
+        video: notification.video,
+        is_group: notification.is_multi_party,
+        subject: notification.subject.clone(),
+    }));
+    loop {
+        tokio::select! {
+            callback = callbacks.recv() => {
+                let Some(callback) = callback else { break };
+                let event = decode_body(&callback).and_then(|body| classify(&callback.path, body));
+                if let Ok((_, CallEvent::End(end))) = event {
+                    inner.emit(EngineEvent::RingEnded {
+                        ring_id,
+                        kind: end.kind(),
+                        answered_by: end.accepted_elsewhere_by,
+                    });
+                    break;
+                }
+            }
+            command = commands.recv() => match command {
+                Some(RingCommand::Accept(_, answer)) if answer.is_closed() => {
+                    if let Some(call_leg) = attached.links.get("callLeg")
+                        && let Err(error) = signaling.decline(call_leg).await
+                    {
+                        timeline.record("decline failed", error.to_string());
+                    }
+                    break;
+                }
+                Some(RingCommand::Accept(accept, answer)) => {
+                    let (handle, control) = call_channel();
+                    let incoming = IncomingCall {
+                        accept,
+                        notification,
+                        attached,
+                        links,
+                        participant,
+                        callbacks,
+                    };
+                    let _ = answer.send(Some(handle));
+                    inner.rings.lock().expect("rings lock").remove(&ring_id);
+                    let options = inner.call_options();
+                    tokio::spawn(async move {
+                        let _ = engine.run(Plan::Incoming(Box::new(incoming)), options, control).await;
+                    });
+                    return;
+                }
+                Some(RingCommand::Decline) => {
+                    if let Some(call_leg) = attached.links.get("callLeg")
+                        && let Err(error) = signaling.decline(call_leg).await
+                    {
+                        timeline.record("decline failed", error.to_string());
+                    }
+                    break;
+                }
+                Some(RingCommand::Drop) | None => break,
+            }
+        }
+    }
+    cleanup(&inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_new_call_dump_keeps_only_the_newest_earlier_ones() {
+        let base = std::env::temp_dir().join(format!("call-dumps-test-{}", std::process::id()));
+        for millis in 1..=6 {
+            std::fs::create_dir_all(base.join(format!("{millis:015}"))).unwrap();
+        }
+        let next = next_call_dump_dir(&base);
+        let mut left: Vec<String> = std::fs::read_dir(&base)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(
+            left,
+            (3..=6)
+                .map(|millis| format!("{millis:015}"))
+                .collect::<Vec<_>>()
+        );
+        assert!(next.file_name().unwrap().to_string_lossy().into_owned() > format!("{:015}", 6));
+    }
+
+    #[test]
+    fn callback_base_comes_from_the_presence_uri() {
+        assert_eq!(
+            callback_base(
+                "https://pub-ent-euwe-02-f.trouter.teams.microsoft.com:3443/v4/f/abc//unifiedPresenceService"
+            ),
+            "https://pub-ent-euwe-02-f.trouter.teams.microsoft.com:3443/v4/f/abc/"
+        );
+        assert_eq!(
+            callback_base("https://h/v4/f/abc/unifiedPresenceService"),
+            "https://h/v4/f/abc/"
+        );
+    }
+
+    #[test]
+    fn only_the_ringable_engine_registers_for_calls() {
+        assert!(calling_realtime_config(true, calling_instance_names()).ringable);
+        assert!(!calling_realtime_config(false, calling_instance_names()).ringable);
+        assert!(calling_realtime_config(true, calling_instance_names()).forward_callbacks);
+    }
+}

@@ -2,8 +2,9 @@
 Type=Application
 Name=Tern
 Comment=Chats and channels from Microsoft Teams
-Exec=tern
+Exec=tern %u
 Icon=io.github.rhgrieve.Tern
+MimeType=x-scheme-handler/msteams;
 Categories=Network;InstantMessaging;GTK;
 StartupNotify=true
 DBusActivatable=true

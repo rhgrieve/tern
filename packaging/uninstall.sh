@@ -10,7 +10,7 @@ if [ -x "$bin/tern-cli" ] && [ "${1:-}" != --no-service ]; then
     "$bin/tern-cli" logout || signed_in=yes
 fi
 [ "${1:-}" = --no-service ] || systemctl --user disable -q --now ternd.service || true
-for name in ternd tern tern-cli tern-login; do rm -f "$bin/$name"; done
+for name in ternd tern tern-cli tern-login tern-call; do rm -f "$bin/$name"; done
 rm -f "$data/applications/$id.desktop" "$data/applications/$id.Chat.desktop" \
     "$data/dbus-1/services/$id.service" "$data/icons/hicolor/scalable/apps/$id.svg" \
     "$units/ternd.service"

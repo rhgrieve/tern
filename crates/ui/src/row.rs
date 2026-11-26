@@ -263,6 +263,16 @@ pub fn text(markup: &str) -> gtk::Label {
             .set_text(&crate::rich::as_written(&selected));
         label.stop_signal_emission_by_name("copy-clipboard");
     });
+    label.connect_activate_link(|label, url| {
+        // A meeting is joined; everything else is for the browser.
+        let Some(address) = tern_engine::meeting_address(url) else {
+            return glib::Propagation::Proceed;
+        };
+        match label.activate_action("app.join", Some(&address.to_variant())) {
+            Ok(()) => glib::Propagation::Stop,
+            Err(_) => glib::Propagation::Proceed,
+        }
+    });
     set_text(&label, markup);
     label
 }
@@ -618,6 +628,14 @@ impl Part {
             }
             frame.remove_css_class("missing");
             stand_in(&frame, Instead::Nothing);
+            if crate::moving::wanted(&picture) {
+                crate::art::moving(&wanted.clone(), move |frames| {
+                    // The row may show another one by now.
+                    if frame.widget_name() == wanted {
+                        picture.set_paintable(Some(&crate::moving::Moving::new(frames)));
+                    }
+                });
+            }
         });
     }
 }
@@ -641,7 +659,7 @@ enum Instead {
 fn wait_for(frame: &gtk::Button, url: &str) {
     let instead = if crate::art::file(url).is_some() {
         Instead::Unreadable
-    } else if !tern_engine::may_prefetch(url) {
+    } else if !tern_engine::may_show(url) {
         Instead::Elsewhere
     } else if let Some(left) = crate::art::wait_for(url) {
         let (frame, url) = (frame.downgrade(), url.to_owned());

@@ -36,8 +36,8 @@ jobs:
         run: |
           apt-get update -q
           apt-get install -qy --no-install-recommends \
-            ca-certificates git curl build-essential cmake clang pkg-config python3 rustup squashfs-tools desktop-file-utils \
-            libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev libgtk-4-bin \
+            ca-certificates git curl unzip build-essential cmake clang pkg-config python3 rustup squashfs-tools desktop-file-utils \
+            libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev libgtk-4-bin libasound2-dev \
             adwaita-icon-theme fonts-noto-core fonts-noto-color-emoji tzdata dbus >/dev/null
           rustup toolchain install "$RUST" --profile minimal -c clippy -c rustfmt
           rustup default "$RUST"
@@ -58,10 +58,14 @@ jobs:
             build-${{ env.RUST }}-${{ hashFiles('Cargo.lock') }}-
             build-${{ env.RUST }}-
 
+      # Calls are built against a prebuilt WebRTC, checked against its sha256.
+      - name: WebRTC
+        run: scripts/webrtc.sh
+
       # The vendored engine keeps its own style.
       - name: Style
         run: |
-          own=(-p tern -p ternd -p tern-cli -p tern-login -p tern-auth -p tern-engine -p tern-ipc -p tern-presence)
+          own=(-p tern -p ternd -p tern-cli -p tern-login -p tern-auth -p tern-engine -p tern-ipc -p tern-presence -p tern-call)
           cargo fmt "${own[@]}" --check
           cargo clippy --locked "${own[@]}" --all-targets --no-deps -- -D warnings
 

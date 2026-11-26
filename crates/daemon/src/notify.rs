@@ -5,12 +5,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use futures_util::StreamExt;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-use tern_engine::Notice;
+use tern_engine::{Notice, Reminder, Stage};
 use tokio::sync::mpsc;
 use zbus::Variant;
+
+use crate::calls::Ring;
 
 #[zbus::proxy(
     interface = "org.freedesktop.Notifications",
@@ -88,8 +90,13 @@ trait Application {
     ) -> zbus::Result<()>;
 }
 
+/// Where Teams itself can answer a call.
+const TEAMS: &str = "https://teams.microsoft.com/v2/";
+
 const OPEN: &str = "default";
 const REPLY: &str = "inline-reply";
+/// Why a notification closed: the user put it away.
+const DISMISSED: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
@@ -105,7 +112,35 @@ pub enum Action {
         conversation: String,
         text: String,
     },
+    Go(Place, Option<String>),
+    /// The user put away the notification of a call: it rings no more.
+    Silence,
 }
+
+/// Where else a notification leads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Place {
+    Agenda,
+    /// A meeting, at its address.
+    Meeting(String),
+    Chat(String),
+    /// Teams in the browser.
+    Teams,
+    /// Answering a call in Tern, with the push that told of it.
+    Answer(String),
+    /// Declining a call, for all the user's devices.
+    Decline(String),
+}
+
+/// A notification that is not about a message.
+struct Aside {
+    id: u32,
+    /// What its buttons do, by their names.
+    choices: Vec<(&'static str, Place)>,
+}
+
+/// By what they are about: a meeting, or a call.
+type Asides = Arc<Mutex<HashMap<String, Aside>>>;
 
 struct Shown {
     id: u32,
@@ -135,7 +170,102 @@ struct Can {
 pub struct Notifier {
     proxy: Option<(NotificationsProxy<'static>, Can)>,
     open: Open,
+    asides: Asides,
     actions: mpsc::UnboundedSender<Action>,
+}
+
+/// What a notification that is not about a message says.
+struct Note<'a> {
+    about: String,
+    icon: &'a str,
+    title: String,
+    body: String,
+    category: &'a str,
+    /// Stays, and is shown above others.
+    urgent: bool,
+    sound: Option<&'a str>,
+    choices: Vec<(&'static str, &'a str, Place)>,
+}
+
+fn clock(time: DateTime<Utc>) -> String {
+    time.with_timezone(&Local).format("%H:%M").to_string()
+}
+
+fn reminder(reminder: &Reminder, now: DateTime<Utc>) -> Note<'static> {
+    let meeting = &reminder.meeting;
+    let name = match meeting.subject.as_str() {
+        "" => "Meeting",
+        subject => subject,
+    };
+    // Rounded: told a few seconds late, it is still in ten minutes.
+    let minutes = ((meeting.start - now).num_seconds() + 30) / 60;
+    let title = match (reminder.stage, minutes) {
+        (Stage::Now, _) => format!("{name} begins"),
+        (Stage::Soon, ..1) => format!("{name} is about to begin"),
+        (Stage::Soon, 1) => format!("{name} in a minute"),
+        (Stage::Soon, 2..120) => format!("{name} in {minutes} minutes"),
+        (Stage::Soon, _) => format!("{name} at {}", clock(meeting.start)),
+    };
+    let mut body = format!("{} to {}", clock(meeting.start), clock(meeting.end));
+    for more in [&meeting.location, &meeting.organizer]
+        .into_iter()
+        .flatten()
+    {
+        body.push('\n');
+        body.push_str(more);
+    }
+    let mut choices = vec![(OPEN, "Calendar", Place::Agenda)];
+    if let Some(address) = &meeting.join {
+        choices.push(("join", "Join", Place::Meeting(address.clone())));
+    }
+    if let Some(chat) = &meeting.chat {
+        choices.push(("chat", "Chat", Place::Chat(chat.clone())));
+    }
+    Note {
+        about: format!("meeting {} {}", meeting.id, meeting.start.timestamp()),
+        icon: "x-office-calendar",
+        title,
+        body,
+        category: "x-tern.meeting",
+        urgent: false,
+        sound: None,
+        choices,
+    }
+}
+
+fn call(ring: &Ring, chat: Option<String>) -> Note<'static> {
+    let kind = if ring.video { "video call" } else { "call" };
+    let mut choices = Vec::new();
+    match &ring.push {
+        // Tern answers with sound, a call of one person or of a group.
+        Some(push) => {
+            choices.push(("answer", "Answer", Place::Answer(push.clone())));
+            choices.push(("decline", "Decline", Place::Decline(push.clone())));
+            if let Some(chat) = chat {
+                choices.push((OPEN, "Open Chat", Place::Chat(chat)));
+            }
+        }
+        None => {
+            if let Some(chat) = chat {
+                choices.push((OPEN, "Open Chat", Place::Chat(chat)));
+            }
+            choices.push(("teams", "Answer in Browser", Place::Teams));
+        }
+    }
+    let body = match &ring.subject {
+        Some(subject) => format!("{subject}\nIncoming {kind}"),
+        None => format!("Incoming {kind}"),
+    };
+    Note {
+        about: format!("call {}", ring.call),
+        icon: "call-start",
+        title: format!("{} is calling", ring.name),
+        body,
+        category: "call.incoming",
+        urgent: true,
+        sound: Some("phone-incoming-call"),
+        choices,
+    }
 }
 
 impl Notifier {
@@ -144,6 +274,7 @@ impl Notifier {
         let notifier = Notifier {
             proxy: None,
             open: Open::default(),
+            asides: Asides::default(),
             actions,
         };
         (notifier, queue)
@@ -152,7 +283,7 @@ impl Notifier {
     /// Connects on first use: the desktop's notification server may start after us.
     async fn server(&mut self) -> Option<(NotificationsProxy<'static>, Can)> {
         if self.proxy.is_none() {
-            match connect(self.open.clone(), self.actions.clone()).await {
+            match connect(self.open.clone(), self.asides.clone(), self.actions.clone()).await {
                 Ok(connected) => self.proxy = Some(connected),
                 Err(error) => tracing::warn!(%error, "no notifications"),
             }
@@ -243,6 +374,85 @@ impl Notifier {
         }
     }
 
+    /// Tells of a meeting, in place of what was told of it before.
+    pub async fn remind(&mut self, due: &Reminder) {
+        self.note(reminder(due, Utc::now())).await;
+    }
+
+    /// Forgets that the desktop showed it, and takes it down.
+    async fn take_down(&mut self, about: &str) {
+        let aside = self.asides.lock().expect("notifications").remove(about);
+        if let (Some(aside), Some((proxy, _))) = (aside, &self.proxy) {
+            let _ = proxy.close_notification(aside.id).await;
+        }
+    }
+
+    pub async fn ring(&mut self, ring: &Ring, chat: Option<String>) {
+        self.note(call(ring, chat)).await;
+    }
+
+    pub async fn stop_ringing(&mut self, ring: &Ring) {
+        self.take_down(&format!("call {}", ring.call)).await;
+    }
+
+    async fn note(&mut self, note: Note<'_>) {
+        let Some((proxy, can)) = self.server().await else {
+            return;
+        };
+        let replaces = {
+            let asides = self.asides.lock().expect("notifications");
+            asides.get(&note.about).map_or(0, |aside| aside.id)
+        };
+        let body = if can.markup {
+            escape(&note.body)
+        } else {
+            note.body
+        };
+        let mut buttons = Vec::new();
+        if can.actions {
+            for (key, label, _) in &note.choices {
+                buttons.extend([*key, *label]);
+            }
+        }
+        let mut hints = HashMap::from([
+            ("category", Variant::from(note.category)),
+            ("desktop-entry", Variant::from(WINDOW)),
+        ]);
+        if note.urgent {
+            hints.insert("urgency", Variant::from(2u8));
+        }
+        if let Some(sound) = note.sound {
+            hints.insert("sound-name", Variant::from(sound));
+        }
+        let shown = proxy
+            .notify(
+                "Tern",
+                replaces,
+                note.icon,
+                &note.title,
+                &body,
+                &buttons,
+                hints,
+                -1,
+            )
+            .await;
+        match shown {
+            Ok(id) => {
+                let choices = note.choices.into_iter().map(|(key, _, to)| (key, to));
+                let aside = Aside {
+                    id,
+                    choices: choices.collect(),
+                };
+                let mut asides = self.asides.lock().expect("notifications");
+                asides.insert(note.about, aside);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "notification");
+                self.proxy = None;
+            }
+        }
+    }
+
     /// Closes notifications `read` answers `true` for.
     pub async fn close_read(&mut self, read: impl Fn(&str, DateTime<Utc>) -> bool) {
         let Some((proxy, _)) = &self.proxy else {
@@ -268,6 +478,7 @@ impl Notifier {
 
 async fn connect(
     open: Open,
+    asides: Asides,
     actions: mpsc::UnboundedSender<Action>,
 ) -> zbus::Result<(NotificationsProxy<'static>, Can)> {
     let connection = zbus::Connection::session().await?;
@@ -290,9 +501,15 @@ async fn connect(
             // Signals name every application's notifications; only ours are in `open`.
             let action = tokio::select! {
                 Some(signal) = invoked.next() => match signal.args() {
-                    Ok(args) if args.action_key == OPEN => {
+                    Ok(args) => {
                         let given = token.take().filter(|(id, _)| *id == args.id).map(|(_, token)| token);
-                        take(&open, args.id).map(|target| Action::Open(target, given))
+                        match choose(&asides, args.id, &args.action_key) {
+                            Some(place) => Some(Action::Go(place, given)),
+                            None if args.action_key == OPEN => {
+                                take(&open, args.id).map(|target| Action::Open(target, given))
+                            }
+                            None => None,
+                        }
                     }
                     _ => None,
                 },
@@ -310,15 +527,24 @@ async fn connect(
                     None
                 }
                 Some(signal) = closed.next() => {
+                    let mut silence = false;
                     if let Ok(args) = signal.args() {
+                        // Put away by the user, not by its time or by us.
+                        silence = args.reason == DISMISSED && asides
+                            .lock()
+                            .expect("notifications")
+                            .iter()
+                            .any(|(about, aside)| aside.id == args.id && about.starts_with("call "));
                         // An answer can follow its notification's close.
-                        let (open, id) = (open.clone(), args.id);
+                        let (open, asides, id) = (open.clone(), asides.clone(), args.id);
                         tokio::spawn(async move {
                             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                             take(&open, id);
+                            let mut asides = asides.lock().expect("notifications");
+                            asides.retain(|_, aside| aside.id != id);
                         });
                     }
-                    None
+                    silence.then_some(Action::Silence)
                 }
                 else => return,
             };
@@ -330,6 +556,14 @@ async fn connect(
         }
     });
     Ok((proxy, can))
+}
+
+/// Where a button of a notification leads, if it is one of those.
+fn choose(asides: &Asides, id: u32, key: &str) -> Option<Place> {
+    let asides = asides.lock().expect("notifications");
+    let aside = asides.values().find(|aside| aside.id == id)?;
+    let (_, place) = aside.choices.iter().find(|(name, _)| *name == key)?;
+    Some(place.clone())
 }
 
 fn take(open: &Open, id: u32) -> Option<Target> {
@@ -439,6 +673,45 @@ pub async fn open_window() {
     }
 }
 
+/// Where a notification about a meeting or a call leads. The window does it: what this service
+/// starts is as confined as itself, which no browser bears.
+pub async fn go(place: &Place, token: Option<String>) {
+    let (action, parameter) = match place {
+        Place::Agenda => ("calendar", None),
+        Place::Meeting(address) => ("join", Some(address.as_str())),
+        Place::Chat(chat) => ("open", Some(chat.as_str())),
+        Place::Teams => ("join", Some(TEAMS)),
+        Place::Answer(push) => ("answer", Some(push.as_str())),
+        Place::Decline(push) => ("decline", Some(push.as_str())),
+    };
+    let shown = async {
+        let connection = zbus::Connection::session().await?;
+        wake(&connection).await?;
+        let parameter = parameter.map(Variant::from).into_iter().collect();
+        ApplicationProxy::new(&connection)
+            .await?
+            .activate_action(action, parameter, platform(token.as_deref()))
+            .await
+    };
+    if let Err(error) = shown.await {
+        tracing::info!(%error, window = WINDOW, "no window; opening Teams on the web");
+        match place {
+            Place::Agenda => open_address("https://teams.microsoft.com/v2/calendar").await,
+            Place::Meeting(address) => open_address(address).await,
+            Place::Teams | Place::Answer(_) => open_address(TEAMS).await,
+            // Without the window nothing declines; the call rings out.
+            Place::Decline(_) => {}
+            Place::Chat(chat) => {
+                let target = Target {
+                    conversation: chat.clone(),
+                    message: String::new(),
+                };
+                open_address(&link(&target)).await;
+            }
+        }
+    }
+}
+
 /// Opens a conversation in Tern's window, or in Teams on the web.
 pub async fn open(target: &Target, token: Option<String>) {
     let shown = async {
@@ -500,6 +773,136 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         notifier.close_read(|_, _| true).await;
         assert!(notifier.open.lock().unwrap().is_empty());
+    }
+
+    fn meeting() -> tern_engine::Meeting {
+        let start: DateTime<Utc> = "2026-11-25T09:00:00Z".parse().unwrap();
+        tern_engine::Meeting {
+            id: "m".into(),
+            subject: "Standup".into(),
+            start,
+            end: start + chrono::Duration::minutes(30),
+            all_day: false,
+            cancelled: false,
+            join: Some("https://teams.microsoft.com/l/meetup-join/a/0".into()),
+            chat: None,
+            organizer: Some("Ada Quill".into()),
+            location: None,
+            answer: tern_engine::Answer::Accepted,
+            free: false,
+            remind: None,
+        }
+    }
+
+    #[test]
+    fn calls_are_answered_here() {
+        let ring = Ring {
+            call: "x".into(),
+            from: Some("ada".into()),
+            name: "Ada Quill".into(),
+            chat: None,
+            subject: None,
+            video: false,
+            push: Some("{\"evt\":107}".into()),
+        };
+        let keys = |note: Note| {
+            note.choices
+                .iter()
+                .map(|(key, ..)| *key)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            keys(call(&ring, Some("19:a_b@unq.gbl.spaces".into()))),
+            ["answer", "decline", OPEN]
+        );
+        let note = call(&ring, None);
+        assert!(matches!(&note.choices[0].2, Place::Answer(push) if push == "{\"evt\":107}"));
+        let group = Ring {
+            chat: Some("19:g@thread.v2".into()),
+            ..ring.clone()
+        };
+        assert_eq!(
+            keys(call(&group, Some("19:g@thread.v2".into()))),
+            ["answer", "decline", OPEN]
+        );
+        // One whose push was not kept is for the browser.
+        let unkept = Ring { push: None, ..ring };
+        assert_eq!(keys(call(&unkept, None)), ["teams"]);
+    }
+
+    #[test]
+    fn a_reminder_says_when_and_leads_to_the_meeting() {
+        let due = |stage| Reminder {
+            meeting: meeting(),
+            stage,
+        };
+        let title = |stage, seconds| {
+            let now = meeting().start - chrono::Duration::seconds(seconds);
+            reminder(&due(stage), now).title
+        };
+        assert_eq!(title(Stage::Soon, 598), "Standup in 10 minutes");
+        assert_eq!(title(Stage::Soon, 60), "Standup in a minute");
+        assert_eq!(title(Stage::Soon, 10), "Standup is about to begin");
+        assert_eq!(title(Stage::Now, -20), "Standup begins");
+        let note = reminder(&due(Stage::Soon), meeting().start);
+        let keys: Vec<_> = note.choices.iter().map(|(key, ..)| *key).collect();
+        assert_eq!(keys, [OPEN, "join"]);
+        // One notification, updated as it begins.
+        assert_eq!(
+            note.about,
+            reminder(&due(Stage::Now), meeting().start).about
+        );
+    }
+
+    /// Needs a notification server that presses the button named "join" or "answer" by itself.
+    #[tokio::test]
+    #[ignore = "needs a bus of its own"]
+    async fn buttons_of_reminders_and_calls_come_back() {
+        let (mut notifier, mut actions) = Notifier::start();
+        let mut due = Reminder {
+            meeting: meeting(),
+            stage: Stage::Soon,
+        };
+        notifier.remind(&due).await;
+        let address = meeting().join.unwrap();
+        let wait = Duration::from_secs(5);
+        let pressed = tokio::time::timeout(wait, actions.recv()).await.unwrap();
+        assert!(
+            matches!(pressed, Some(Action::Go(Place::Meeting(to), Some(_))) if to == address),
+            "with the permission to take the focus"
+        );
+        due.stage = Stage::Now;
+        notifier.remind(&due).await;
+        let first = tokio::time::timeout(wait, actions.recv()).await.unwrap();
+        assert!(matches!(first, Some(Action::Go(Place::Meeting(_), _))));
+        assert_eq!(notifier.asides.lock().unwrap().len(), 1, "replaced");
+        let ring = Ring {
+            call: "x".into(),
+            from: None,
+            name: "Ada <b>".into(),
+            chat: None,
+            subject: None,
+            video: false,
+            push: Some("{}".into()),
+        };
+        notifier.ring(&ring, None).await;
+        let pressed = tokio::time::timeout(wait, actions.recv()).await.unwrap();
+        assert!(matches!(pressed, Some(Action::Go(Place::Answer(_), _))));
+        notifier.stop_ringing(&ring).await;
+        assert_eq!(notifier.asides.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn only_buttons_that_were_shown_lead_somewhere() {
+        let asides = Asides::default();
+        let aside = Aside {
+            id: 3,
+            choices: vec![("chat", Place::Chat("c".into()))],
+        };
+        asides.lock().unwrap().insert("call x".into(), aside);
+        assert_eq!(choose(&asides, 3, "chat"), Some(Place::Chat("c".into())));
+        assert_eq!(choose(&asides, 3, "join"), None);
+        assert_eq!(choose(&asides, 4, "chat"), None);
     }
 
     #[test]

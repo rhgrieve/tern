@@ -12,6 +12,10 @@ pub struct Regions {
     pub presence: Option<String>,
     pub trouter_host: Option<String>,
     pub chat_service: Option<String>,
+    /// The account's partition within its region, such as `amer01`.
+    pub partition: String,
+    /// The host of every regional service named, by its name. Only hosts: no paths.
+    pub hosts: Vec<(String, String)>,
 }
 
 const PRESENCE: &str = "https://presence.teams.microsoft.com";
@@ -37,11 +41,23 @@ pub fn parse_regions(answer: &Value) -> Option<Regions> {
         .and_then(|url| url::Url::parse(url).ok())
         .and_then(|url| url.host_str().map(str::to_owned))
         .filter(|host| host.ends_with(".trouter.teams.microsoft.com"));
+    let hosts = gtms
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, url)| {
+            let url = url::Url::parse(url.as_str()?).ok()?;
+            let host = url.host_str()?.to_owned();
+            Some((name.clone(), host))
+        })
+        .collect();
     Some(Regions {
         region: answer["region"].as_str().unwrap_or_default().to_owned(),
         presence,
         trouter_host,
         chat_service: checked("chatService", SPACES),
+        partition: answer["partition"].as_str().unwrap_or_default().to_owned(),
+        hosts,
     })
 }
 

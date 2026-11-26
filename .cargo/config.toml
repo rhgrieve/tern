@@ -1,0 +1,5 @@
+[env]
+# Calls are built against our own verified copy of WebRTC (webrtc-89d790b, linux-x64-release,
+# zip sha256 b167adad5291cea0e4d66a0454d9d52d2ad714e6b0ed70f4410317d3ebde70c5), never a download
+# made during the build. scripts/webrtc.sh fetches and checks it.
+LK_CUSTOM_WEBRTC = { value = "target/phase5/webrtc/linux-x64-release", relative = true }

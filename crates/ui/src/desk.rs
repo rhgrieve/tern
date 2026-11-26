@@ -1,20 +1,26 @@
 //! All windows together: the main one, and conversations in windows of their own. Drafts, the
 //! account and its cache are theirs in common. A conversation is in one window at a time.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
+use gtk4::gio::prelude::*;
+use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
+use libadwaita::prelude::*;
 use store::Store;
+use tern_engine::Place;
 
+use crate::call::{Call, Change, Stage};
 use crate::client::Client;
 use crate::composer::{Drafts, Written};
+use crate::model::Callable;
 use crate::window::Window;
-use crate::{art, drafts};
+use crate::{art, drafts, join};
 
 /// Windows with one conversation tell themselves apart from the main one, for the rules of window
 /// managers.
@@ -32,6 +38,10 @@ pub struct Desk {
     main: RefCell<Option<Rc<Window>>>,
     /// Closed ones stay, to be used again.
     chats: RefCell<Vec<Rc<Window>>>,
+    /// The call that is on, one at a time, whichever window it was started in.
+    call: RefCell<Option<Rc<Call>>>,
+    /// A clock of the call is running.
+    ticking: Cell<bool>,
 }
 
 impl Desk {
@@ -45,7 +55,117 @@ impl Desk {
             store: RefCell::default(),
             main: RefCell::default(),
             chats: RefCell::default(),
+            call: RefCell::default(),
+            ticking: Cell::default(),
         })
+    }
+
+    fn windows(&self) -> Vec<Rc<Window>> {
+        let mut all: Vec<Rc<Window>> = self.main.borrow().iter().cloned().collect();
+        all.extend(self.chats.borrow().iter().cloned());
+        all
+    }
+
+    pub fn call_on(&self) -> Option<Rc<Call>> {
+        self.call.borrow().clone()
+    }
+
+    /// Calls `who`; `from` is told how it ended.
+    pub fn call(self: &Rc<Self>, who: &Callable, from: &Rc<Window>) {
+        if self.demo || self.call.borrow().is_some() {
+            return;
+        }
+        let started = Call::place(who, self.follow(Rc::downgrade(from)));
+        self.started(started, from);
+    }
+
+    /// Answers the call that `push` told of, in the main window.
+    pub fn answer(self: &Rc<Self>, push: &str) {
+        let main = self.main();
+        main.window.present();
+        if self.demo {
+            return;
+        }
+        if self.call.borrow().is_some() {
+            main.toast("Hang up first to answer another call");
+            return;
+        }
+        let started = Call::answer(push, self.follow(Rc::downgrade(&main)));
+        self.started(started, &main);
+    }
+
+    /// Declines the call that `push` told of, for all the user's devices.
+    pub fn decline(&self, push: &str) {
+        if self.demo {
+            return;
+        }
+        if let Err(error) = Call::decline(push) {
+            eprintln!("tern: the call could not be declined: {error}");
+        }
+    }
+
+    fn started(&self, started: Result<Rc<Call>, glib::Error>, from: &Rc<Window>) {
+        match started {
+            Ok(call) => {
+                self.call.replace(Some(call));
+                self.show_call();
+            }
+            Err(error) => from.toast(&format!("The call could not start: {error}")),
+        }
+    }
+
+    /// What follows the changes of a call; `told` is told how it ended.
+    fn follow(self: &Rc<Self>, told: Weak<Window>) -> impl Fn(&Rc<Call>, Change) + 'static {
+        let desk = Rc::downgrade(self);
+        move |_, change| {
+            let Some(desk) = desk.upgrade() else { return };
+            match change {
+                Change::Ended(text) => {
+                    desk.call.replace(None);
+                    if let Some(window) = told.upgrade() {
+                        window.toast(&text);
+                    }
+                }
+                Change::Notice(text) => {
+                    if let Some(window) = told.upgrade() {
+                        window.toast(&text);
+                    }
+                }
+                Change::Stage(Stage::Connected(_)) => desk.tick(),
+                _ => {}
+            }
+            desk.show_call();
+        }
+    }
+
+    /// Every window shows the call as it is.
+    fn show_call(&self) {
+        let call = self.call_on();
+        for window in self.windows() {
+            window.show_call(call.as_ref());
+        }
+    }
+
+    /// Moves the clocks on while a call is connected.
+    fn tick(self: &Rc<Self>) {
+        if self.ticking.replace(true) {
+            return;
+        }
+        let desk = Rc::downgrade(self);
+        glib::timeout_add_seconds_local(1, move || {
+            let Some(desk) = desk.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let on = desk
+                .call_on()
+                .is_some_and(|call| matches!(call.stage(), Stage::Connected(_)));
+            if !on {
+                desk.ticking.set(false);
+                return glib::ControlFlow::Break;
+            }
+            desk.show_call();
+            glib::ControlFlow::Continue
+        });
     }
 
     pub fn app(&self) -> &adw::Application {
@@ -59,6 +179,7 @@ impl Desk {
         let (client, news) = Client::start();
         let window = Window::new(self, client, own);
         window.follow(news);
+        window.show_call(self.call_on().as_ref());
         window
     }
 
@@ -99,6 +220,124 @@ impl Desk {
                 main.window.present();
             }
         }
+    }
+
+    /// Where an address of Teams leads: to a chat here, else to a browser.
+    pub fn go(self: &Rc<Self>, address: &str) {
+        match tern_engine::place(address) {
+            Some(Place::Chat(id)) => self.open(&id),
+            Some(_) => self.join(address),
+            None => self.main().window.present(),
+        }
+    }
+
+    /// Joins a meeting: in Tern, with sound, when it is a meeting Tern can join; else in a browser.
+    pub fn join(self: &Rc<Self>, address: &str) {
+        match join::here(address).filter(|_| !self.demo) {
+            Some(link) => self.meet(&link),
+            None => self.join_in_browser(address),
+        }
+    }
+
+    /// Joins the meeting of `link` in Tern, in the main window.
+    fn meet(self: &Rc<Self>, link: &str) {
+        let main = self.main();
+        main.window.present();
+        if self.call.borrow().is_some() {
+            main.toast("Hang up first to join the meeting");
+            return;
+        }
+        let name = self
+            .meeting_name(link)
+            .unwrap_or_else(|| "the meeting".into());
+        let started = Call::meeting(link, &name, self.follow(Rc::downgrade(&main)));
+        self.started(started, &main);
+    }
+
+    /// The subject of the meeting of `link`, if the calendar has it.
+    fn meeting_name(&self, link: &str) -> Option<String> {
+        let store = self.store.borrow().clone()?;
+        tern_engine::agenda(&store)?
+            .meetings
+            .into_iter()
+            .find(|meeting| {
+                meeting
+                    .join
+                    .as_deref()
+                    .and_then(join::here)
+                    .is_some_and(|other| other == link)
+            })
+            .map(|meeting| meeting.subject)
+            .filter(|subject| !subject.trim().is_empty())
+    }
+
+    /// Opens a meeting, or what else only Teams shows, in a browser. Before the first meeting the
+    /// user has to sign in there.
+    pub fn join_in_browser(self: &Rc<Self>, address: &str) {
+        if !join::as_guest(address) {
+            return self.browse(address);
+        }
+        let dialog = adw::AlertDialog::new(
+            Some("Sign in for meetings?"),
+            Some(
+                "Meetings open in a browser window of their own, which does not have Tern's sign-in. Sign in there once, and meetings know you from then on.",
+            ),
+        );
+        dialog.add_responses(&[
+            ("cancel", "Cancel"),
+            ("guest", "Join as Guest"),
+            ("sign-in", "Sign In"),
+        ]);
+        dialog.set_response_appearance("sign-in", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("sign-in"));
+        dialog.set_close_response("cancel");
+        let (desk, address) = (self.clone(), address.to_owned());
+        dialog.connect_response(None, move |_, response| match response {
+            "guest" => desk.browse(&address),
+            "sign-in" => {
+                desk.browse(join::TEAMS);
+                desk.join_signed_in(&address);
+            }
+            _ => {}
+        });
+        let main = self.main();
+        main.window.present();
+        dialog.present(Some(&main.window));
+    }
+
+    /// Goes on to the meeting once the user has signed in.
+    fn join_signed_in(self: &Rc<Self>, address: &str) {
+        let dialog = adw::AlertDialog::new(
+            Some("Sign in in the browser window"),
+            Some("When Teams shows there, you are signed in, and can join."),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("join", "Join")]);
+        dialog.set_response_appearance("join", adw::ResponseAppearance::Suggested);
+        dialog.set_close_response("cancel");
+        let (desk, address) = (self.clone(), address.to_owned());
+        dialog.connect_response(Some("join"), move |_, _| {
+            join::remember_sign_in();
+            desk.browse(&address);
+        });
+        dialog.present(Some(&self.main().window));
+    }
+
+    fn browse(self: &Rc<Self>, address: &str) {
+        let over = self.app.active_window();
+        // Until it is open: there may be no window, and then nothing else keeps this running.
+        let (hold, desk) = (self.app.hold(), self.clone());
+        join::go(address, over, move |reason| {
+            let main = desk.main();
+            main.window.present();
+            main.toast(&reason);
+            drop(hold);
+        });
+    }
+
+    pub fn show_calendar(self: &Rc<Self>) {
+        let main = self.main();
+        main.show_calendar();
+        main.window.present();
     }
 
     /// Gives the conversation a window of its own.
@@ -241,6 +480,83 @@ mod tests {
     use gtk4::{gio, glib};
 
     use super::*;
+
+    /// As the composer's test: needs a display, and a process of its own.
+    #[test]
+    #[ignore = "needs a display"]
+    fn the_first_meeting_asks_for_a_sign_in_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let folder = tempfile::tempdir().unwrap();
+        let (browser, seen) = (folder.path().join("chromium"), folder.path().join("seen"));
+        let script = format!("#!/bin/sh\necho \"$*\" >> '{}'\n", seen.display());
+        std::fs::write(&browser, script).unwrap();
+        std::fs::set_permissions(&browser, PermissionsExt::from_mode(0o755)).unwrap();
+        // Nothing else runs yet that reads these.
+        unsafe {
+            std::env::set_var("PATH", folder.path());
+            std::env::set_var("XDG_DATA_HOME", folder.path().join("data"));
+        }
+        adw::init().unwrap();
+        let app = adw::Application::builder()
+            .application_id("io.github.rhgrieve.Tern.Test")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(gio::Cancellable::NONE).unwrap();
+        let wait = |milliseconds: u64| {
+            let end = Instant::now() + Duration::from_millis(milliseconds);
+            while Instant::now() < end {
+                glib::MainContext::default().iteration(false);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let desk = Desk::new(&app, true);
+        desk.use_store(Arc::new(crate::demo::store()), 1);
+        let main = desk.main();
+        main.window.present();
+        wait(300);
+        let opened = || -> Vec<String> {
+            let seen = std::fs::read_to_string(&seen).unwrap_or_default();
+            seen.lines()
+                .filter_map(|line| Some(line.split_once("--app=")?.1.to_owned()))
+                .collect()
+        };
+        let answer = |with: &str| {
+            let dialog = main.window.visible_dialog().expect("a dialog");
+            let dialog = dialog.downcast::<adw::AlertDialog>().unwrap();
+            let detail = glib::Quark::from_str(with);
+            dialog.emit_by_name_with_details::<()>("response", detail, &[&with]);
+            dialog.force_close();
+            wait(500);
+        };
+        let meeting = "https://teams.microsoft.com/l/meetup-join/a/0";
+        let page = "https://teams.microsoft.com/v2/?meetingjoin=true#/l/meetup-join/a/0";
+
+        desk.join_in_browser(meeting);
+        assert!(opened().is_empty(), "asks first");
+        answer("cancel");
+        assert!(opened().is_empty());
+        desk.join_in_browser(meeting);
+        answer("guest");
+        assert_eq!(opened(), [page]);
+
+        // A guest is asked again.
+        desk.join_in_browser(meeting);
+        answer("sign-in");
+        assert_eq!(opened(), [page, join::TEAMS]);
+        answer("cancel");
+        desk.join_in_browser(meeting);
+        answer("sign-in");
+        answer("join");
+        assert_eq!(opened()[3..], [page]);
+        wait(500);
+        assert!(main.window.visible_dialog().is_none());
+
+        // From then on nobody is asked.
+        desk.join_in_browser(meeting);
+        wait(500);
+        assert!(main.window.visible_dialog().is_none());
+        assert_eq!(opened().len(), 5);
+    }
 
     /// As the composer's test: needs a display.
     #[test]

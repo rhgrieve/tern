@@ -24,6 +24,7 @@ serde_json.workspace = true
 store.workspace = true
 teams-core.workspace = true
 tern-engine.workspace = true
+url.workspace = true
 tern-ipc.workspace = true
 tokio.workspace = true
 

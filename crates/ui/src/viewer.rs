@@ -134,7 +134,19 @@ impl Viewer {
         art::whole(file.clone(), move |texture| {
             if let (Some(viewer), Some(texture)) = (viewer.upgrade(), texture) {
                 viewer.picture.set_paintable(Some(&texture));
-                viewer.file.replace(Some(file));
+                viewer.file.replace(Some(file.clone()));
+                if !crate::moving::wanted(&viewer.picture) {
+                    return;
+                }
+                let (shown, weak) = (file.clone(), Rc::downgrade(&viewer));
+                art::moving_file(file, (texture.width(), texture.height()), move |frames| {
+                    let viewer = weak.upgrade();
+                    let still = |viewer: &Rc<Viewer>| viewer.file.borrow().as_ref() == Some(&shown);
+                    if let Some(viewer) = viewer.filter(still) {
+                        let moving = crate::moving::Moving::new(frames);
+                        viewer.picture.set_paintable(Some(&moving));
+                    }
+                });
             }
         });
     }

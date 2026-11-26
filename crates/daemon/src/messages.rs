@@ -16,7 +16,7 @@ use tern_engine::{
 };
 use tern_ipc::{Availability, Event};
 use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout_at};
 
@@ -28,6 +28,8 @@ pub enum News {
     },
     /// Somebody came or went.
     Presence,
+    /// The calendar was read.
+    Agenda,
     Failed {
         reason: String,
     },
@@ -45,6 +47,7 @@ pub struct Messages {
     files: Arc<Files>,
     media: std::path::PathBuf,
     want: mpsc::UnboundedSender<Want>,
+    agenda: Arc<Notify>,
 }
 
 impl Drop for Messages {
@@ -56,6 +59,8 @@ impl Drop for Messages {
 }
 
 const RECENT_CHATS: usize = 50;
+/// How far back the chat with somebody who calls is looked for.
+const CHATS_WITH: usize = 1000;
 /// Chats whose pictures are kept ready, and how many messages of each are looked at.
 const PICTURE_CHATS: usize = 20;
 const PICTURE_MESSAGES: usize = 60;
@@ -67,6 +72,10 @@ const PEOPLE: usize = 200;
 /// How often in that time a pinned chat is read that is not in the chat list.
 const PIN_TRIES: u32 = 2;
 const PINS_EVERY: Duration = Duration::from_secs(5 * 60);
+/// Nobody tells when the calendar changes.
+const AGENDA_EVERY: Duration = Duration::from_secs(5 * 60);
+/// Asked for in a row, it is read once.
+const AGENDA_PAUSE: Duration = Duration::from_secs(5);
 const MEDIA_EVERY: Duration = Duration::from_secs(30 * 60);
 
 pub fn presence<'a>(
@@ -191,6 +200,33 @@ async fn read_pins(
     }
 }
 
+/// Reads the calendar after the first sync, now and then, and when asked.
+async fn read_agenda(
+    mut state: watch::Receiver<SyncState>,
+    teams: Arc<Teams>,
+    asked: Arc<Notify>,
+    changes: broadcast::Sender<Event>,
+    news: mpsc::UnboundedSender<News>,
+) {
+    if state.wait_for(|state| state.refreshed).await.is_err() {
+        return;
+    }
+    loop {
+        match teams.read_agenda(Utc::now()).await {
+            Ok(changed) => {
+                // Also when it did not: how old it is did.
+                let _ = changes.send(Event::Agenda);
+                if changed && news.send(News::Agenda).is_err() {
+                    return;
+                }
+            }
+            Err(failure) => tracing::debug!(error = failure.text(), "calendar"),
+        }
+        tokio::time::sleep(AGENDA_PAUSE).await;
+        let _ = tokio::time::timeout(AGENDA_EVERY, asked.notified()).await;
+    }
+}
+
 /// Passes on what the engine changed in the cache.
 async fn tell(
     mut core: broadcast::Receiver<CoreEvent>,
@@ -268,7 +304,15 @@ impl Messages {
             &path.with_file_name("outgoing"),
         );
         let (sent, moved) = (news.clone(), changes.clone());
+        let agenda = Arc::new(Notify::new());
         let tasks = vec![
+            tokio::spawn(read_agenda(
+                state.clone(),
+                teams.clone(),
+                agenda.clone(),
+                changes.clone(),
+                news.clone(),
+            )),
             tokio::spawn(prefetch(teams.clone(), wanted)),
             tokio::spawn(read_pins(state.clone(), teams.clone(), changes.clone())),
             tokio::spawn(tell(core, changes, news.clone())),
@@ -308,6 +352,7 @@ impl Messages {
             files: Arc::new(files),
             media,
             want,
+            agenda,
         })
     }
 
@@ -326,6 +371,33 @@ impl Messages {
     pub fn catch_up(&self) {
         let _ = self.jobs.send(Job::CatchUp);
         self.outbox.wake();
+        self.read_agenda();
+    }
+
+    pub fn read_agenda(&self) {
+        self.agenda.notify_one();
+    }
+
+    /// The calendar as it was last read.
+    pub fn meetings(&self) -> Vec<tern_engine::Meeting> {
+        tern_engine::agenda(&self.store)
+            .map(|agenda| agenda.meetings)
+            .unwrap_or_default()
+    }
+
+    /// The chat of two with this person.
+    pub fn chat_with(&self, person: &str) -> Option<String> {
+        let chats = self.store.recent_chats(CHATS_WITH).ok()?;
+        let with = |chat: &store::ChatRecord| {
+            chat.kind.eq_ignore_ascii_case("oneOnOne")
+                && chat.members.iter().any(|member| {
+                    member
+                        .user_id
+                        .as_deref()
+                        .is_some_and(|id| id.eq_ignore_ascii_case(person))
+                })
+        };
+        chats.into_iter().find(with).map(|chat| chat.id)
     }
 
     pub fn teams(&self) -> Arc<Teams> {
