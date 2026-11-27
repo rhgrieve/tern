@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -60,6 +61,89 @@ pub fn markdown_line(line: &str) -> (MarkdownLine, usize) {
     (MarkdownLine::Text, 0)
 }
 
+/// Where what is in each cell of a table row is: between the `|`, without the space around it.
+pub fn table_cells(line: &str) -> Vec<Range<usize>> {
+    let mut inner = line.len() - line.trim_start().len()..line.trim_end().len();
+    if line[inner.clone()].starts_with('|') {
+        inner.start += 1;
+    }
+    if inner.end > inner.start && line[inner.clone()].ends_with('|') {
+        inner.end -= 1;
+    }
+    let trimmed = |cell: Range<usize>| {
+        let text = &line[cell.clone()];
+        let start = cell.start + (text.len() - text.trim_start().len());
+        start..start + text.trim().len()
+    };
+    let mut cells = Vec::new();
+    let mut at = inner.start;
+    for (pipe, _) in line[inner.clone()].match_indices('|') {
+        cells.push(trimmed(at..inner.start + pipe));
+        at = inner.start + pipe + 1;
+    }
+    cells.push(trimmed(at..inner.end));
+    cells
+}
+
+/// How many columns a line under a table's first row makes, as `|---|:-:|`.
+fn table_rule(line: &str) -> Option<usize> {
+    if !line.contains('|') {
+        return None;
+    }
+    let cells = table_cells(line);
+    let rule = |cell: &str| {
+        let dashes = cell.strip_prefix(':').unwrap_or(cell);
+        let dashes = dashes.strip_suffix(':').unwrap_or(dashes);
+        !dashes.is_empty() && dashes.bytes().all(|byte| byte == b'-')
+    };
+    cells
+        .iter()
+        .all(|cell| rule(&line[cell.clone()]))
+        .then_some(cells.len())
+}
+
+/// How many of `lines` make a table from the first: a row with a `|` in it, a rule of as many
+/// cells, and the rows with a `|` after them.
+pub fn markdown_table(lines: &[&str]) -> Option<usize> {
+    let head = lines.first()?;
+    if !head.contains('|') || markdown_line(head).0 != MarkdownLine::Text {
+        return None;
+    }
+    if table_rule(lines.get(1)?)? != table_cells(head).len() {
+        return None;
+    }
+    let rows = lines[2..]
+        .iter()
+        .take_while(|line| line.contains('|') && markdown_line(line).0 == MarkdownLine::Text)
+        .count();
+    Some(2 + rows)
+}
+
+fn table_html(rows: &[&str], dialect: Dialect) -> String {
+    let columns = table_cells(rows[0]).len();
+    let cells = |row: &str, tag: &str| {
+        let mut html = String::from("<tr>");
+        let found = table_cells(row);
+        // Missing cells are empty, and cells beyond the first row's are left out.
+        for column in 0..columns {
+            let text = found.get(column).map_or("", |cell| &row[cell.clone()]);
+            html.push_str(&format!("<{tag}>{}</{tag}>", inline_html(text, dialect)));
+        }
+        html.push_str("</tr>");
+        html
+    };
+    let mut html = format!("<table><thead>{}</thead>", cells(rows[0], "th"));
+    if rows.len() > 2 {
+        html.push_str("<tbody>");
+        for row in &rows[2..] {
+            html.push_str(&cells(row, "td"));
+        }
+        html.push_str("</tbody>");
+    }
+    html.push_str("</table>");
+    html
+}
+
 fn line_of(line: &str, dialect: Dialect) -> (MarkdownLine, usize) {
     match dialect {
         Dialect::Message => markdown_line(line),
@@ -120,6 +204,11 @@ fn render(text: &str, dialect: Dialect) -> String {
 }
 
 fn block_html(segment: &str, dialect: Dialect) -> String {
+    let raw: Vec<&str> = segment.split('\n').collect();
+    let table = |at: usize| match dialect {
+        Dialect::Message => markdown_table(&raw[at..]),
+        Dialect::Card => None,
+    };
     let lines: Vec<(MarkdownLine, &str)> = segment
         .split('\n')
         .map(|line| {
@@ -127,17 +216,24 @@ fn block_html(segment: &str, dialect: Dialect) -> String {
             (kind, &line[at..])
         })
         .collect();
-    if lines.iter().all(|(kind, _)| *kind == MarkdownLine::Text) {
+    if lines.iter().all(|(kind, _)| *kind == MarkdownLine::Text)
+        && (0..raw.len()).all(|at| table(at).is_none())
+    {
         return inline_html(segment, dialect);
     }
     // Runs of lines of a kind; blocks need no breaks between them.
     let mut html = String::new();
     let mut at = 0;
     while at < lines.len() {
+        if let Some(rows) = table(at) {
+            html.push_str(&table_html(&raw[at..at + rows], dialect));
+            at += rows;
+            continue;
+        }
         let kind = lines[at].0;
         let mut end = at + 1;
         if !matches!(kind, MarkdownLine::Heading(_)) {
-            while end < lines.len() && lines[end].0 == kind {
+            while end < lines.len() && lines[end].0 == kind && table(end).is_none() {
                 end += 1;
             }
         }

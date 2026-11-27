@@ -137,3 +137,32 @@ fn cards_keep_their_own_lines() {
         "# no<br>&gt; no<br>1. no<ul><li>yes</li></ul>"
     );
 }
+
+#[test]
+fn pipe_tables_become_tables() {
+    assert_eq!(
+        markdown_to_html("|a|table|\n|-|-----|\n|it|**worked**|"),
+        "<table><thead><tr><th>a</th><th>table</th></tr></thead>\
+         <tbody><tr><td>it</td><td><b>worked</b></td></tr></tbody></table>"
+    );
+    // Without the outer pipes, with alignment, short and long rows, and text around it. A
+    // line without a pipe ends it, so what follows a table is not taken into it.
+    assert_eq!(
+        markdown_to_html("before\nx | y\n:-- | --:\n1 |\n2 | 3 | 4\nafter"),
+        "before<table><thead><tr><th>x</th><th>y</th></tr></thead>\
+         <tbody><tr><td>1</td><td></td></tr><tr><td>2</td><td>3</td></tr></tbody></table>after"
+    );
+    assert_eq!(
+        markdown_to_html("| h |\n|---|"),
+        "<table><thead><tr><th>h</th></tr></thead></table>"
+    );
+}
+
+#[test]
+fn what_only_looks_like_a_table_stays_text() {
+    // A rule of another width, no rule, or no pipe.
+    assert_eq!(markdown_to_html("a|b\n|-|"), "a|b<br>|-|");
+    assert_eq!(markdown_to_html("a | b\nc | d"), "a | b<br>c | d");
+    assert_eq!(markdown_to_html("a\n---"), "a<br>---");
+    assert_eq!(card_markdown_to_html("a|b\n-|-"), "a|b<br>-|-");
+}

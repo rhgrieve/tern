@@ -13,7 +13,7 @@ use gtk4::prelude::*;
 use gtk4::{gdk, glib, pango};
 use libadwaita as adw;
 use regex::{Captures, Regex};
-use teams_core::{MarkdownLine, markdown_line};
+use teams_core::{MarkdownLine, markdown_line, markdown_table, table_cells};
 
 // As `teams_core::markdown`, which keeps them to itself.
 static CODE_FENCE: LazyLock<Regex> =
@@ -36,6 +36,10 @@ pub enum Kind {
     Heading(u8),
     /// A whole line that is quoted.
     Quote,
+    /// A whole line of a table.
+    Table,
+    /// What is in a cell of a table's first row.
+    Header,
     /// The `- ` or `1. ` that makes a line a list item.
     Bullet,
     /// Characters that say how text looks and are not sent as text.
@@ -87,24 +91,37 @@ fn group(captures: &Captures, index: usize) -> Range<usize> {
     captures.get(index).expect("the pattern has it").range()
 }
 
-/// Outside code blocks, each line is text, a list item, a heading or quoted, as when sending.
+/// A line: what it is, where it is, and where its text starts.
+type Line = (MarkdownLine, Range<usize>, usize);
+
+/// Outside code blocks, each line is text, a list item, a heading or quoted, or lines are a
+/// table, as when sending.
 fn block(found: &mut Vec<(Kind, Range<usize>)>, body: &str, range: Range<usize>) {
-    let mut lines = Vec::new();
+    let raw: Vec<&str> = body[range.clone()].split('\n').collect();
+    let table = |at: usize| markdown_table(&raw[at..]);
+    let mut lines: Vec<Line> = Vec::new();
     let mut at = range.start;
-    for line in body[range.clone()].split('\n') {
+    for line in &raw {
         let (kind, text) = markdown_line(line);
         lines.push((kind, at..at + line.len(), at + text));
         at += line.len() + 1;
     }
-    if lines.iter().all(|(kind, ..)| *kind == MarkdownLine::Text) {
+    if lines.iter().all(|(kind, ..)| *kind == MarkdownLine::Text)
+        && (0..raw.len()).all(|at| table(at).is_none())
+    {
         return inline(found, body, std::slice::from_ref(&range));
     }
     let mut at = 0;
     while at < lines.len() {
+        if let Some(rows) = table(at) {
+            cells(found, body, &lines[at..at + rows]);
+            at += rows;
+            continue;
+        }
         let kind = lines[at].0;
         let mut end = at + 1;
         if !matches!(kind, MarkdownLine::Heading(_)) {
-            while end < lines.len() && lines[end].0 == kind {
+            while end < lines.len() && lines[end].0 == kind && table(end).is_none() {
                 end += 1;
             }
         }
@@ -138,6 +155,29 @@ fn block(found: &mut Vec<(Kind, Range<usize>)>, body: &str, range: Range<usize>)
             }
         }
         at = end;
+    }
+}
+
+/// A table: its rule and pipes only mark, and cells beyond the first row's are not sent.
+fn cells(found: &mut Vec<(Kind, Range<usize>)>, body: &str, rows: &[Line]) {
+    let columns = table_cells(&body[rows[0].1.clone()]).len();
+    for (index, (_, line, _)) in rows.iter().enumerate() {
+        found.push((Kind::Table, line.clone()));
+        if index == 1 {
+            found.push((Kind::Marker, line.clone()));
+            continue;
+        }
+        let mut at = line.start;
+        for cell in table_cells(&body[line.clone()]).into_iter().take(columns) {
+            let cell = line.start + cell.start..line.start + cell.end;
+            found.push((Kind::Marker, at..cell.start));
+            if index == 0 {
+                found.push((Kind::Header, cell.clone()));
+            }
+            inline(found, body, std::slice::from_ref(&cell));
+            at = cell.end;
+        }
+        found.push((Kind::Marker, at..line.end));
     }
 }
 
@@ -356,6 +396,11 @@ pub fn attach(text: &gtk::TextView) -> Rc<Styled> {
             Kind::Quote,
             gtk::TextTag::builder().left_margin(QUOTE_MARGIN).build(),
         ),
+        (
+            Kind::Table,
+            gtk::TextTag::builder().family("monospace").build(),
+        ),
+        (Kind::Header, gtk::TextTag::builder().weight(700).build()),
         (Kind::Bold, gtk::TextTag::builder().weight(700).build()),
         (
             Kind::Italic,
@@ -477,7 +522,13 @@ impl Styled {
                 Kind::Code => tag.set_background_rgba(Some(&with(SHADE))),
                 Kind::Block => tag.set_paragraph_background_rgba(Some(&with(SHADE))),
                 Kind::Quote => tag.set_foreground_rgba(Some(&with(QUIET))),
-                Kind::Bold | Kind::Italic | Kind::Strike | Kind::Link | Kind::Heading(_) => {}
+                Kind::Bold
+                | Kind::Italic
+                | Kind::Strike
+                | Kind::Link
+                | Kind::Heading(_)
+                | Kind::Table
+                | Kind::Header => {}
             }
         }
     }
@@ -507,6 +558,8 @@ mod tests {
                         Kind::Link => 'l',
                         Kind::Heading(_) => 'h',
                         Kind::Quote => 'q',
+                        Kind::Table => 't',
+                        Kind::Header => 'H',
                         Kind::Bullet => '-',
                         Kind::Marker => '~',
                     })
@@ -648,6 +701,18 @@ mod tests {
         assert_eq!(under("* a"), "--.");
     }
 
+    #[test]
+    fn tables() {
+        let text = "|a|**b**|\n|-|-|\n| c |d|e|";
+        assert_eq!(under(text), "~H~~~H~~~.~~~~~.~~t~~t~~~");
+        assert_eq!(shown(text)[5], "b:Hbt");
+        assert_eq!(shown(text)[18], "c:t");
+        // A cell beyond the first row's is not sent.
+        assert_eq!(shown(text)[23], "e:t~");
+        // Without a rule as wide as the first row, it is text.
+        assert!(marks("a|b\n|-|").is_empty());
+    }
+
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     struct Looks {
         bold: bool,
@@ -659,6 +724,8 @@ mod tests {
         item: bool,
         heading: u8,
         quote: bool,
+        /// 1 in a table's first row, 2 in the rest.
+        cell: u8,
     }
 
     /// What sending makes, character by character: looks of each character that is not space.
@@ -768,6 +835,14 @@ mod tests {
                     },
                     out,
                 ),
+                Span::Table { header, rows } => {
+                    for (index, row) in rows.iter().enumerate() {
+                        let cell = if *header && index == 0 { 1 } else { 2 };
+                        for one in row {
+                            walk(one, Looks { cell, ..looks }, out);
+                        }
+                    }
+                }
                 Span::List { items, .. } => {
                     for one in items {
                         walk(
@@ -820,6 +895,13 @@ mod tests {
                 item: item && !block,
                 heading,
                 quote: has(at, Kind::Quote),
+                cell: if has(at, Kind::Header) {
+                    1
+                } else if has(at, Kind::Table) {
+                    2
+                } else {
+                    0
+                },
             };
             out.push((character, looks));
         }
@@ -828,7 +910,14 @@ mod tests {
 
     #[test]
     fn marks_agree_with_what_is_sent() {
-        const PIECES: [&str; 32] = [
+        const PIECES: [&str; 39] = [
+            "\n|a|b|\n|-|-|\n|",
+            "\n| b |",
+            "|",
+            " | ",
+            "\n|-|-|\n",
+            "\n| ",
+            "-|",
             "\n# ",
             "\n### ",
             "\n> ",

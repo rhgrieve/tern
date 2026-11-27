@@ -22,7 +22,10 @@ fn write(out: &mut String, spans: &[Span]) -> Option<()> {
     for span in spans {
         let was_ended = std::mem::replace(
             &mut ended,
-            matches!(span, Span::Heading { .. } | Span::List { .. }),
+            matches!(
+                span,
+                Span::Heading { .. } | Span::List { .. } | Span::Table { .. }
+            ),
         );
         match span {
             Span::Text(text) => out.push_str(text),
@@ -66,6 +69,25 @@ fn write(out: &mut String, spans: &[Span]) -> Option<()> {
                     out.push_str(url);
                 } else {
                     out.push_str(&format!("[{text}]({url})"));
+                }
+            }
+            // Markdown tables have a first row of headings.
+            Span::Table { header: true, rows } => {
+                line(out);
+                for (index, row) in rows.iter().enumerate() {
+                    let mut cells = Vec::new();
+                    for cell in row {
+                        let mut text = String::new();
+                        write(&mut text, cell)?;
+                        if text.contains(['\n', '|']) {
+                            return None;
+                        }
+                        cells.push(text);
+                    }
+                    out.push_str(&format!("| {} |\n", cells.join(" | ")));
+                    if index == 0 {
+                        out.push_str(&format!("|{}\n", " --- |".repeat(cells.len())));
+                    }
                 }
             }
             Span::List { ordered, items, .. } => {
@@ -121,6 +143,7 @@ mod tests {
             "> said\n>\n> *more*\nthen",
             "1. one\n2. two",
             "- a\nafter\n\n# T\n\nx",
+            "before\n| a | **b** |\n| --- | --- |\n| 1 | `2` |\nafter",
         ] {
             assert_eq!(of(&markdown_to_html(text)).as_deref(), Some(text));
         }
@@ -131,6 +154,7 @@ mod tests {
         for html in [
             "<p><i>slanted</i></p>",
             "<table><tr><td>a</td></tr></table>",
+            "<table><tr><th>a|b</th></tr></table>",
             "<p>hi <at id=\"0\">Ann</at></p>",
             "<blockquote>quoted</blockquote><p>x</p>",
             "<ol start=\"3\"><li>a</li></ol>",

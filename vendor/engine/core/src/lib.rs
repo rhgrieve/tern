@@ -170,8 +170,8 @@ pub use jumbo::{JumboEmoji, MAX_JUMBO_EMOJI, jumbo_emoji};
 pub use links::{LinkPreview, first_public_link, is_public_link, link_preview, public_links};
 pub use mapping::{chat_record, message_record};
 pub use markdown::{
-    MarkdownLine, card_markdown_to_html, escape_html, markdown_line, markdown_to_html,
-    plain_text_to_html,
+    MarkdownLine, card_markdown_to_html, escape_html, markdown_line, markdown_table,
+    markdown_to_html, plain_text_to_html, table_cells,
 };
 pub use meeting_join::{
     MeetingCode, MeetingLink, ThreadMeeting, find_meeting_link, meeting_code_from_id,
