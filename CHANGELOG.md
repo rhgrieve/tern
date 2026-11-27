@@ -5,9 +5,9 @@
 **New**
 
 - Write a message in your own editor with Ctrl+Shift+E or the button beside the message box:
-  `$VISUAL`, else `$EDITOR`, else your default app for text, in a terminal when it needs one. The
-  text comes back when you close it, also if you went to another chat meanwhile. Not in the
-  Flatpak.
+  your default app for Markdown or text, else `$VISUAL` or `$EDITOR`, in a terminal when it needs
+  one. The text comes back when you close it, also if you went to another chat meanwhile. Not in
+  the Flatpak.
 
 ## 0.3.0
 

@@ -1,7 +1,9 @@
 //! Writing a message in the user's own editor: which one, in which terminal, the file it edits,
 //! and what comes back. No widgets, so it can be tested.
 //!
-//! The editor is `$VISUAL`, else `$EDITOR`, else the default app for text. One that draws in a
+//! The editor is the default app for Markdown or else plain text, as the desktop sets it; else
+//! `$VISUAL`, else `$EDITOR`, which an app started from the desktop often does not see the shell's
+//! values of. One that draws in a
 //! terminal runs in one: `$TERMINAL`, else the first of [`TERMINALS`] there is. In a terminal the
 //! editor runs inside `sh`, which removes a marker file when the editor ends, so it does not
 //! matter whether the terminal waits. A graphical editor is asked to wait where it can be.
@@ -70,7 +72,7 @@ pub struct Setting {
     pub terminal: Option<String>,
     /// The folders of `$PATH`.
     pub path: Vec<PathBuf>,
-    /// The default app for text: its command, and whether it wants a terminal.
+    /// The default app for Markdown, else for text: its command, and whether it wants a terminal.
     pub default: Option<(Vec<String>, bool)>,
 }
 
@@ -113,9 +115,10 @@ fn runnable(path: &Path) -> bool {
         .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
-/// The default app for plain text, without its `%f` and the like.
+/// The default app for Markdown, else for plain text, without its `%f` and the like.
 fn default_app() -> Option<(Vec<String>, bool)> {
-    let app = gio::AppInfo::default_for_type("text/plain", false)?;
+    let app = gio::AppInfo::default_for_type("text/markdown", false)
+        .or_else(|| gio::AppInfo::default_for_type("text/plain", false))?;
     let line = app.commandline()?;
     let words = glib::shell_parse_argv(line.as_os_str()).ok()?;
     let words: Vec<String> = words
@@ -210,18 +213,17 @@ fn words(setting: &str) -> Option<Vec<String>> {
 
 /// How to edit `file` with what `setting` says, or nothing when there is no way.
 pub fn plan(setting: &Setting, file: &Path) -> Option<Plan> {
-    let chosen = [&setting.visual, &setting.editor]
-        .into_iter()
-        .flatten()
-        .filter_map(|value| words(value))
-        .find(|words| setting.find(&words[0]).is_some())
-        .map(|words| {
-            let terminal = in_terminal(&words);
-            (words, terminal)
-        })
+    let chosen = setting
+        .default
+        .clone()
+        .filter(|(words, _)| setting.find(&words[0]).is_some())
         .or_else(|| {
-            let (words, terminal) = setting.default.clone()?;
-            setting.find(&words[0])?;
+            let words = [&setting.visual, &setting.editor]
+                .into_iter()
+                .flatten()
+                .filter_map(|value| words(value))
+                .find(|words| setting.find(&words[0]).is_some())?;
+            let terminal = in_terminal(&words);
             Some((words, terminal))
         });
     let Some((words, terminal)) = chosen else {
@@ -435,23 +437,30 @@ mod tests {
     }
 
     #[test]
-    fn visual_then_editor_then_the_default_then_xdg_open() {
-        let folder = programs(&["nano", "gedit", "kate", "xdg-open", "sh", "xterm"]);
+    fn the_default_then_visual_then_editor_then_xdg_open() {
+        let folder = programs(&["nano", "gedit", "kate", "nvim", "xdg-open", "sh", "xterm"]);
         let mut setting = in_folder(&folder);
-        // `$VISUAL` that is not there gives way to `$EDITOR`.
-        setting.visual = Some("not-installed".into());
+        // The desktop's default comes before the shell's settings.
+        setting.visual = Some("nvim".into());
         setting.editor = Some("kate".into());
-        let plan = plan(&setting, Path::new(FILE)).unwrap();
-        assert_eq!(said(&plan), ["kate", "--block", "message.md"]);
-        setting.editor = None;
         setting.default = Some((vec!["gedit".into()], false));
-        let plan = super::plan(&setting, Path::new(FILE)).unwrap();
+        let plan = plan(&setting, Path::new(FILE)).unwrap();
         assert_eq!(said(&plan), ["gedit", "--wait", "message.md"]);
         // A default that wants a terminal gets one.
         setting.default = Some((vec!["nano".into()], true));
         let plan = super::plan(&setting, Path::new(FILE)).unwrap();
         assert_eq!(said(&plan)[..2], ["xterm", "-e"]);
+        assert_eq!(plan.name, "nano");
+        // A default that is not there gives way to `$VISUAL`.
+        setting.default = Some((vec!["gone".into()], false));
+        let plan = super::plan(&setting, Path::new(FILE)).unwrap();
+        assert_eq!(plan.name, "nvim");
+        // `$VISUAL` that is not there gives way to `$EDITOR`.
         setting.default = None;
+        setting.visual = Some("not-installed".into());
+        let plan = super::plan(&setting, Path::new(FILE)).unwrap();
+        assert_eq!(said(&plan), ["kate", "--block", "message.md"]);
+        setting.editor = None;
         let plan = super::plan(&setting, Path::new(FILE)).unwrap();
         assert_eq!(said(&plan), ["xdg-open", "message.md"]);
         assert_eq!(plan.name, "your editor");
