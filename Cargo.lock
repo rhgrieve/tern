@@ -4767,6 +4767,7 @@ dependencies = [
  "gtk4",
  "libadwaita",
  "libloading 0.8.9",
+ "regex",
  "serde",
  "serde_json",
  "store",

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::editor;
 use crate::emoji;
+use crate::marks;
 use crate::mention::{self, Person};
 use crate::row;
 use crate::spell;
@@ -141,6 +142,8 @@ pub struct Composer {
     away_bar: gtk::Box,
     away_text: gtk::Label,
     trouble: Rc<RefCell<Option<Told>>>,
+    /// Markdown shown as it will be sent.
+    styled: Rc<marks::Styled>,
 }
 
 impl Composer {
@@ -303,6 +306,7 @@ impl Composer {
             away_bar,
             away_text,
             trouble: Rc::default(),
+            styled: marks::attach(&text),
         };
         let submit = {
             let composer = composer.clone();
@@ -376,6 +380,9 @@ impl Composer {
             move |_| {
                 composer.update();
                 composer.complete();
+                if !composer.filling.get() {
+                    composer.styled.soon();
+                }
             }
         });
         composer.choices.connect_row_activated({
@@ -451,6 +458,7 @@ impl Composer {
         self.filling.set(true);
         self.text.buffer().set_text(&written.text);
         self.filling.set(false);
+        self.styled.now();
         self.show_files();
         self.popover.popdown();
     }
@@ -1385,5 +1393,54 @@ mod tests {
         wait_until(|| !away());
         assert_eq!(*told.borrow(), ["broken could not be opened"]);
         assert_eq!(composer.raw(), "long instead");
+    }
+
+    /// As above, one test at a time: `-- --ignored --exact composer::tests::markdown_is_shown_as_it_will_be_sent`.
+    #[test]
+    #[ignore = "needs a display"]
+    fn markdown_is_shown_as_it_will_be_sent() {
+        use crate::marks::Kind;
+
+        gtk::init().unwrap();
+        let drafts = Drafts::default();
+        let composer = Composer::new(drafts.clone(), |_, _, _| {}, || {});
+        let window = gtk::Window::builder().child(&composer.root).build();
+        window.present();
+        composer.open("c1");
+        let buffer = composer.text.buffer();
+        let typed = "say **hi** to `x*y` and https://a.io\n- one";
+        // A character at a time, as typed.
+        for character in typed.chars() {
+            buffer.insert_at_cursor(character.encode_utf8(&mut [0; 4]));
+        }
+        let at = |offset: i32| composer.styled.kinds(offset);
+        wait_until(|| at(6) == [Kind::Bold]);
+        assert_eq!(at(0), []);
+        assert_eq!(at(4), [Kind::Marker]);
+        assert_eq!(at(15), [Kind::Code]);
+        assert_eq!(at(14), [Kind::Marker]);
+        assert_eq!(at(30), [Kind::Link]);
+        assert_eq!(at(37), [Kind::Bullet]);
+        // The text stays what is sent.
+        assert_eq!(composer.written().text, typed);
+
+        // A change takes away what no longer holds.
+        buffer.delete(
+            &mut buffer.iter_at_offset(9),
+            &mut buffer.iter_at_offset(10),
+        );
+        wait_until(|| at(6).is_empty());
+        assert_eq!(at(4), []);
+        assert_eq!(at(15), [Kind::Code]);
+        buffer.insert(&mut buffer.iter_at_offset(9), "*");
+        wait_until(|| at(6) == [Kind::Bold]);
+
+        // Drafts come back styled, at once.
+        composer.close();
+        composer.open("c2");
+        assert_eq!(at(6), []);
+        composer.open("c1");
+        assert_eq!(at(6), [Kind::Bold]);
+        assert_eq!(composer.written().text, typed);
     }
 }
