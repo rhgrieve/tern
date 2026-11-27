@@ -84,8 +84,9 @@ jobs:
           gtk4-broadwayd :9 >/dev/null 2>&1 & display=$!
           trap 'kill $display' EXIT
           sleep 2
-          # GTK wants one thread for all it does, so each test gets a process.
-          for test in $(cargo test --locked -q -p tern --lib -- --ignored --list --format terse | sed -n 's/: test$//p'); do
+          # GTK wants one thread for all it does, so each test gets a process. Those that need
+          # the Flatpak are run from inside one.
+          for test in $(cargo test --locked -q -p tern --lib -- --ignored --list --format terse | sed -n 's/: test$//p' | grep -v '::from_the_flatpak_'); do
             echo "$test"
             timeout 120 cargo test --locked -q -p tern --lib "$test" -- --ignored --exact --nocapture
           done
