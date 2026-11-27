@@ -285,7 +285,7 @@ impl Notifier {
         if self.proxy.is_none() {
             match connect(self.open.clone(), self.asides.clone(), self.actions.clone()).await {
                 Ok(connected) => self.proxy = Some(connected),
-                Err(error) => tracing::warn!(%error, "no notifications"),
+                Err(error) => tracing::warn!(%error, "cannot show notifications"),
             }
         }
         self.proxy.clone()
@@ -345,7 +345,7 @@ impl Notifier {
                 open.insert(key(notice), shown);
             }
             Err(error) => {
-                tracing::warn!(%error, "notification");
+                tracing::warn!(%error, "could not show a notification");
                 // The server may have restarted: connect again next time.
                 self.proxy = None;
             }
@@ -447,7 +447,7 @@ impl Notifier {
                 asides.insert(note.about, aside);
             }
             Err(error) => {
-                tracing::warn!(%error, "notification");
+                tracing::warn!(%error, "could not show a notification");
                 self.proxy = None;
             }
         }

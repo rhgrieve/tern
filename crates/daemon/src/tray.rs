@@ -198,7 +198,7 @@ impl TrayIcon {
             .assume_sni_available(true)
             .spawn()
             .await
-            .inspect_err(|error| tracing::info!(%error, "no tray"))
+            .inspect_err(|error| tracing::info!(%error, "no tray icon"))
             .ok();
         let icon = TrayIcon {
             handle,

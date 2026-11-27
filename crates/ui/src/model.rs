@@ -204,7 +204,16 @@ pub fn channel_rows(teams: &[SidebarTeam], now: DateTime<Utc>) -> Vec<ChatRow> {
     rows
 }
 
-/// The messages of a conversation and what is still on its way, oldest first.
+/// What came before an item, for whether the next one joins it.
+#[derive(Clone, Copy)]
+struct Before<'a> {
+    at: DateTime<Utc>,
+    sender: Option<&'a str>,
+    event: bool,
+}
+
+/// The messages of a conversation and what is still on its way, oldest first. A message that
+/// could not be sent stays where it was written, so that what was sent after it is after it.
 pub fn items(
     messages: &[MessageRecord],
     outgoing: &[OutboxRecord],
@@ -213,19 +222,35 @@ pub fn items(
     now: DateTime<Utc>,
 ) -> Vec<Item> {
     let mut items = Vec::with_capacity(messages.len() + outgoing.len());
-    let mut before: Option<(&MessageRecord, bool)> = None;
+    let mut before: Option<Before> = None;
+    let mut failed = outgoing
+        .iter()
+        .filter(|waiting| waiting.state == OutboxState::Failed)
+        .peekable();
+    let mut placed = std::collections::HashSet::new();
     for message in messages {
+        while let Some(waiting) = failed.next_if(|waiting| waiting.created_at <= message.created_at)
+        {
+            placed.insert(waiting.id.as_str());
+            if let Some(item) = outgoing_item(waiting, messages, before, me, my_name, now) {
+                items.push(item);
+                before = Some(Before {
+                    at: waiting.created_at,
+                    sender: me,
+                    event: false,
+                });
+            }
+        }
         let event = message.call_event_json.is_some();
-        let new_day =
-            before.is_none_or(|(last, _)| day(last.created_at) != day(message.created_at));
+        let new_day = before.is_none_or(|last| day(last.at) != day(message.created_at));
         let joined = !new_day
             && !event
             && message.reply_to_id.is_none()
-            && before.is_some_and(|(last, last_event)| {
-                !last_event
-                    && last.sender_id.is_some()
-                    && last.sender_id == message.sender_id
-                    && message.created_at - last.created_at < JOIN
+            && before.is_some_and(|last| {
+                !last.event
+                    && last.sender.is_some()
+                    && last.sender == message.sender_id.as_deref()
+                    && message.created_at - last.at < JOIN
             });
         items.push(Item {
             id: message.message_id.clone(),
@@ -268,66 +293,88 @@ pub fn items(
             failed: false,
             progress: None,
         });
-        before = Some((message, event));
+        before = Some(Before {
+            at: message.created_at,
+            sender: message.sender_id.as_deref(),
+            event,
+        });
     }
     // Shown exactly as they will be once they are sent, so that nothing moves then.
-    let mut last_own = before.map(|(last, event)| {
-        let own = !event && me.is_some() && last.sender_id.as_deref() == me;
-        (last.created_at, own)
-    });
     for waiting in outgoing {
-        let Ok(draft) = serde_json::from_str::<tern_engine::Draft>(&waiting.payload) else {
-            continue;
-        };
-        let mut blocks = rich::blocks(&html_to_spans(&tern_engine::linked(&markdown_to_html(
-            &draft.markdown,
-        ))));
-        for file in &draft.files {
-            blocks.push(Block::Text(format!("📎 {}", rich::shown(&file.name))));
-        }
-        let sending = waiting.state == OutboxState::Sending;
-        // The service has it already, and the outbox is about to know.
-        let there = messages.last().is_some_and(|last| {
-            me.is_some()
-                && last.sender_id.as_deref() == me
-                && last.created_at >= waiting.created_at - CLOCKS
-                && draft.files.is_empty()
-                && content(last).first() == blocks.first()
-        });
-        if sending && there {
+        if placed.contains(waiting.id.as_str()) {
             continue;
         }
-        let new_day = last_own.is_none_or(|(at, _)| day(at) != day(waiting.created_at));
-        let joined = !new_day
-            && draft.reply_to.is_none()
-            && waiting.thread_root_id.is_none()
-            && last_own.is_some_and(|(at, own)| own && waiting.created_at - at < JOIN);
-        last_own = Some((waiting.created_at, true));
-        items.push(Item {
-            joined,
-            divider: new_day.then(|| day_name(waiting.created_at, now)),
-            progress: sending.then_some(Progress::Sending),
-            id: format!("{OUTGOING}{}", waiting.id),
-            failed: waiting.state == OutboxState::Failed,
-            sender: my_name.to_owned(),
-            sender_id: me.map(str::to_owned),
-            time: waiting
-                .created_at
-                .with_timezone(&Local)
-                .format("%H:%M")
-                .to_string(),
-            blocks,
-            own: true,
-            note: (waiting.state == OutboxState::Failed).then(|| {
-                format!(
-                    "Not sent: {}",
-                    waiting.last_error.as_deref().unwrap_or("unknown error")
-                )
-            }),
-            ..Default::default()
-        });
+        if let Some(item) = outgoing_item(waiting, messages, before, me, my_name, now) {
+            items.push(item);
+            before = Some(Before {
+                at: waiting.created_at,
+                sender: me,
+                event: false,
+            });
+        }
     }
     items
+}
+
+/// A message in the outbox as it will look once sent: none when it already is, or unreadable.
+fn outgoing_item(
+    waiting: &OutboxRecord,
+    messages: &[MessageRecord],
+    before: Option<Before>,
+    me: Option<&str>,
+    my_name: &str,
+    now: DateTime<Utc>,
+) -> Option<Item> {
+    let draft = serde_json::from_str::<tern_engine::Draft>(&waiting.payload).ok()?;
+    let mut blocks = rich::blocks(&html_to_spans(&tern_engine::linked(&markdown_to_html(
+        &draft.markdown,
+    ))));
+    for file in &draft.files {
+        blocks.push(Block::Text(format!("📎 {}", rich::shown(&file.name))));
+    }
+    let sending = waiting.state == OutboxState::Sending;
+    // The service has it already, and the outbox is about to know.
+    let there = messages.last().is_some_and(|last| {
+        me.is_some()
+            && last.sender_id.as_deref() == me
+            && last.created_at >= waiting.created_at - CLOCKS
+            && draft.files.is_empty()
+            && content(last).first() == blocks.first()
+    });
+    if sending && there {
+        return None;
+    }
+    let new_day = before.is_none_or(|last| day(last.at) != day(waiting.created_at));
+    let joined = !new_day
+        && draft.reply_to.is_none()
+        && waiting.thread_root_id.is_none()
+        && before.is_some_and(|last| {
+            !last.event && me.is_some() && last.sender == me && waiting.created_at - last.at < JOIN
+        });
+    let failed = waiting.state == OutboxState::Failed;
+    Some(Item {
+        joined,
+        divider: new_day.then(|| day_name(waiting.created_at, now)),
+        progress: sending.then_some(Progress::Sending),
+        id: format!("{OUTGOING}{}", waiting.id),
+        failed,
+        sender: my_name.to_owned(),
+        sender_id: me.map(str::to_owned),
+        time: waiting
+            .created_at
+            .with_timezone(&Local)
+            .format("%H:%M")
+            .to_string(),
+        blocks,
+        own: true,
+        note: failed.then(|| {
+            format!(
+                "Not sent: {}",
+                waiting.last_error.as_deref().unwrap_or("unknown error")
+            )
+        }),
+        ..Default::default()
+    })
 }
 
 /// What is known of who read a conversation, and of who is in it.
@@ -1246,6 +1293,49 @@ mod tests {
         mark_newest(&mut all, &messages, Some("me"), &Readers::default());
         let marked: Vec<bool> = all.iter().map(|item| item.progress.is_some()).collect();
         assert_eq!(marked, [false, false, false, true]);
+    }
+
+    #[test]
+    fn what_failed_stays_where_it_was_written() {
+        let waiting = |id: &str, state, minutes| OutboxRecord {
+            id: id.into(),
+            conversation_id: "c".into(),
+            target: store::OutboxTarget::Flat,
+            thread_root_id: None,
+            payload: r#"{"markdown":"a clip","tried":true}"#.into(),
+            images: vec![],
+            state,
+            last_error: Some("HTTP 400".into()),
+            created_at: at(minutes),
+        };
+        // Refused at 1; written and sent after it at 2 and 4; one more on its way at 5.
+        let messages = [
+            message("1", "ann", 0),
+            message("2", "me", 2),
+            message("3", "me", 4),
+        ];
+        let outgoing = [
+            waiting("x", OutboxState::Failed, 1),
+            waiting("y", OutboxState::Sending, 5),
+        ];
+        let mut all = items(&messages, &outgoing, Some("me"), "Me", at(6));
+        let ids: Vec<&str> = all.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["1", "outgoing-x", "2", "3", "outgoing-y"]);
+        assert!(all[1].failed && !all[1].joined);
+        // What was sent after it joins it, as it would have joined a sent one.
+        assert!(all[2].joined && all[3].joined && all[4].joined);
+        // Once nothing is on its way, the newest sent one is marked, not the one that failed.
+        all.pop();
+        mark_newest(&mut all, &messages, Some("me"), &Readers::default());
+        assert!(all[3].progress.is_some());
+        assert!(all[1].progress.is_none());
+        // Failed after all that was read, it is still last.
+        let late = [waiting("z", OutboxState::Failed, 9)];
+        let ids: Vec<String> = items(&messages, &late, Some("me"), "Me", at(10))
+            .into_iter()
+            .map(|item| item.id)
+            .collect();
+        assert_eq!(ids, ["1", "2", "3", "outgoing-z"]);
     }
 
     #[test]

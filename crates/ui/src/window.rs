@@ -400,7 +400,7 @@ impl Window {
             }
 
             // Keys
-            let keys: [(&str, &[&str], Run); 13] = [
+            let keys: [(&str, &[&str], Run); 14] = [
                 ("leave", &["Escape"], Window::escape),
                 ("search", &["<Ctrl>k", "<Ctrl>f"], Window::search),
                 ("calendar", &["<Ctrl>e"], Window::calendar),
@@ -415,6 +415,7 @@ impl Window {
                 ("pin-open", &["<Ctrl><Shift>p"], Window::pin_open),
                 ("area", &["F6"], Window::next_area),
                 ("keys", &["<Ctrl>question"], Window::show_keys),
+                ("log", &["<Ctrl><Shift>l"], Window::open_log),
                 ("close", &["<Ctrl>w"], |window| window.window.close()),
             ];
             for (name, shortcuts, run) in keys {
@@ -1841,6 +1842,16 @@ impl Window {
         }
     }
 
+    /// Opens what the service wrote lately, for when something went wrong.
+    fn open_log(self: &Rc<Self>) {
+        let window = self.clone();
+        glib::spawn_future_local(async move {
+            if let Err(reason) = crate::log::open(&window.window).await {
+                window.toast(&reason);
+            }
+        });
+    }
+
     fn show_keys(self: &Rc<Self>) {
         let dialog = adw::ShortcutsDialog::new();
         for (title, keys) in [
@@ -1874,6 +1885,12 @@ impl Window {
             let section = adw::ShortcutsSection::new(Some(title));
             for (what, keys) in keys {
                 section.add(adw::ShortcutsItem::new(what, keys));
+            }
+            if title == "Moving around" && crate::log::kept() {
+                section.add(adw::ShortcutsItem::new(
+                    "Open the service's log",
+                    "<Ctrl><Shift>l",
+                ));
             }
             // Not from inside a sandbox.
             if title == "Messages" && crate::editor::reachable() {

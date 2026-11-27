@@ -13,6 +13,16 @@
   writes them; `* ` starts a list item as `- ` does. Editing a sent message keeps them.
 - The message box shows Markdown as it will be sent while you type: each look shows as you write
   it, and the characters that make it stay, dimmed.
+- Ctrl+Shift+L opens the background service's log of the last two days in your app for text,
+  where Tern was installed with its script. The log says which version runs and what happened in
+  plain words, without colour codes, and web addresses in it go no further than their host.
+- When Teams refuses a message, Tern says what Teams answered, as "Not sent: HTTP 400: …", and the
+  log names the files that went with it and their sizes.
+
+**Fixed**
+
+- A message that could not be sent stays where it was written. It was kept below everything sent
+  after it, and took the mark of the newest message from them, so they looked unsent.
 
 ## 0.3.0
 

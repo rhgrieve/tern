@@ -175,7 +175,7 @@ impl Link {
         let wait = (RETRY_FIRST * 2u32.pow((self.failures - 1).min(8))).min(RETRY_MAX);
         self.next_try = Some(now + wait);
         if self.problem.as_ref() != Some(&error) {
-            tracing::warn!(%error, "presence");
+            tracing::warn!(%error, "could not set your status in Teams");
         }
         self.problem = Some(error);
     }

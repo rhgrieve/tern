@@ -83,7 +83,7 @@ pub fn open_store(path: &Path) -> Result<Store, String> {
     match reopen_history(&store) {
         Ok(0) => {}
         Ok(count) => tracing::info!(count, "chats reopened for older messages"),
-        Err(error) => tracing::warn!(%error, "history"),
+        Err(error) => tracing::warn!(%error, "could not reopen chats for older messages"),
     }
     Ok(store)
 }

@@ -3,6 +3,7 @@
 
 mod calls;
 mod link;
+mod logging;
 mod messages;
 mod notify;
 mod ringtone;
@@ -313,7 +314,7 @@ impl Daemon {
 
     async fn input(&mut self, input: Input) {
         if let Some(state) = self.machine.apply(input) {
-            tracing::info!(?state, "user");
+            tracing::info!(now = ?state, "your activity changed");
             self.changed = Instant::now();
             self.read_at = self.changed + READ_AFTER_CHANGE;
             self.reconcile().await;
@@ -365,7 +366,7 @@ impl Daemon {
                 )
             };
             if timeout(BEFORE_SLEEP, goodbye).await.is_err() {
-                tracing::warn!("leaving took too long");
+                tracing::warn!("Teams was not told in time that this computer sleeps");
             }
         }
         self.link.restart();
@@ -384,23 +385,23 @@ impl Daemon {
                 self.reconnect(Duration::ZERO);
             }
             Event::NetworkUp if self.machine.state() != State::Sleeping => {
-                tracing::info!("network changed");
+                tracing::info!("the network changed; connecting again");
                 self.backoff = RECONNECT_FIRST;
                 self.reconnect(Duration::ZERO);
             }
             Event::NetworkUp => {}
             Event::Ready(Source::Logind) => self.logind = true,
             Event::Ready(source) => {
-                tracing::info!(?source, "idle detection");
+                tracing::info!(?source, "watching for when you are idle");
                 self.idle_source = Some(source);
             }
             Event::Lost(Source::Logind, reason) => {
                 self.logind = false;
-                tracing::warn!(reason, "logind");
+                tracing::warn!(reason, "cannot follow locking and sleep");
             }
             Event::Lost(_, reason) => {
                 self.idle_source = None;
-                tracing::warn!(reason, "no idle detection");
+                tracing::warn!(reason, "cannot tell when you are idle");
             }
         }
     }
@@ -445,7 +446,7 @@ impl Daemon {
             }
             Some(RealtimeEvent::Status(status)) => match status.kind {
                 StatusKind::Connected => {
-                    tracing::info!("push connected");
+                    tracing::info!("connected to Teams");
                     self.push = "connected".into();
                     self.problem = None;
                     self.backoff = RECONNECT_FIRST;
@@ -457,7 +458,10 @@ impl Daemon {
                     self.reconcile().await;
                 }
                 StatusKind::Disconnected | StatusKind::Error => {
-                    tracing::info!(detail = status.detail, "push");
+                    tracing::info!(
+                        detail = status.detail,
+                        "lost the connection to Teams; connecting again"
+                    );
                     self.push = "reconnecting".into();
                     self.link.disconnected(Instant::now());
                 }
@@ -477,12 +481,12 @@ impl Daemon {
                 self.online = Some(online);
             }
             Connect::NeedsUser(reason) => {
-                tracing::warn!(reason, "waiting for a sign-in");
+                tracing::warn!(reason, "signed out; waiting for you to sign in");
                 self.push = "signed out".into();
                 self.problem = Some(reason);
             }
             Connect::Failed(reason) => {
-                tracing::warn!(reason, "could not connect");
+                tracing::warn!(reason, "could not connect to Teams");
                 self.problem = Some(reason);
                 self.start_messages_offline().await;
                 self.connect_at = Some(Instant::now() + self.backoff);
@@ -513,7 +517,7 @@ impl Daemon {
                 self.messages = Some(messages);
             }
             Err(error) => {
-                tracing::error!(error, "no message cache");
+                tracing::error!(error, "the message cache cannot be opened");
                 self.problem = Some(error);
             }
         }
@@ -559,7 +563,7 @@ impl Daemon {
 
     async fn rang(&mut self, ring: Ring) {
         // Neither the caller nor the chat is for the log.
-        tracing::info!(group = ring.chat.is_some(), "a call");
+        tracing::info!(group = ring.chat.is_some(), "a call is ringing");
         if self.quiet() {
             return;
         }
@@ -807,7 +811,7 @@ impl Daemon {
                 }
                 let before = self.shown.as_ref().map(|(_, shown)| &shown.availability);
                 if before != Some(&status.availability) {
-                    tracing::info!(shows = status.availability, state = ?self.machine.state(), "Teams");
+                    tracing::info!(you = ?self.machine.state(), "Teams now shows you as {}", status.availability);
                 }
                 self.shown = Some((Instant::now(), status));
                 self.reconcile().await;
@@ -1106,7 +1110,7 @@ impl Daemon {
                 _ = interrupt.recv() => break,
             }
         }
-        tracing::info!("leaving");
+        tracing::info!("stopping");
         self.leave().await;
         Ok(())
     }
@@ -1199,16 +1203,8 @@ async fn start() -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
-    // Dependencies stay at warnings whatever is asked: their debug output can hold request headers.
-    let level = match std::env::var("TERN_LOG").as_deref() {
-        Ok("debug") => "warn,ternd=debug,tern_auth=debug,tern_presence=debug,tern_engine=debug",
-        _ => "warn,ternd=info,tern_auth=info,tern_presence=info,tern_engine=info",
-    };
-    tracing_subscriber::fmt()
-        .with_env_filter(level)
-        .with_writer(std::io::stderr)
-        .with_target(false)
-        .init();
+    logging::start();
+    tracing::info!("Tern {} starting", env!("CARGO_PKG_VERSION"));
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()

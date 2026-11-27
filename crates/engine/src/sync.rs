@@ -131,7 +131,7 @@ impl<B: Backend> Sync<B> {
                     Ok(done) => self.done(done),
                     Err(error) => {
                         // A panic in the engine: forget who was running and check again.
-                        tracing::error!(%error, "sync task");
+                        tracing::error!(%error, "reading messages failed unexpectedly; starting again");
                         self.running.clear();
                         self.refreshing = false;
                         tasks.abort_all();
@@ -280,7 +280,7 @@ impl<B: Backend> Sync<B> {
                 self.catch_up |= std::mem::take(&mut self.catching_up);
                 self.refresh_failures += 1;
                 self.refresh_at = Instant::now() + backoff(self.refresh_failures);
-                tracing::warn!(error = failure.text(), "chat list");
+                tracing::warn!(error = failure.text(), "could not read the list of chats");
                 self.problem = Some(failure.text().to_owned());
             }
             Done::History(id, outcome) => {

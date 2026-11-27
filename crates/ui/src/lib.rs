@@ -17,6 +17,7 @@ pub mod fit;
 pub mod history;
 pub mod join;
 pub mod list;
+pub mod log;
 pub mod mark;
 pub mod marks;
 pub mod mention;

@@ -265,7 +265,7 @@ impl<P: Post> Outbox<P> {
         if folder.is_dir()
             && let Err(error) = std::fs::remove_dir_all(&folder)
         {
-            tracing::warn!(%error, "a sent file's copy stays");
+            tracing::warn!(%error, "could not delete Tern's copy of a sent file");
         }
     }
 
@@ -322,7 +322,7 @@ impl<P: Post> Outbox<P> {
             let records = match self.store.sending_outbox() {
                 Ok(records) => records,
                 Err(error) => {
-                    tracing::error!(%error, "outbox");
+                    tracing::error!(%error, "could not read the messages waiting to be sent");
                     tokio::time::sleep(RETRY_MAX).await;
                     continue;
                 }
@@ -345,6 +345,12 @@ impl<P: Post> Outbox<P> {
                         report(Queued::Sent { conversation });
                     }
                     Err(Failure::Permanent(reason)) => {
+                        // Not the text, which is the user's own; what went with it may be why.
+                        tracing::warn!(
+                            reason,
+                            files = attached(&record),
+                            "Teams refused a message"
+                        );
                         blocked.remove(&conversation);
                         let _ = self.store.mark_outbox_failed(&record.id, &reason);
                         report(Queued::Failed {
@@ -469,6 +475,42 @@ impl<P: Post> Outbox<P> {
         if let Ok(json) = serde_json::to_string(&sent) {
             let _ = self.store.set_meta(META_SENT, &json);
         }
+    }
+}
+
+/// The files of a message in the outbox, with their sizes: `clip.mp4 (52.4 MB), …`.
+fn attached(record: &OutboxRecord) -> String {
+    let Ok(stored) = serde_json::from_str::<Payload>(&record.payload) else {
+        return "unreadable".into();
+    };
+    let files: Vec<String> = stored
+        .draft
+        .files
+        .iter()
+        .map(|file| match std::fs::metadata(&file.path) {
+            Ok(meta) => format!("{} ({})", file.name, size(meta.len())),
+            Err(_) => format!("{} (gone)", file.name),
+        })
+        .collect();
+    if files.is_empty() {
+        "none".into()
+    } else {
+        files.join(", ")
+    }
+}
+
+fn size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut amount = bytes as f64;
+    let mut unit = 0;
+    while amount >= 1000.0 && unit + 1 < UNITS.len() {
+        amount /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{amount:.1} {}", UNITS[unit])
     }
 }
 
@@ -676,6 +718,23 @@ mod tests {
         let restarted = Outbox::new(service.clone(), outbox.store.clone(), &outbox.spool);
         run(&restarted, &reports, 10).await;
         assert_eq!((texts(&service).len(), restarted.waiting()), (1, 0));
+    }
+
+    #[test]
+    fn refusals_name_what_went_with_them() {
+        assert_eq!(size(999), "999 B");
+        assert_eq!(size(52_400_000), "52.4 MB");
+        assert_eq!(size(3_000_000_000_000), "3000.0 GB");
+        let (outbox, _, _) = outbox(&[]);
+        let clip = file("clip.mp4", &[0; 1500]);
+        outbox
+            .add("c", &Draft::text("see"), std::slice::from_ref(&clip))
+            .unwrap();
+        outbox.add("c", &Draft::text("plain"), &[]).unwrap();
+        let records = outbox.store.sending_outbox().unwrap();
+        let said: Vec<String> = records.iter().map(attached).collect();
+        assert!(said.contains(&"clip.mp4 (1.5 KB)".to_owned()), "{said:?}");
+        assert!(said.contains(&"none".to_owned()), "{said:?}");
     }
 
     #[tokio::test(start_paused = true)]

@@ -28,16 +28,40 @@ impl Failure {
     }
 }
 
+/// The most a failure says of what the service answered.
+const MOST_SAID: usize = 160;
+
+/// What the service said of a refusal, on one short line: nothing when it said nothing.
+fn said(message: &str) -> Option<String> {
+    let line = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if matches!(line.as_str(), "" | "{}" | "[]" | "null" | "\"\"") {
+        return None;
+    }
+    let mut short: String = line.chars().take(MOST_SAID).collect();
+    if line.chars().count() > MOST_SAID {
+        short.push('…');
+    }
+    Some(short)
+}
+
 impl From<Error> for Failure {
     fn from(error: Error) -> Self {
-        // Addresses hold conversation ids; the status says enough.
+        // Addresses hold conversation ids: the status and what the service said are enough.
         let session = match &error {
             Error::Graph(graph::Error::Session(inner)) => Some(inner),
             _ => None,
         };
         match (&error, session) {
-            (_, Some(session::Error::Api { status, .. })) => {
-                let text = format!("HTTP {status}");
+            (
+                _,
+                Some(session::Error::Api {
+                    status, message, ..
+                }),
+            ) => {
+                let text = match said(message) {
+                    Some(said) => format!("HTTP {status}: {said}"),
+                    None => format!("HTTP {status}"),
+                };
                 if (400..500).contains(status) && !matches!(status, 401 | 408 | 429) {
                     Failure::Permanent(text)
                 } else {
@@ -680,5 +704,34 @@ mod tests {
             Failure::from(api(403)),
             Failure::Permanent("HTTP 403".into())
         );
+    }
+
+    #[test]
+    fn a_refusal_says_why_without_the_address() {
+        let api = |body| {
+            Failure::from(Error::Graph(graph::Error::Session(session::Error::api(
+                400,
+                "https://x/19%3Asecret",
+                body,
+            ))))
+        };
+        assert_eq!(
+            api(json!({"error": {"message": "Message is too large\n to post"}})),
+            Failure::Permanent("HTTP 400: Message is too large to post".into())
+        );
+        assert_eq!(
+            api(json!({"errorCode": 201, "message": "Bad file"})),
+            Failure::Permanent(r#"HTTP 400: {"errorCode":201,"message":"Bad file"}"#.into())
+        );
+        let long = api(json!({"error": {"message": "x".repeat(500)}}));
+        assert_eq!(
+            long.text().chars().count(),
+            "HTTP 400: ".len() + MOST_SAID + 1
+        );
+        assert!(long.text().ends_with('…'));
+        for quiet in [json!({}), json!(null), json!("")] {
+            assert_eq!(api(quiet), Failure::Permanent("HTTP 400".into()));
+        }
+        assert!(!api(json!({})).text().contains("secret"));
     }
 }
