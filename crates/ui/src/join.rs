@@ -1,9 +1,10 @@
 //! Meetings and other things only Teams itself shows, in a browser.
 //!
 //! A browser with Chromium's engine gets a window without its own buttons, and a profile of its own:
-//! the sign-in there is for Teams alone. Any other browser gets the address as a page.
+//! the sign-in there is for Teams alone. Any other browser gets the address as a page. From the
+//! Flatpak the browser is the computer's, found and started there by the same rules.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant};
 use gtk4 as gtk;
 use gtk4::{gio, glib};
 use tern_engine::{Place, place};
-use tern_ipc::Home;
+use tern_ipc::host;
 
 const PROGRAMS: [&str; 11] = [
     "chromium",
@@ -79,10 +80,60 @@ fn find(path: &[PathBuf], home: &Path, data: &Path, system: &Path) -> Option<Bro
     })
 }
 
+/// Where Flatpaks for everyone are.
+const SYSTEM: &str = "/var/lib/flatpak";
+
+/// What [`find`] finds, looked for by the computer itself: the folder of system Flatpaks, the
+/// programs, `--`, then the sandboxed.
+/// Says the program, or `flatpak` and the sandboxed one's name, a line each.
+const ON_HOST: &str = r#"system=$1
+shift
+while [ "$1" != -- ]; do command -v "$1" && exit 0; shift; done
+shift
+flatpak=$(command -v flatpak) || exit 1
+data=${XDG_DATA_HOME:-$HOME/.local/share}
+for id; do
+    if [ -d "$system/app/$id" ] || [ -d "$data/flatpak/app/$id" ]; then
+        printf '%s\n%s\n' "$flatpak" "$id"
+        exit 0
+    fi
+done
+exit 1"#;
+
+/// What [`ON_HOST`] said, as a browser; `data` is where this program keeps its own things.
+fn from_host(said: &str, home: &Path, data: &Path) -> Option<Browser> {
+    let lines: Vec<&str> = said.lines().filter(|line| !line.is_empty()).collect();
+    match lines.as_slice() {
+        [program] => Some(Browser {
+            command: vec![(*program).into()],
+            profile: data.join("tern/browser"),
+        }),
+        [flatpak, id] if SANDBOXED.contains(id) => Some(Browser {
+            command: vec![(*flatpak).into(), "run".into(), (*id).into()],
+            profile: home.join(".var/app").join(id).join("data/tern"),
+        }),
+        _ => None,
+    }
+}
+
+fn on_host() -> Option<Browser> {
+    let names = std::iter::once(&SYSTEM)
+        .chain(&PROGRAMS)
+        .chain(&["--"])
+        .chain(&SANDBOXED)
+        .map(OsStr::new);
+    let names: Vec<&OsStr> = names.collect();
+    let said = host::script(ON_HOST, &names)?;
+    from_host(
+        &String::from_utf8_lossy(&said),
+        &glib::home_dir(),
+        &glib::user_data_dir(),
+    )
+}
+
 fn browser() -> Option<Browser> {
-    // A sandbox has no browsers in it.
-    if matches!(tern_ipc::home(), Home::Flatpak(_)) {
-        return None;
+    if host::sandboxed() {
+        return on_host();
     }
     let path = std::env::var_os("PATH")?;
     let path: Vec<PathBuf> = std::env::split_paths(&path).collect();
@@ -90,7 +141,7 @@ fn browser() -> Option<Browser> {
         &path,
         &glib::home_dir(),
         &glib::user_data_dir(),
-        Path::new("/var/lib/flatpak"),
+        Path::new(SYSTEM),
     )
 }
 
@@ -146,16 +197,38 @@ pub fn here(address: &str) -> Option<String> {
 /// one with a profile of its own is the user's own affair.
 pub fn as_guest(address: &str) -> bool {
     let meeting = tern_engine::meeting_address(address).is_some();
-    meeting && browser().is_some_and(|browser| !browser.profile.join(SIGNED_IN).exists())
+    meeting && browser().is_some_and(|browser| !signed_in(&browser.profile))
+}
+
+/// A sandboxed browser's profile is out of reach of the Flatpak, but not of the computer.
+fn signed_in(profile: &Path) -> bool {
+    let marker = profile.join(SIGNED_IN);
+    if host::sandboxed() {
+        return host::script(r#"[ -e "$1" ]"#, &[marker.as_os_str()]).is_some();
+    }
+    marker.exists()
 }
 
 pub fn remember_sign_in() {
-    if let Some(browser) = browser() {
-        let kept = std::fs::create_dir_all(&browser.profile)
-            .and_then(|()| std::fs::write(browser.profile.join(SIGNED_IN), ""));
-        if let Err(error) = kept {
-            eprintln!("tern: the sign-in is not remembered: {error}");
+    let Some(browser) = browser() else {
+        return;
+    };
+    if host::sandboxed() {
+        let script = r#"mkdir -p "$1" && : >"$1/$2""#;
+        if host::script(
+            script,
+            &[browser.profile.as_os_str(), OsStr::new(SIGNED_IN)],
+        )
+        .is_none()
+        {
+            eprintln!("tern: the sign-in is not remembered");
         }
+        return;
+    }
+    let kept = std::fs::create_dir_all(&browser.profile)
+        .and_then(|()| std::fs::write(browser.profile.join(SIGNED_IN), ""));
+    if let Err(error) = kept {
+        eprintln!("tern: the sign-in is not remembered: {error}");
     }
 }
 
@@ -163,6 +236,7 @@ fn spawn(before: &[&str], browser: &Browser, address: &str) -> std::io::Result<C
     let mut all: Vec<OsString> = before.iter().map(OsString::from).collect();
     all.extend(browser.command.iter().cloned());
     all.extend(arguments(browser, address));
+    let all = host::command(all);
     Command::new(&all[0])
         .args(&all[1..])
         .stdin(Stdio::null())
@@ -282,6 +356,64 @@ mod tests {
     }
 
     #[test]
+    fn the_computer_finds_them_in_the_same_order() {
+        use std::os::unix::fs::PermissionsExt;
+        let folder = tempfile::tempdir().unwrap();
+        let at = |name: &str| folder.path().join(name);
+        let (bin, home, data, ours) = (at("bin"), at("home"), at("data"), at("ours"));
+        let system = at("system");
+        std::fs::create_dir_all(&bin).unwrap();
+        let program = |name: &str| {
+            std::fs::write(bin.join(name), "").unwrap();
+            std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        };
+        let run = || {
+            let out = Command::new("/bin/sh")
+                .args(["-c", ON_HOST, "sh"])
+                .arg(&system)
+                .args(PROGRAMS)
+                .arg("--")
+                .args(SANDBOXED)
+                .env("PATH", &bin)
+                .env("XDG_DATA_HOME", &data)
+                .output()
+                .unwrap();
+            from_host(&String::from_utf8(out.stdout).unwrap(), &home, &ours)
+        };
+        assert_eq!(run(), None);
+        std::fs::create_dir_all(data.join("flatpak/app/com.brave.Browser")).unwrap();
+        assert_eq!(run(), None, "without flatpak");
+        std::fs::create_dir_all(system.join("app/com.vivaldi.Vivaldi")).unwrap();
+        program("flatpak");
+        let found = run().unwrap();
+        assert_eq!(found.command[1..], ["run", "com.brave.Browser"]);
+        assert_eq!(
+            found.profile,
+            home.join(".var/app/com.brave.Browser/data/tern")
+        );
+        program("vivaldi");
+        program("chromium-browser");
+        let found = run().unwrap();
+        assert_eq!(
+            found.command,
+            [bin.join("chromium-browser").into_os_string()]
+        );
+        assert_eq!(found.profile, ours.join("tern/browser"));
+    }
+
+    #[test]
+    fn only_what_the_computer_could_say_is_taken() {
+        let (home, data) = (Path::new("/h"), Path::new("/d"));
+        assert_eq!(from_host("", home, data), None);
+        assert_eq!(
+            from_host("/usr/bin/flatpak\norg.example.Evil\n", home, data),
+            None
+        );
+        assert_eq!(from_host("a\nb\nc\n", home, data), None);
+    }
+
+    #[test]
     fn an_address_is_one_argument_and_never_an_option() {
         let browser = Browser {
             command: vec!["b".into()],
@@ -292,5 +424,19 @@ mod tests {
             arguments.last().unwrap(),
             "--app=https://teams.microsoft.com/v2/"
         );
+    }
+
+    /// Inside the Flatpak, on a computer with a Chromium-based browser.
+    #[test]
+    #[ignore = "needs the Flatpak"]
+    fn from_the_flatpak_the_browser_is_the_computers() {
+        assert!(host::sandboxed());
+        let found = on_host().expect("a browser");
+        let program = found.command[0].to_string_lossy().into_owned();
+        assert!(program.starts_with('/'), "{program}");
+        let profile = tempfile::tempdir_in(glib::user_data_dir()).unwrap();
+        assert!(!signed_in(profile.path()));
+        std::fs::write(profile.path().join(SIGNED_IN), "").unwrap();
+        assert!(signed_in(profile.path()));
     }
 }

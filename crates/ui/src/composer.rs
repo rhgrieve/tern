@@ -224,7 +224,6 @@ impl Composer {
             .icon_name("document-edit-symbolic")
             .tooltip_text("Write in your editor (Ctrl+Shift+E)")
             .valign(gtk::Align::End)
-            .visible(editor::reachable())
             .build();
         row::say(&elsewhere, "Write in your editor");
         elsewhere.add_css_class("flat");
@@ -512,7 +511,7 @@ impl Composer {
 
     /// Opens what is being written with what `plan` says for its file.
     fn write_with(&self, plan: impl FnOnce(&Path) -> Option<editor::Plan>) {
-        let Some(id) = self.opened().filter(|_| editor::reachable()) else {
+        let Some(id) = self.opened() else {
             return;
         };
         if self.away.borrow().contains_key(&id) {
@@ -538,8 +537,9 @@ impl Composer {
             self.tell(&format!("{} could not be opened: {error}", plan.name));
             return;
         }
-        let command: Vec<&std::ffi::OsStr> =
-            plan.command.iter().map(|word| word.as_os_str()).collect();
+        // From the Flatpak, on the computer; it ends when the editor does, as it does here.
+        let command = tern_ipc::host::command(plan.command.clone());
+        let command: Vec<&std::ffi::OsStr> = command.iter().map(|word| word.as_os_str()).collect();
         let child = match gio::Subprocess::newv(&command, gio::SubprocessFlags::NONE) {
             Ok(child) => child,
             Err(error) => {

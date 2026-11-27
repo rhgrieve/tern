@@ -22,12 +22,17 @@ cp "$from/share/desktop/$id.metainfo.xml" "$files/share/metainfo/"
 cp "$from"/LICENSE* "$files/share/licenses/$id/"
 sed 's|^Exec=.*/tern |Exec=/app/bin/tern |' "$from/share/dbus/$id.service" >"$files/share/dbus-1/services/$id.service"
 
-# The network, a window, the keyring (by a portal), and of the desktop only: notifications, the tray,
-# whether anybody is there, and whether the computer locks, sleeps or goes online. No files: those
-# are picked by the user.
+# Every feature works here as it does in the other two. The network, a window, sound for calls,
+# the keyring (by a portal), and of the desktop: notifications, the tray, whether anybody is there,
+# and whether the computer locks, sleeps or goes online. No files: those are picked by the user.
+# What only the computer has, Tern starts there (org.freedesktop.Flatpak, by flatpak-spawn --host):
+# the editor, the browser for meetings, the ringtone's sound theme and player, and what keeps the
+# computer awake in a call. That lets Tern run anything the user can, as the other two do.
 flatpak build-finish "$work/app" \
     --command=tern \
     --share=network --share=ipc --socket=wayland --socket=fallback-x11 --device=dri \
+    --socket=pulseaudio \
+    --talk-name=org.freedesktop.Flatpak \
     --talk-name=org.freedesktop.Notifications \
     --talk-name=org.kde.StatusNotifierWatcher \
     --talk-name=org.gnome.Mutter.IdleMonitor \

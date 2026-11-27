@@ -1,5 +1,14 @@
 # Changes
 
+## Unreleased
+
+**Fixed**
+
+- The Flatpak does all that the other two do. Calls have sound, a call rings with your sound
+  theme's ringtone, and the computer stays awake during one. Write in your own editor works, and
+  Join opens meetings in a Chromium-based browser's window of its own. Ctrl+Shift+L opens the
+  service's log, which the Flatpak's service keeps itself for two days.
+
 ## 0.3.1
 
 **New**

@@ -1,6 +1,9 @@
 //! A ringtone while a call rings: the desktop's sound for it, played again and again by PipeWire,
 //! or else PulseAudio, until it is stopped. Notification servers that play sounds play it once.
+//! From the Flatpak, the sound theme and the player are the computer's, as they are elsewhere.
 
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -26,7 +29,12 @@ impl Ringtone {
         if self.0.as_ref().is_some_and(|task| !task.is_finished()) {
             return;
         }
-        let Some(sound) = find_sound(&sound_folders()) else {
+        let found = if tern_ipc::host::sandboxed() {
+            find_on_host()
+        } else {
+            find_sound(&sound_folders())
+        };
+        let Some(sound) = found else {
             tracing::info!("no ringtone: the sound theme has no {SOUND}");
             return;
         };
@@ -50,26 +58,45 @@ impl Drop for Ringtone {
 }
 
 async fn ring(sound: &Path) {
-    let mut players = PLAYERS.iter().peekable();
-    while let Some(player) = players.peek() {
-        let played = Command::new(player)
-            .arg(sound)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn();
-        match played {
-            Ok(mut child) => {
-                let _ = child.wait().await;
-                tokio::time::sleep(PAUSE).await;
+    'players: for player in PLAYERS {
+        let mut played = false;
+        loop {
+            let words = tern_ipc::host::watched(vec![player.into(), sound.into()]);
+            let child = Command::new(&words[0])
+                .args(&words[1..])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn();
+            let Ok(mut child) = child else {
+                continue 'players;
+            };
+            let ok = child.wait().await.is_ok_and(|status| status.success());
+            // From a sandbox a player that is not there fails rather than not starting.
+            if !ok && !played {
+                continue 'players;
             }
-            Err(_) => {
-                players.next();
-            }
+            played = true;
+            tokio::time::sleep(PAUSE).await;
         }
     }
     tracing::info!("no ringtone: neither pw-play nor paplay is here");
+}
+
+/// What [`find_sound`] finds in [`sound_folders`], looked for by the computer itself.
+const ON_HOST: &str = r#"IFS=:
+for dir in "${XDG_DATA_HOME:-$HOME/.local/share}" ${XDG_DATA_DIRS:-/usr/local/share:/usr/share}; do
+    for kind in oga ogg wav; do
+        file="$dir/sounds/freedesktop/stereo/$1.$kind"
+        [ -n "$dir" ] && [ -f "$file" ] && { printf '%s' "$file"; exit 0; }
+    done
+done
+exit 1"#;
+
+fn find_on_host() -> Option<PathBuf> {
+    let found = tern_ipc::host::script(ON_HOST, &[OsStr::new(SOUND)])?;
+    (!found.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(&found)))
 }
 
 /// Where sound themes are, the user's own first.
@@ -118,5 +145,39 @@ mod tests {
         assert_eq!(found, Some(user.join("phone-incoming-call.wav")));
         assert_eq!(find_sound(&[none]), None);
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn the_computer_is_searched_the_same_way() {
+        let base = std::env::temp_dir().join(format!("tern-ringtone-sh-{}", std::process::id()));
+        let (user, system) = (base.join("user"), base.join("system"));
+        for dir in [&user, &system] {
+            std::fs::create_dir_all(dir.join("sounds/freedesktop/stereo")).unwrap();
+        }
+        let sound =
+            |dir: &Path, kind: &str| dir.join(format!("sounds/freedesktop/stereo/{SOUND}.{kind}"));
+        std::fs::write(sound(&system, "oga"), b"").unwrap();
+        let run = |home: &Path| {
+            let out = std::process::Command::new("sh")
+                .args(["-c", ON_HOST, "sh", SOUND])
+                .env("XDG_DATA_HOME", home)
+                .env("XDG_DATA_DIRS", format!("::{}", system.display()))
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        assert_eq!(run(&user), sound(&system, "oga").to_str().unwrap());
+        std::fs::write(sound(&user, "wav"), b"").unwrap();
+        assert_eq!(run(&user), sound(&user, "wav").to_str().unwrap());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Inside the Flatpak, with the computer's sound theme.
+    #[test]
+    #[ignore = "needs the Flatpak"]
+    fn from_the_flatpak_the_theme_is_the_computers() {
+        assert!(tern_ipc::host::sandboxed());
+        let sound = find_on_host().expect("the computer's sound");
+        assert!(sound.to_string_lossy().ends_with("phone-incoming-call.oga"));
     }
 }

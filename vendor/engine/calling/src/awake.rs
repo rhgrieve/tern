@@ -58,7 +58,15 @@ impl StayAwake {
     #[cfg(not(windows))]
     pub fn new() -> Self {
         // `cat` ends on EOF when this process dies, so a crash cannot leave the inhibitor behind.
-        let inhibitor = std::process::Command::new("systemd-inhibit")
+        // A Flatpak has no `systemd-inhibit`: the computer's holds it, and the same `cat`.
+        let mut command = if std::path::Path::new("/.flatpak-info").exists() {
+            let mut command = std::process::Command::new("flatpak-spawn");
+            command.args(["--host", "--watch-bus", "systemd-inhibit"]);
+            command
+        } else {
+            std::process::Command::new("systemd-inhibit")
+        };
+        let inhibitor = command
             .args([
                 "--what=idle:sleep",
                 "--who=Rusty Teams",
