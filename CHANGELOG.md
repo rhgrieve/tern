@@ -16,6 +16,9 @@
 - Ctrl+Shift+L opens the background service's log of the last two days in your app for text,
   where Tern was installed with its script. The log says which version runs and what happened in
   plain words, without colour codes, and web addresses in it go no further than their host.
+- The log follows each call: whether it could be answered here, why it was not shown (Do not
+  disturb, paused notifications, no buttons on notifications), which button was pressed, how the
+  ringing ended, and how answering or calling went, errors too. It never says who called.
 - When Teams refuses a message, Tern says what Teams answered, as "Not sent: HTTP 400: …", and the
   log names the files that went with it and their sizes.
 
@@ -23,6 +26,8 @@
 
 - A message that could not be sent stays where it was written. It was kept below everything sent
   after it, and took the mark of the newest message from them, so they looked unsent.
+- The system journal no longer records who you call: it had the call program's whole command
+  line, with the other person's name.
 
 ## 0.3.0
 

@@ -1842,6 +1842,11 @@ impl Window {
         }
     }
 
+    /// Tells the service's log how a call goes: never who is in it.
+    pub fn log_call(&self, line: &str) {
+        self.client.ask(Request::CallSaid { line: line.into() });
+    }
+
     /// Opens what the service wrote lately, for when something went wrong.
     fn open_log(self: &Rc<Self>) {
         let window = self.clone();

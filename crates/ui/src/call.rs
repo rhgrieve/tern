@@ -95,12 +95,15 @@ pub fn duration(seconds: u64) -> String {
     }
 }
 
-/// Bounds for the call process: it handles what the other side sends, so it gets no more.
-const SCOPE: [&str; 9] = [
+/// Bounds for the call process: it handles what the other side sends, so it gets no more. Its
+/// description is what the journal says of it: without one, the whole command line, with who is
+/// called.
+const SCOPE: [&str; 10] = [
     "systemd-run",
     "--user",
     "--scope",
     "--quiet",
+    "--description=Tern call",
     "-p",
     "MemoryMax=2G",
     "-p",
@@ -113,7 +116,9 @@ fn spawn(arguments: &[&str]) -> Result<(gio::OutputStream, gio::Subprocess), gli
     let call: Vec<OsString> = std::iter::once(tern_ipc::program("tern-call").into_os_string())
         .chain(arguments.iter().map(OsString::from))
         .collect();
-    let flags = gio::SubprocessFlags::STDIN_PIPE | gio::SubprocessFlags::STDOUT_PIPE;
+    let flags = gio::SubprocessFlags::STDIN_PIPE
+        | gio::SubprocessFlags::STDOUT_PIPE
+        | gio::SubprocessFlags::STDERR_PIPE;
     let scoped: Vec<OsString> = SCOPE
         .iter()
         .map(OsString::from)
@@ -132,6 +137,10 @@ fn spawn(arguments: &[&str]) -> Result<(gio::OutputStream, gio::Subprocess), gli
             Err(glib::Error::new(gio::IOErrorEnum::Failed, "no pipes"))
         }
     }
+}
+
+fn process_errors(call: &Call) -> Option<gio::InputStream> {
+    call._process.stderr_pipe()
 }
 
 /// What a bar shows of a call.
@@ -154,8 +163,19 @@ pub struct Call {
     muted: Cell<bool>,
     ended: Cell<bool>,
     input: gio::OutputStream,
+    /// Hears how the call goes, for the log.
+    said: RefCell<Option<Said>>,
     /// Kept so the process is not let go of.
     _process: gio::Subprocess,
+}
+
+/// What hears a call's lines for the log.
+type Said = Box<dyn Fn(&str)>;
+
+/// Whether a line of `tern-call` is for the log: not the ones that name people.
+fn loggable(line: &str) -> bool {
+    let line = line.trim();
+    !line.is_empty() && !line.starts_with("caller:") && !line.starts_with("people:")
 }
 
 impl Call {
@@ -248,8 +268,22 @@ impl Call {
             muted: Cell::new(false),
             ended: Cell::new(false),
             input,
+            said: RefCell::default(),
             _process: process,
         });
+        // What goes wrong in it, said to nobody else.
+        if let Some(errors) = process_errors(&call) {
+            let errors = gio::DataInputStream::new(&errors);
+            let weak = Rc::downgrade(&call);
+            glib::spawn_future_local(async move {
+                while let Ok(Some(line)) =
+                    errors.read_line_utf8_future(glib::Priority::DEFAULT).await
+                {
+                    let Some(call) = weak.upgrade() else { return };
+                    call.say(&line);
+                }
+            });
+        }
         if let Some(first) = first {
             call.tell(first);
         }
@@ -259,13 +293,23 @@ impl Call {
             loop {
                 let line = lines.read_line_utf8_future(glib::Priority::DEFAULT).await;
                 let Some(call) = weak.upgrade() else { return };
+                if let Ok(Some(line)) = &line
+                    && loggable(line)
+                {
+                    call.say(line);
+                }
                 let change = match line {
                     Ok(Some(line)) => match self::change(&line, Instant::now()) {
                         Some(change) => change,
                         None => continue,
                     },
                     // The process is gone without saying how.
-                    _ => Change::Ended("Call ended".into()),
+                    _ => {
+                        if !call.ended.get() {
+                            call.say("the call program ended without saying how");
+                        }
+                        Change::Ended("Call ended".into())
+                    }
                 };
                 if call.ended.get() {
                     return;
@@ -299,6 +343,17 @@ impl Call {
             muted: self.muted.get(),
             waiting: self.waiting.get(),
             people: self.people.borrow().clone(),
+        }
+    }
+
+    /// `said` hears how the call goes, a line at a time, for the log.
+    pub fn on_said(&self, said: impl Fn(&str) + 'static) {
+        self.said.replace(Some(Box::new(said)));
+    }
+
+    fn say(&self, line: &str) {
+        if let Some(said) = self.said.borrow().as_ref() {
+            said(line.trim());
         }
     }
 
@@ -446,6 +501,22 @@ impl Bar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_log_hears_how_a_call_goes_but_not_who_is_in_it() {
+        for line in [
+            "ringing",
+            "connected",
+            "ended: no answer",
+            "failed: HTTP 403",
+            "refused: GET x",
+        ] {
+            assert!(loggable(line), "{line}");
+        }
+        for line in ["caller: Ann Example", "people: Ann; Bo", "  ", ""] {
+            assert!(!loggable(line), "{line:?}");
+        }
+    }
 
     #[test]
     fn the_lines_of_tern_call_are_understood() {

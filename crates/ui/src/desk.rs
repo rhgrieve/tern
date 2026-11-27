@@ -75,6 +75,11 @@ impl Desk {
         if self.demo || self.call.borrow().is_some() {
             return;
         }
+        self.log_call(if who.is_group() {
+            "calling a group"
+        } else {
+            "calling someone"
+        });
         let started = Call::place(who, self.follow(Rc::downgrade(from)));
         self.started(started, from);
     }
@@ -87,9 +92,11 @@ impl Desk {
             return;
         }
         if self.call.borrow().is_some() {
+            self.log_call("not answered: another call is on");
             main.toast("Hang up first to answer another call");
             return;
         }
+        self.log_call("answering");
         let started = Call::answer(push, self.follow(Rc::downgrade(&main)));
         self.started(started, &main);
     }
@@ -99,18 +106,35 @@ impl Desk {
         if self.demo {
             return;
         }
+        self.log_call("declining");
         if let Err(error) = Call::decline(push) {
-            eprintln!("tern: the call could not be declined: {error}");
+            self.log_call(&format!("could not decline: {error}"));
         }
     }
 
-    fn started(&self, started: Result<Rc<Call>, glib::Error>, from: &Rc<Window>) {
+    fn started(self: &Rc<Self>, started: Result<Rc<Call>, glib::Error>, from: &Rc<Window>) {
         match started {
             Ok(call) => {
+                let desk = Rc::downgrade(self);
+                call.on_said(move |line| {
+                    if let Some(desk) = desk.upgrade() {
+                        desk.log_call(line);
+                    }
+                });
                 self.call.replace(Some(call));
                 self.show_call();
             }
-            Err(error) => from.toast(&format!("The call could not start: {error}")),
+            Err(error) => {
+                self.log_call(&format!("could not start: {error}"));
+                from.toast(&format!("The call could not start: {error}"));
+            }
+        }
+    }
+
+    /// Tells the service's log how a call goes.
+    fn log_call(&self, line: &str) {
+        if let Some(window) = self.windows().first() {
+            window.log_call(line);
         }
     }
 

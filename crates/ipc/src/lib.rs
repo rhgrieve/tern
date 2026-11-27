@@ -24,6 +24,10 @@ pub enum Request {
         conversation: String,
         active: bool,
     },
+    /// How a call goes, from the window, for the service's log. Never who is in it.
+    CallSaid {
+        line: String,
+    },
     /// The user has seen a conversation.
     MarkRead {
         conversation: String,

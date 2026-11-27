@@ -132,6 +132,20 @@ pub enum Place {
     Decline(String),
 }
 
+impl Place {
+    /// What was chosen, for the log: never the chat, meeting or call itself.
+    pub fn choice(&self) -> &'static str {
+        match self {
+            Place::Agenda => "the calendar",
+            Place::Meeting(_) => "join the meeting",
+            Place::Chat(_) => "open the chat",
+            Place::Teams => "Teams on the web",
+            Place::Answer(_) => "answer",
+            Place::Decline(_) => "decline",
+        }
+    }
+}
+
 /// A notification that is not about a message.
 struct Aside {
     id: u32,
@@ -388,6 +402,13 @@ impl Notifier {
     }
 
     pub async fn ring(&mut self, ring: &Ring, chat: Option<String>) {
+        if let Some((_, can)) = self.server().await
+            && !can.actions
+        {
+            tracing::warn!(
+                "the notification server shows no buttons, so the call cannot be answered from it"
+            );
+        }
         self.note(call(ring, chat)).await;
     }
 
@@ -693,7 +714,11 @@ pub async fn go(place: &Place, token: Option<String>) {
             .activate_action(action, parameter, platform(token.as_deref()))
             .await
     };
-    if let Err(error) = shown.await {
+    let shown = shown.await;
+    if shown.is_ok() {
+        tracing::info!(choice = place.choice(), "the window took it");
+    }
+    if let Err(error) = shown {
         tracing::info!(%error, window = WINDOW, "no window; opening Teams on the web");
         match place {
             Place::Agenda => open_address("https://teams.microsoft.com/v2/calendar").await,

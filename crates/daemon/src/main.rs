@@ -34,6 +34,9 @@ use messages::{Messages, News};
 use notify::{Action, Notifier, Target};
 use tray::{Dot, Model, Pick, TrayIcon};
 
+/// The longest line of a call that the window has logged.
+const MOST_SAID: usize = 300;
+
 const TICK: Duration = Duration::from_secs(15);
 const READ_BACK: Duration = Duration::from_secs(5 * 60);
 const READ_AFTER_CHANGE: Duration = Duration::from_secs(20);
@@ -563,8 +566,23 @@ impl Daemon {
 
     async fn rang(&mut self, ring: Ring) {
         // Neither the caller nor the chat is for the log.
-        tracing::info!(group = ring.chat.is_some(), "a call is ringing");
+        tracing::info!(
+            group = ring.chat.is_some(),
+            video = ring.video,
+            answer = if ring.push.is_some() {
+                "here"
+            } else {
+                "only on the web: its notification was too large to keep"
+            },
+            "a call is ringing"
+        );
         if self.quiet() {
+            let why = if self.paused() {
+                "notifications are paused"
+            } else {
+                "Teams shows you as Do not disturb"
+            };
+            tracing::info!(why, "the call is not shown");
             return;
         }
         let chat = ring.chat.clone().or_else(|| {
@@ -590,7 +608,13 @@ impl Daemon {
             self.ringtone.stop();
         }
         let over: Vec<_> = over;
-        for (ring, ..) in over {
+        for (ring, _, until) in over {
+            let why = if until <= now {
+                "nobody answered here in time"
+            } else {
+                "the call ended"
+            };
+            tracing::info!(why, "the call stopped ringing");
             self.notifier.stop_ringing(&ring).await;
         }
     }
@@ -660,6 +684,10 @@ impl Daemon {
                 ));
             }
             Action::Go(place, token) => {
+                tracing::info!(
+                    choice = place.choice(),
+                    "a notification's button was pressed"
+                );
                 // Whatever the user did about a call, it has been heard.
                 if !self.ringing.is_empty() {
                     self.ringtone.stop();
@@ -890,6 +918,15 @@ impl Daemon {
                 if let Some(messages) = &self.messages {
                     messages.read_agenda();
                 }
+                Response::Done
+            }
+            Request::CallSaid { line } => {
+                let line: String = line
+                    .chars()
+                    .filter(|letter| !letter.is_control())
+                    .take(MOST_SAID)
+                    .collect();
+                tracing::info!("call: {line}");
                 Response::Done
             }
             Request::MarkRead { conversation } => {
