@@ -9,6 +9,7 @@ static CODE_FENCE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)```[^\n`]*\n(.*?)```").unwrap());
 static INLINE_CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`([^`\n]+)`").unwrap());
 static BOLD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\*\*([^*\n]+)\*\*").unwrap());
+static STRIKE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"~~([^~\n]+)~~").unwrap());
 static LINK: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)").unwrap());
 
@@ -16,6 +17,56 @@ static MENTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<at>([^<>\n]{1,100})</at>").unwrap());
 
 const LIST_MARKER: &str = "- ";
+const BULLETS: [&str; 2] = ["- ", "* "];
+const MAX_HEADING: usize = 3;
+const MAX_NUMBER_DIGITS: usize = 9;
+
+/// What a line of a message is, by how it starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkdownLine {
+    Text,
+    /// `- ` or `* `.
+    Bullet,
+    /// `1. `, with any number.
+    Numbered,
+    /// `# ` to `### `, with something after it.
+    Heading(u8),
+    /// `> `, or `>` alone.
+    Quote,
+}
+
+/// What a line of a message is, and the byte where its text starts after the marker.
+pub fn markdown_line(line: &str) -> (MarkdownLine, usize) {
+    if BULLETS.iter().any(|bullet| line.starts_with(bullet)) {
+        return (MarkdownLine::Bullet, 2);
+    }
+    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+    if (1..=MAX_NUMBER_DIGITS).contains(&digits) && line[digits..].starts_with(". ") {
+        return (MarkdownLine::Numbered, digits + 2);
+    }
+    let hashes = line.bytes().take_while(|&byte| byte == b'#').count();
+    if (1..=MAX_HEADING).contains(&hashes)
+        && line[hashes..].starts_with(' ')
+        && !line[hashes..].trim().is_empty()
+    {
+        return (MarkdownLine::Heading(hashes as u8), hashes + 1);
+    }
+    if line == ">" {
+        return (MarkdownLine::Quote, 1);
+    }
+    if line.starts_with("> ") {
+        return (MarkdownLine::Quote, 2);
+    }
+    (MarkdownLine::Text, 0)
+}
+
+fn line_of(line: &str, dialect: Dialect) -> (MarkdownLine, usize) {
+    match dialect {
+        Dialect::Message => markdown_line(line),
+        Dialect::Card if line.starts_with(LIST_MARKER) => (MarkdownLine::Bullet, LIST_MARKER.len()),
+        Dialect::Card => (MarkdownLine::Text, 0),
+    }
+}
 
 pub fn escape_html(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
@@ -42,7 +93,8 @@ enum Dialect {
     Card,
 }
 
-/// Teams chat HTML for light markdown, plus `- ` list lines as `<ul><li>`.
+/// Teams chat HTML for light markdown: bold, italic, strike, code, links, and lines that are
+/// list items, headings or quotes.
 pub fn markdown_to_html(text: &str) -> String {
     render(text, Dialect::Message)
 }
@@ -68,48 +120,58 @@ fn render(text: &str, dialect: Dialect) -> String {
 }
 
 fn block_html(segment: &str, dialect: Dialect) -> String {
-    if !segment.lines().any(is_list_line) {
+    let lines: Vec<(MarkdownLine, &str)> = segment
+        .split('\n')
+        .map(|line| {
+            let (kind, at) = line_of(line, dialect);
+            (kind, &line[at..])
+        })
+        .collect();
+    if lines.iter().all(|(kind, _)| *kind == MarkdownLine::Text) {
         return inline_html(segment, dialect);
     }
+    // Runs of lines of a kind; blocks need no breaks between them.
     let mut html = String::new();
-    let mut text_run: Vec<&str> = Vec::new();
-    let mut list_run: Vec<&str> = Vec::new();
-    for line in segment.split('\n') {
-        if is_list_line(line) {
-            flush_text(&mut html, &mut text_run, dialect);
-            list_run.push(&line[LIST_MARKER.len()..]);
-        } else {
-            flush_list(&mut html, &mut list_run, dialect);
-            text_run.push(line);
+    let mut at = 0;
+    while at < lines.len() {
+        let kind = lines[at].0;
+        let mut end = at + 1;
+        if !matches!(kind, MarkdownLine::Heading(_)) {
+            while end < lines.len() && lines[end].0 == kind {
+                end += 1;
+            }
         }
+        let run: Vec<&str> = lines[at..end].iter().map(|(_, text)| *text).collect();
+        match kind {
+            MarkdownLine::Text => html.push_str(&inline_html(&run.join("\n"), dialect)),
+            MarkdownLine::Bullet | MarkdownLine::Numbered => {
+                let tag = if kind == MarkdownLine::Bullet {
+                    "ul"
+                } else {
+                    "ol"
+                };
+                html.push_str(&format!("<{tag}>"));
+                for item in run {
+                    html.push_str("<li>");
+                    html.push_str(&inline_html(item, dialect));
+                    html.push_str("</li>");
+                }
+                html.push_str(&format!("</{tag}>"));
+            }
+            MarkdownLine::Heading(level) => {
+                html.push_str(&format!("<h{level}>"));
+                html.push_str(&inline_html(run[0], dialect));
+                html.push_str(&format!("</h{level}>"));
+            }
+            MarkdownLine::Quote => {
+                html.push_str("<blockquote>");
+                html.push_str(&inline_html(&run.join("\n"), dialect));
+                html.push_str("</blockquote>");
+            }
+        }
+        at = end;
     }
-    flush_list(&mut html, &mut list_run, dialect);
-    flush_text(&mut html, &mut text_run, dialect);
     html
-}
-
-fn is_list_line(line: &str) -> bool {
-    line.starts_with(LIST_MARKER)
-}
-
-fn flush_text(html: &mut String, run: &mut Vec<&str>, dialect: Dialect) {
-    if !run.is_empty() {
-        html.push_str(&inline_html(&run.join("\n"), dialect));
-        run.clear();
-    }
-}
-
-fn flush_list(html: &mut String, run: &mut Vec<&str>, dialect: Dialect) {
-    if run.is_empty() {
-        return;
-    }
-    html.push_str("<ul>");
-    for item in run.drain(..) {
-        html.push_str("<li>");
-        html.push_str(&inline_html(item, dialect));
-        html.push_str("</li>");
-    }
-    html.push_str("</ul>");
 }
 
 pub(crate) fn split_mentions(text: &str) -> Vec<Span> {
@@ -155,7 +217,7 @@ fn inline_markdown(text: &str, dialect: Dialect) -> String {
     let coded = INLINE_CODE.replace_all(&escaped, "<code>${1}</code>");
     let bolded = BOLD.replace_all(&coded, "<b>${1}</b>");
     let styled = match dialect {
-        Dialect::Message => bolded.into_owned(),
+        Dialect::Message => italicize(&STRIKE.replace_all(&bolded, "<s>${1}</s>")),
         Dialect::Card => italicize(&bolded),
     };
     LINK.replace_all(&styled, r#"<a href="${2}">${1}</a>"#)

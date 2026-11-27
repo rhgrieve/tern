@@ -73,7 +73,7 @@ fn card_markdown_adds_italic_and_mentions_to_the_message_dialect() {
     );
     assert_eq!(
         markdown_to_html("_soft_ <at>Ada</at>"),
-        "_soft_ &lt;at&gt;Ada&lt;/at&gt;"
+        "<i>soft</i> &lt;at&gt;Ada&lt;/at&gt;"
     );
 }
 
@@ -82,5 +82,58 @@ fn card_markdown_keeps_snake_case_and_urls() {
     assert_eq!(
         card_markdown_to_html("my_var_name https://a.example/_x_/ [l](https://a.example/_y_)"),
         "my_var_name https://a.example/_x_/ <a href=\"https://a.example/_y_\">l</a>"
+    );
+}
+
+#[test]
+fn italic_and_strike_as_teams_writes_them() {
+    assert_eq!(
+        markdown_to_html("_soft_, *slanted* and ~~gone~~"),
+        "<i>soft</i>, <i>slanted</i> and <s>gone</s>"
+    );
+    assert_eq!(
+        markdown_to_html("***both*** and ~~**bold gone**~~"),
+        "<i><b>both</b></i> and <s><b>bold gone</b></s>"
+    );
+    // Names, sums and code stay as they are.
+    assert_eq!(
+        markdown_to_html("@Sam_O_Brien 2*3*4 `*x*` ~~ a ~"),
+        "@Sam_O_Brien 2*3*4 <code>*x*</code> ~~ a ~"
+    );
+}
+
+#[test]
+fn headings_quotes_and_numbers_are_blocks() {
+    assert_eq!(
+        markdown_to_html("# One\n## Two **b**\n### Three\n#### Four"),
+        "<h1>One</h1><h2>Two <b>b</b></h2><h3>Three</h3>#### Four"
+    );
+    assert_eq!(
+        markdown_to_html("said:\n> a\n>\n> *b*\nthen"),
+        "said:<blockquote>a<br><br><i>b</i></blockquote>then"
+    );
+    assert_eq!(
+        markdown_to_html("1. one\n2. two\n- dot\n* star"),
+        "<ol><li>one</li><li>two</li></ol><ul><li>dot</li><li>star</li></ul>"
+    );
+}
+
+#[test]
+fn what_only_looks_like_a_block_stays_text() {
+    assert_eq!(
+        markdown_to_html("#tag\n# \n>no\n1.5 kg\na > b"),
+        "#tag<br># <br>&gt;no<br>1.5 kg<br>a &gt; b"
+    );
+    assert_eq!(
+        markdown_to_html("```\n# not\n> this\n```"),
+        "<pre># not\n&gt; this</pre>"
+    );
+}
+
+#[test]
+fn cards_keep_their_own_lines() {
+    assert_eq!(
+        card_markdown_to_html("# no\n> no\n1. no\n- yes"),
+        "# no<br>&gt; no<br>1. no<ul><li>yes</li></ul>"
     );
 }

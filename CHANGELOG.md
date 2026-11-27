@@ -8,8 +8,11 @@
   your default app for Markdown or text, else `$VISUAL` or `$EDITOR`, in a terminal when it needs
   one. The text comes back when you close it, also if you went to another chat meanwhile. Not in
   the Flatpak.
-- The message box shows Markdown as it will be sent while you type: bold, `code`, code blocks,
-  links and list items get their look, and the characters that make them stay, dimmed.
+- Messages can have italic (`*so*` or `_so_`), `~~strike~~`, headings (`#` to `###`), quotes
+  (`> `) and numbered lists (`1. `), as Teams writes them; `* ` starts a list item as `- ` does.
+  Editing a sent message keeps them.
+- The message box shows Markdown as it will be sent while you type: each look shows as you write
+  it, and the characters that make it stay, dimmed.
 
 ## 0.3.0
 

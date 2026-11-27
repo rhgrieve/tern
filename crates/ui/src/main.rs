@@ -78,7 +78,7 @@ fn start(desk: &Rc<Desk>, options: &Options) -> Rc<Window> {
         desk.drafts.borrow_mut().insert(
             "c3".into(),
             tern_ui::composer::Written {
-                text: "Sounds **good**, I'll bring the `slides` and\n- the [plan](https://example.com/plan)\n- notes from https://example.com".into(),
+                text: "## Friday\nSounds *good*, I'll bring the `slides` and\n> ~~cake~~ **biscuits**\n1. the [plan](https://example.com/plan)\n2. notes from https://example.com".into(),
                 ..Default::default()
             },
         );

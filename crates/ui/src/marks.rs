@@ -1,7 +1,7 @@
-//! The message box shows Markdown as it will be sent: bold, code, code blocks, links and list
-//! items get their look, and the characters that only say so stay, dimmed. The text itself is
-//! never changed. What counts is what sending makes of it: `teams_core::markdown_to_html` and
-//! then `tern_engine::linked`, so `*this*` or `# this`, which go as they are, are not styled.
+//! The message box shows Markdown as it will be sent: bold, italic, strike, code, code blocks,
+//! links, headings, quotes and list items get their look, and the characters that only say so
+//! stay, dimmed. The text itself is never changed. What counts is what sending makes of it:
+//! `teams_core::markdown_to_html` and then `tern_engine::linked`.
 
 use std::cell::Cell;
 use std::ops::Range;
@@ -13,24 +13,30 @@ use gtk4::prelude::*;
 use gtk4::{gdk, glib, pango};
 use libadwaita as adw;
 use regex::{Captures, Regex};
+use teams_core::{MarkdownLine, markdown_line};
 
 // As `teams_core::markdown`, which keeps them to itself.
 static CODE_FENCE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)```[^\n`]*\n(.*?)```").unwrap());
 static INLINE_CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`([^`\n]+)`").unwrap());
 static BOLD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\*\*([^*\n]+)\*\*").unwrap());
+static STRIKE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"~~([^~\n]+)~~").unwrap());
 static LINK: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)").unwrap());
-const BULLET: &str = "- ";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
     Bold,
+    Italic,
+    Strike,
     Code,
     /// What is inside a fenced code block.
     Block,
     Link,
-    /// The `- ` that makes a line a list item.
+    /// A whole line that is a heading, of level 1 to 3.
+    Heading(u8),
+    /// A whole line that is quoted.
+    Quote,
+    /// The `- ` or `1. ` that makes a line a list item.
     Bullet,
     /// Characters that say how text looks and are not sent as text.
     Marker,
@@ -81,39 +87,66 @@ fn group(captures: &Captures, index: usize) -> Range<usize> {
     captures.get(index).expect("the pattern has it").range()
 }
 
-/// Outside code blocks: lines that start with `- ` are list items, the rest runs of text.
+/// Outside code blocks, each line is text, a list item, a heading or quoted, as when sending.
 fn block(found: &mut Vec<(Kind, Range<usize>)>, body: &str, range: Range<usize>) {
-    let segment = &body[range.clone()];
-    if !segment.lines().any(|line| line.starts_with(BULLET)) {
-        return inline(found, body, range);
-    }
-    let mut run: Option<Range<usize>> = None;
+    let mut lines = Vec::new();
     let mut at = range.start;
-    for line in segment.split('\n') {
-        let here = at..at + line.len();
-        at = here.end + 1;
-        if line.starts_with(BULLET) {
-            if let Some(run) = run.take() {
-                inline(found, body, run);
-            }
-            let item = here.start + BULLET.len();
-            found.push((Kind::Bullet, here.start..item));
-            inline(found, body, item..here.end);
-        } else {
-            run = Some(run.map_or(here.clone(), |run| run.start..here.end));
-        }
+    for line in body[range.clone()].split('\n') {
+        let (kind, text) = markdown_line(line);
+        lines.push((kind, at..at + line.len(), at + text));
+        at += line.len() + 1;
     }
-    if let Some(run) = run {
-        inline(found, body, run);
+    if lines.iter().all(|(kind, ..)| *kind == MarkdownLine::Text) {
+        return inline(found, body, std::slice::from_ref(&range));
+    }
+    let mut at = 0;
+    while at < lines.len() {
+        let kind = lines[at].0;
+        let mut end = at + 1;
+        if !matches!(kind, MarkdownLine::Heading(_)) {
+            while end < lines.len() && lines[end].0 == kind {
+                end += 1;
+            }
+        }
+        let run = &lines[at..end];
+        if matches!(kind, MarkdownLine::Heading(_) | MarkdownLine::Quote) {
+            for (_, line, text) in run {
+                found.push((Kind::Marker, line.start..*text));
+            }
+        }
+        let texts: Vec<Range<usize>> = run.iter().map(|(_, line, text)| *text..line.end).collect();
+        match kind {
+            MarkdownLine::Text => {
+                let whole = run[0].1.start..run[run.len() - 1].1.end;
+                inline(found, body, std::slice::from_ref(&whole));
+            }
+            MarkdownLine::Bullet | MarkdownLine::Numbered => {
+                for ((_, line, text), item) in run.iter().zip(&texts) {
+                    found.push((Kind::Bullet, line.start..*text));
+                    inline(found, body, std::slice::from_ref(item));
+                }
+            }
+            MarkdownLine::Heading(level) => {
+                found.push((Kind::Heading(level), run[0].1.clone()));
+                inline(found, body, &texts);
+            }
+            MarkdownLine::Quote => {
+                for (_, line, _) in run {
+                    found.push((Kind::Quote, line.clone()));
+                }
+                inline(found, body, &texts);
+            }
+        }
+        at = end;
     }
 }
 
-/// As the converter does it: on escaped text, code first, then bold, then links, then the
-/// addresses written plainly.
-fn inline(all: &mut Vec<(Kind, Range<usize>)>, body: &str, range: Range<usize>) {
+/// As the converter does it, on escaped text: code, bold, strike, italic, links, then the
+/// addresses written plainly. `pieces` are joined by line breaks, as quoted lines are.
+fn inline(all: &mut Vec<(Kind, Range<usize>)>, body: &str, pieces: &[Range<usize>]) {
     let mut found = Vec::new();
     let found = &mut found;
-    let mut shown = Shown::escaped(&body[range.clone()], range.start);
+    let mut shown = Shown::escaped(body, pieces);
     shown = shown.replace(
         found,
         &INLINE_CODE,
@@ -122,6 +155,8 @@ fn inline(all: &mut Vec<(Kind, Range<usize>)>, body: &str, range: Range<usize>) 
         "</code>",
     );
     shown = shown.replace(found, &BOLD, Kind::Bold, |_| "<b>".into(), "</b>");
+    shown = shown.replace(found, &STRIKE, Kind::Strike, |_| "<s>".into(), "</s>");
+    shown = shown.italics(found);
     shown = shown.replace(
         found,
         &LINK,
@@ -130,14 +165,14 @@ fn inline(all: &mut Vec<(Kind, Range<usize>)>, body: &str, range: Range<usize>) 
         "</a>",
     );
     shown.bare_links(found);
-    // Code is only code when shown: what is bold or a link inside it is not.
+    // Code is only code when shown: what is styled inside it is not.
     let code: Vec<Range<usize>> = found
         .iter()
         .filter(|(kind, _)| *kind == Kind::Code)
         .map(|(_, range)| range.clone())
         .collect();
     all.extend(found.drain(..).filter(|(kind, range)| {
-        !matches!(kind, Kind::Bold | Kind::Link)
+        matches!(kind, Kind::Code | Kind::Marker)
             || !code
                 .iter()
                 .any(|code| code.start <= range.start && range.end <= code.end)
@@ -151,24 +186,31 @@ struct Shown {
 }
 
 impl Shown {
-    fn escaped(text: &str, offset: usize) -> Shown {
+    fn escaped(body: &str, pieces: &[Range<usize>]) -> Shown {
         let mut shown = Shown {
-            html: String::with_capacity(text.len()),
-            from: Vec::with_capacity(text.len()),
+            html: String::new(),
+            from: Vec::new(),
         };
-        for (at, character) in text.char_indices() {
-            let source = offset + at..offset + at + character.len_utf8();
-            let mut buffer = [0; 4];
-            let escaped = match character {
-                '&' => "&amp;",
-                '<' => "&lt;",
-                '>' => "&gt;",
-                '"' => "&quot;",
-                '\'' => "&#x27;",
-                '\n' => "<br>",
-                other => other.encode_utf8(&mut buffer),
-            };
-            shown.push(escaped, source);
+        for (index, piece) in pieces.iter().enumerate() {
+            // Between pieces, the line break that ends the one before.
+            if index > 0 {
+                let end = pieces[index - 1].end;
+                shown.push("<br>", end..end + 1);
+            }
+            for (at, character) in body[piece.clone()].char_indices() {
+                let at = piece.start + at;
+                let mut buffer = [0; 4];
+                let escaped = match character {
+                    '&' => "&amp;",
+                    '<' => "&lt;",
+                    '>' => "&gt;",
+                    '"' => "&quot;",
+                    '\'' => "&#x27;",
+                    '\n' => "<br>",
+                    other => other.encode_utf8(&mut buffer),
+                };
+                shown.push(escaped, at..at + character.len_utf8());
+            }
         }
         shown
     }
@@ -219,6 +261,44 @@ impl Shown {
         out
     }
 
+    /// Where `italicize` puts `<i>` and `</i>` in place of a `*` or `_`.
+    fn italics(self, found: &mut Vec<(Kind, Range<usize>)>) -> Shown {
+        let after = teams_core::italicize(&self.html);
+        let mut out = Shown {
+            html: String::with_capacity(after.len()),
+            from: Vec::with_capacity(after.len()),
+        };
+        let (before, made) = (self.html.as_bytes(), after.as_bytes());
+        let (mut at, mut to, mut copied) = (0, 0, 0);
+        let mut open: Option<usize> = None;
+        while to < made.len() {
+            let tag = ["<i>", "</i>"]
+                .into_iter()
+                .find(|tag| made[to..].starts_with(tag.as_bytes()));
+            match tag {
+                Some(tag) if matches!(before.get(at), Some(b'*' | b'_')) => {
+                    self.copy(&mut out, copied..at);
+                    let marker = self.from[at].clone();
+                    found.push((Kind::Marker, marker.clone()));
+                    match open.take() {
+                        None => open = Some(at + 1),
+                        Some(start) => found.push((Kind::Italic, self.source(start..at))),
+                    }
+                    out.push(tag, marker);
+                    at += 1;
+                    copied = at;
+                    to += tag.len();
+                }
+                _ => {
+                    at += 1;
+                    to += 1;
+                }
+            }
+        }
+        self.copy(&mut out, copied..self.html.len());
+        out
+    }
+
     /// Where `linked` makes links of addresses: it only adds tags, so what it adds is found by
     /// walking both.
     fn bare_links(&self, found: &mut Vec<(Kind, Range<usize>)>) {
@@ -258,10 +338,33 @@ pub struct Styled {
 /// How strong the colour of the text is in markers, and behind code.
 const DIM: f32 = 0.45;
 const SHADE: f32 = 0.08;
+const QUIET: f32 = 0.75;
+/// Quoted lines stand in from the text's own margin.
+const QUOTE_MARGIN: i32 = 28;
 
 pub fn attach(text: &gtk::TextView) -> Rc<Styled> {
+    let heading = |level: u8, scale: f64| {
+        let tag = gtk::TextTag::builder().weight(700).scale(scale).build();
+        (Kind::Heading(level), tag)
+    };
+    // Later tags win where they differ: markers are dim whatever they are in.
     let looks = [
+        heading(1, 1.5),
+        heading(2, 1.3),
+        heading(3, 1.15),
+        (
+            Kind::Quote,
+            gtk::TextTag::builder().left_margin(QUOTE_MARGIN).build(),
+        ),
         (Kind::Bold, gtk::TextTag::builder().weight(700).build()),
+        (
+            Kind::Italic,
+            gtk::TextTag::builder().style(pango::Style::Italic).build(),
+        ),
+        (
+            Kind::Strike,
+            gtk::TextTag::builder().strikethrough(true).build(),
+        ),
         (
             Kind::Code,
             gtk::TextTag::builder().family("monospace").build(),
@@ -373,7 +476,8 @@ impl Styled {
                 Kind::Marker | Kind::Bullet => tag.set_foreground_rgba(Some(&with(DIM))),
                 Kind::Code => tag.set_background_rgba(Some(&with(SHADE))),
                 Kind::Block => tag.set_paragraph_background_rgba(Some(&with(SHADE))),
-                Kind::Bold | Kind::Link => {}
+                Kind::Quote => tag.set_foreground_rgba(Some(&with(QUIET))),
+                Kind::Bold | Kind::Italic | Kind::Strike | Kind::Link | Kind::Heading(_) => {}
             }
         }
     }
@@ -396,9 +500,13 @@ mod tests {
                     .filter(|mark| mark.range.contains(&at))
                     .map(|mark| match mark.kind {
                         Kind::Bold => 'b',
+                        Kind::Italic => 'i',
+                        Kind::Strike => 's',
                         Kind::Code => 'c',
                         Kind::Block => 'p',
                         Kind::Link => 'l',
+                        Kind::Heading(_) => 'h',
+                        Kind::Quote => 'q',
                         Kind::Bullet => '-',
                         Kind::Marker => '~',
                     })
@@ -455,15 +563,25 @@ mod tests {
         assert_eq!(under("`open"), ".....");
         assert_eq!(under("a ** b"), "......");
         assert_eq!(under("[x](not a link)"), "...............");
-        // Teams messages from here have no italic, strike, headings or quotes.
-        for plain in ["*it*", "_it_", "~~gone~~", "# Title", "> quoted", "* item"] {
+        // What only looks like a block, or has nothing in it.
+        for plain in [
+            "#tag",
+            "# ",
+            "#### deep",
+            ">no",
+            "a > b",
+            "1.5 kg",
+            "-a",
+            "~~ a ~",
+            "2*3*4",
+        ] {
             assert!(marks(plain).is_empty(), "{plain}");
         }
     }
 
     #[test]
     fn code_keeps_what_would_be_markers() {
-        assert_eq!(under("`a*b` and *c*"), "~ccc~........");
+        assert_eq!(under("`a*b` and *c*"), "~ccc~.....~i~");
         assert_eq!(under("`[x](https://a.io)`").chars().nth(2), Some('c'));
         assert_eq!(under("```\n**a**\n```"), "~~~~ccccc~~~~".replace('c', "p"));
     }
@@ -499,15 +617,59 @@ mod tests {
         assert_eq!(under("@Ann_B **hi** @Cy_D"), ".......~~bb~~......");
     }
 
+    #[test]
+    fn italic_and_strike() {
+        assert_eq!(under("a *b* _c_ ~~d~~"), "..~i~.~i~.~~s~~");
+        assert_eq!(shown("***x***")[3], "x:bi");
+        assert_eq!(shown("~~*x*~~")[3], "x:is");
+        assert_eq!(shown("*`x`*")[2], "x:ci");
+        // Inside code it is code.
+        assert_eq!(shown("`~~x~~`")[3], "x:c");
+    }
+
+    #[test]
+    fn headings_quotes_and_numbers() {
+        let heading = shown("# Hi **b**");
+        assert_eq!(heading[0], "#:h~");
+        assert_eq!(heading[2], "H:h");
+        assert_eq!(heading[7], "b:bh");
+        assert!(
+            marks("### c")
+                .iter()
+                .any(|mark| mark.kind == Kind::Heading(3) && mark.range == (0..5))
+        );
+        // Quoted lines are sent as one, so bold reaches from one to the next.
+        let quote = shown("> **b\n> c**");
+        assert_eq!(quote[0], ">:q~");
+        assert_eq!(quote[4], "b:bq");
+        assert_eq!(quote[6], ">:bq~");
+        assert_eq!(quote[8], "c:bq");
+        assert_eq!(under("1. one\n10. ten"), "---....----...");
+        assert_eq!(under("* a"), "--.");
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct Looks {
+        bold: bool,
+        italic: bool,
+        strike: bool,
+        /// Either kind.
+        code: bool,
+        link: bool,
+        item: bool,
+        heading: u8,
+        quote: bool,
+    }
+
     /// What sending makes, character by character: looks of each character that is not space.
-    fn sent(text: &str) -> Option<Vec<(char, [bool; 4])>> {
+    fn sent(text: &str) -> Option<Vec<(char, Looks)>> {
         let html = tern_engine::linked(&markdown_to_html(text.trim()));
         // Misnested HTML (bold over the end of code) is read anyhow by whoever gets it.
         if !well_formed(&html) {
             return None;
         }
         let mut out = Vec::new();
-        walk(&html_to_spans(&html), [false; 4], &mut out);
+        walk(&html_to_spans(&html), Looks::default(), &mut out);
         Some(out)
     }
 
@@ -535,9 +697,8 @@ mod tests {
         open.is_empty()
     }
 
-    // Looks: bold, code (either kind), link, list item.
-    fn walk(spans: &[Span], looks: [bool; 4], out: &mut Vec<(char, [bool; 4])>) {
-        fn text(out: &mut Vec<(char, [bool; 4])>, text: &str, looks: [bool; 4]) {
+    fn walk(spans: &[Span], looks: Looks, out: &mut Vec<(char, Looks)>) {
+        fn text(out: &mut Vec<(char, Looks)>, text: &str, looks: Looks) {
             out.extend(
                 text.chars()
                     .filter(|character| !character.is_whitespace())
@@ -545,17 +706,78 @@ mod tests {
             );
         }
         for span in spans {
-            let [bold, code, link, item] = looks;
             match span {
                 Span::Text(said) => text(out, said, looks),
                 Span::Code(said) | Span::CodeBlock { code: said, .. } => {
-                    text(out, said, [bold, true, link, item]);
+                    text(
+                        out,
+                        said,
+                        Looks {
+                            code: true,
+                            ..looks
+                        },
+                    );
                 }
-                Span::Bold(children) => walk(children, [true, code, link, item], out),
-                Span::Link { children, .. } => walk(children, [bold, code, true, item], out),
+                Span::Bold(children) => walk(
+                    children,
+                    Looks {
+                        bold: true,
+                        ..looks
+                    },
+                    out,
+                ),
+                Span::Italic(children) => walk(
+                    children,
+                    Looks {
+                        italic: true,
+                        ..looks
+                    },
+                    out,
+                ),
+                Span::Strike(children) => walk(
+                    children,
+                    Looks {
+                        strike: true,
+                        ..looks
+                    },
+                    out,
+                ),
+                Span::Link { children, .. } => walk(
+                    children,
+                    Looks {
+                        link: true,
+                        ..looks
+                    },
+                    out,
+                ),
+                Span::Heading { level, children } => {
+                    walk(
+                        children,
+                        Looks {
+                            heading: *level,
+                            ..looks
+                        },
+                        out,
+                    );
+                }
+                Span::BlockQuote(children) => walk(
+                    children,
+                    Looks {
+                        quote: true,
+                        ..looks
+                    },
+                    out,
+                ),
                 Span::List { items, .. } => {
                     for one in items {
-                        walk(one, [bold, code, link, true], out);
+                        walk(
+                            one,
+                            Looks {
+                                item: true,
+                                ..looks
+                            },
+                            out,
+                        );
                     }
                 }
                 Span::LineBreak => {}
@@ -564,8 +786,8 @@ mod tests {
         }
     }
 
-    /// The same from the marks: markers are not sent, and inside code only code shows.
-    fn styled(text: &str) -> Vec<(char, [bool; 4])> {
+    /// The same from the marks: markers are not sent.
+    fn styled(text: &str) -> Vec<(char, Looks)> {
         let marks = marks(text);
         let has = |at: usize, kind: Kind| {
             marks
@@ -585,17 +807,36 @@ mod tests {
             if character.is_whitespace() || has(at, Kind::Marker) {
                 continue;
             }
-            let code = has(at, Kind::Code) || has(at, Kind::Block);
-            let bold = has(at, Kind::Bold);
-            let link = has(at, Kind::Link);
-            out.push((character, [bold, code, link, item && !has(at, Kind::Block)]));
+            let block = has(at, Kind::Block);
+            let heading = (1..=3)
+                .find(|&level| has(at, Kind::Heading(level)))
+                .unwrap_or(0);
+            let looks = Looks {
+                bold: has(at, Kind::Bold),
+                italic: has(at, Kind::Italic),
+                strike: has(at, Kind::Strike),
+                code: has(at, Kind::Code) || block,
+                link: has(at, Kind::Link),
+                item: item && !block,
+                heading,
+                quote: has(at, Kind::Quote),
+            };
+            out.push((character, looks));
         }
         out
     }
 
     #[test]
     fn marks_agree_with_what_is_sent() {
-        const PIECES: [&str; 24] = [
+        const PIECES: [&str; 32] = [
+            "\n# ",
+            "\n### ",
+            "\n> ",
+            "\n>",
+            "\n1. ",
+            "\n* ",
+            "#",
+            ">",
             "a",
             "b",
             " ",

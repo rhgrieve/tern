@@ -165,10 +165,14 @@ pub use graph::{
     MessageExtras, QuickSite, SharedFile, UploadedFile,
 };
 pub use images::StoredImage;
+pub use italic::italicize;
 pub use jumbo::{JumboEmoji, MAX_JUMBO_EMOJI, jumbo_emoji};
 pub use links::{LinkPreview, first_public_link, is_public_link, link_preview, public_links};
 pub use mapping::{chat_record, message_record};
-pub use markdown::{card_markdown_to_html, escape_html, markdown_to_html, plain_text_to_html};
+pub use markdown::{
+    MarkdownLine, card_markdown_to_html, escape_html, markdown_line, markdown_to_html,
+    plain_text_to_html,
+};
 pub use meeting_join::{
     MeetingCode, MeetingLink, ThreadMeeting, find_meeting_link, meeting_code_from_id,
     meeting_link_in_html, parse_meeting_link,

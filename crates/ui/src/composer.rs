@@ -1424,15 +1424,25 @@ mod tests {
         // The text stays what is sent.
         assert_eq!(composer.written().text, typed);
 
-        // A change takes away what no longer holds.
+        // A change takes away what no longer holds, and brings what now does: `**hi*` is a
+        // star and italic.
         buffer.delete(
             &mut buffer.iter_at_offset(9),
             &mut buffer.iter_at_offset(10),
         );
-        wait_until(|| at(6).is_empty());
+        wait_until(|| at(6) == [Kind::Italic]);
         assert_eq!(at(4), []);
+        assert_eq!(at(5), [Kind::Marker]);
+        buffer.delete(&mut buffer.iter_at_offset(8), &mut buffer.iter_at_offset(9));
+        wait_until(|| at(6).is_empty());
         assert_eq!(at(15), [Kind::Code]);
-        buffer.insert(&mut buffer.iter_at_offset(9), "*");
+        buffer.insert(&mut buffer.iter_at_offset(8), "**");
+        wait_until(|| at(6) == [Kind::Bold]);
+        // A line that becomes a heading is one as a whole.
+        buffer.insert(&mut buffer.start_iter(), "# ");
+        wait_until(|| at(8) == [Kind::Heading(1), Kind::Bold]);
+        assert_eq!(at(0), [Kind::Heading(1), Kind::Marker]);
+        buffer.delete(&mut buffer.start_iter(), &mut buffer.iter_at_offset(2));
         wait_until(|| at(6) == [Kind::Bold]);
 
         // Drafts come back styled, at once.

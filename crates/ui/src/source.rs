@@ -17,11 +17,37 @@ pub fn markdown(spans: &[Span]) -> Option<String> {
 }
 
 fn write(out: &mut String, spans: &[Span]) -> Option<()> {
+    // Headings and lists are read with a break after them, which their own line already is.
+    let mut ended = false;
     for span in spans {
+        let was_ended = std::mem::replace(
+            &mut ended,
+            matches!(span, Span::Heading { .. } | Span::List { .. }),
+        );
         match span {
             Span::Text(text) => out.push_str(text),
+            Span::LineBreak if was_ended => {}
             Span::LineBreak => out.push('\n'),
             Span::Bold(children) => around(out, "**", children)?,
+            Span::Italic(children) => around(out, "*", children)?,
+            Span::Strike(children) => around(out, "~~", children)?,
+            Span::Heading { level, children } => {
+                line(out);
+                out.push_str(&"#".repeat(usize::from(*level)));
+                out.push(' ');
+                write(out, children)?;
+                line(out);
+            }
+            Span::BlockQuote(children) => {
+                let mut quoted = String::new();
+                write(&mut quoted, children)?;
+                line(out);
+                for said in quoted.trim_end_matches('\n').split('\n') {
+                    out.push_str(if said.is_empty() { ">" } else { "> " });
+                    out.push_str(said);
+                    out.push('\n');
+                }
+            }
             Span::Code(code) => {
                 out.push('`');
                 out.push_str(code);
@@ -42,14 +68,14 @@ fn write(out: &mut String, spans: &[Span]) -> Option<()> {
                     out.push_str(&format!("[{text}]({url})"));
                 }
             }
-            Span::List {
-                ordered: false,
-                items,
-                ..
-            } => {
+            Span::List { ordered, items, .. } => {
                 line(out);
-                for item in items {
-                    out.push_str("- ");
+                for (number, item) in items.iter().enumerate() {
+                    if *ordered {
+                        out.push_str(&format!("{}. ", number + 1));
+                    } else {
+                        out.push_str("- ");
+                    }
                     write(out, item)?;
                     line(out);
                 }
@@ -90,6 +116,11 @@ mod tests {
             "see [here](https://example.com/x)",
             "- one\n- two",
             "```\nlet x = 1;\n```",
+            "*slanted*, ~~gone~~ and ***both***",
+            "# Title\n## Part **b**\ntext",
+            "> said\n>\n> *more*\nthen",
+            "1. one\n2. two",
+            "- a\nafter\n\n# T\n\nx",
         ] {
             assert_eq!(of(&markdown_to_html(text)).as_deref(), Some(text));
         }
@@ -102,7 +133,9 @@ mod tests {
             "<table><tr><td>a</td></tr></table>",
             "<p>hi <at id=\"0\">Ann</at></p>",
             "<blockquote>quoted</blockquote><p>x</p>",
-            "<ol><li>a</li></ol>",
+            "<ol start=\"3\"><li>a</li></ol>",
+            "<h4>deep</h4>",
+            "<p>a<i>b</i>c</p>",
             "<p>1 ** 2 ** 3</p>",
             "<p>a `b</p><p>c` d</p>",
             "",
@@ -116,10 +149,10 @@ mod tests {
                     "{html}"
                 );
             }
-            if html.contains("<i>")
-                || html.contains("table")
-                || html.contains("<ol")
-                || html.contains("quote")
+            if html.contains("table")
+                || html.contains("<at")
+                || html.contains("start")
+                || html.contains("a<i>")
                 || html.is_empty()
             {
                 assert_eq!(source, None, "{html}");

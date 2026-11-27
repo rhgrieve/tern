@@ -5,7 +5,9 @@ const LINE_BREAK: &str = "<br>";
 const LINK_TARGET_OPEN: &str = "](";
 const URL_SCHEMES: [&str; 2] = ["https://", "http://"];
 
-pub(crate) fn italicize(escaped: &str) -> String {
+/// Escaped HTML with `*pairs*` and `_pairs_` made italic, except in code, link targets and
+/// addresses.
+pub fn italicize(escaped: &str) -> String {
     let characters: Vec<char> = escaped.chars().collect();
     let mut output = String::with_capacity(escaped.len());
     let mut index = 0;

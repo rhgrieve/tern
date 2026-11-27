@@ -28,6 +28,7 @@ From https://github.com/danieldaeschle/rusty-teams (MIT, see `LICENSE`), commit
 | A call that starts muted mutes both microphone tracks | `calling/src/call/mod.rs` | With noise suppression on Low the unmuted one was sent |
 | Links are parsed before their host is trusted; only call services are reached | `calling/src/signaling.rs` | `https://evil.example#.teams.microsoft.com/` passed, and a push could name any Teams host |
 | `EngineConfig::trouter_host`; `run_call` runs one call with the caller's own options | `calling/src/engine.rs`, `call/mod.rs` | Finding the push host needs a web page; `run_test_call` only knows Europe |
+| Messages' Markdown has italic, `~~strike~~`, `#` headings, `>` quotes, `1.` and `*` lists; `markdown_line` and `italicize` are public | `core/src/markdown.rs`, `italic.rs`, `lib.rs`, `tests/markdown.rs` | Teams writes all of these; the message box styles what is sent by the same rules |
 | WebRTC's build helper pinned to 0.3.19; the build uses our checked copy | `native/webrtc-sys/Cargo.toml`, `.cargo/config.toml` | 0.3.21 named another WebRTC build, downloaded without a check |
 
 Known for later phases: pinned posts still run in a page.
