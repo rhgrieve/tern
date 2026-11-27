@@ -119,6 +119,10 @@ sandbox. The Flatpak gets them from the GNOME runtime.
 Spell checking needs a dictionary for your language, e.g. `hunspell-en-ca` on Ubuntu,
 `hunspell-en-CA` on Fedora, or `hunspell hunspell-en_ca` on Arch. The Flatpak has its own.
 
+The Flatpak does all that the other two do. Your editor, the browser for meetings, the ringtone and
+what keeps the computer awake in a call are your computer's, which it starts there
+(`flatpak-spawn --host`): its sandbox does not keep Tern from your files.
+
 Passkeys may not work for signing in. Automatic presence needs a Wayland desktop with
 `ext-idle-notify-v1`, or GNOME. When you report a problem, please do not paste `tern-cli tail`,
 `read` or `chats`: they show messages.

@@ -4898,6 +4898,7 @@ dependencies = [
  "session",
  "store",
  "teams-core",
+ "tempfile",
  "tern-auth",
  "tern-engine",
  "tern-ipc",

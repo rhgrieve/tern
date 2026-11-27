@@ -1897,8 +1897,7 @@ impl Window {
                     "<Ctrl><Shift>l",
                 ));
             }
-            // Not from inside a sandbox.
-            if title == "Messages" && crate::editor::reachable() {
+            if title == "Messages" {
                 section.add(adw::ShortcutsItem::new(
                     "Write in your editor",
                     "<Ctrl><Shift>e",

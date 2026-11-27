@@ -233,6 +233,22 @@ jobs:
           grep -qi 'not signed in' status.log
           END
           timeout 120 dbus-run-session -- bash -e talk.sh || { cat service.log; exit 1; }
+      # What the other two do, the Flatpak does: see CLAUDE.md.
+      - name: Does all that the others do
+        env:
+          ID: io.github.rhgrieve.Tern
+        run: |
+          permissions=$(flatpak info --show-permissions "$ID")
+          for want in pulseaudio org.freedesktop.Flatpak org.freedesktop.Notifications \
+              org.freedesktop.login1; do
+            grep -q "$want" <<<"$permissions" || { echo "the Flatpak lacks $want"; exit 1; }
+          done
+          cat >host.sh <<'END'
+          # Programs of the computer are reached, and the sound players are in the sandbox.
+          flatpak run --command=sh "$ID" -c 'flatpak-spawn --host --directory="$HOME" true'
+          flatpak run --command=sh "$ID" -c 'command -v paplay && command -v pw-play'
+          END
+          timeout 60 dbus-run-session -- bash -e host.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tern-x86_64-flatpak

@@ -7,17 +7,21 @@
 //! terminal runs in one: `$TERMINAL`, else the first of [`TERMINALS`] there is. In a terminal the
 //! editor runs inside `sh`, which removes a marker file when the editor ends, so it does not
 //! matter whether the terminal waits. A graphical editor is asked to wait where it can be.
+//!
+//! From the Flatpak all of it is the computer's: its settings, programs and default app, asked for
+//! once each time, and the editor runs there. The file is in a folder both see alike.
 
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
-use tern_ipc::Home;
+use tern_ipc::host;
 
 use crate::composer::Written;
 use crate::mention::{self, Person};
@@ -74,11 +78,17 @@ pub struct Setting {
     pub path: Vec<PathBuf>,
     /// The default app for Markdown, else for text: its command, and whether it wants a terminal.
     pub default: Option<(Vec<String>, bool)>,
+    /// Where the computer found programs, when it is not this one that looks: by name, or by path
+    /// for those given with a folder. What is missing is not there.
+    pub found: Option<HashMap<String, PathBuf>>,
 }
 
 impl Setting {
     /// This session's.
     pub fn here() -> Setting {
+        if host::sandboxed() {
+            return Setting::on_host().unwrap_or_default();
+        }
         let var = |name| {
             std::env::var(name)
                 .ok()
@@ -93,11 +103,42 @@ impl Setting {
             terminal: var("TERMINAL"),
             path,
             default: default_app(),
+            found: None,
         }
+    }
+
+    /// The computer's, asked from a sandbox: what it says, then where its programs are.
+    fn on_host() -> Option<Setting> {
+        let said = host::script(SETTING, &[])?;
+        let mut setting = from_host(&said);
+        let names = setting.wanted();
+        let names: Vec<&OsStr> = names.iter().map(OsStr::new).collect();
+        setting.found = Some(found(&host::script(FIND, &names)?));
+        Some(setting)
+    }
+
+    /// The programs [`plan`] may look for.
+    fn wanted(&self) -> Vec<String> {
+        let first = |value: &Option<String>| value.as_deref().and_then(words).map(|w| w[0].clone());
+        let default = self.default.as_ref().map(|(words, _)| words[0].clone());
+        [
+            default,
+            first(&self.visual),
+            first(&self.editor),
+            first(&self.terminal),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(["sh", "xdg-open"].map(String::from))
+        .chain(TERMINALS.map(String::from))
+        .collect()
     }
 
     /// Where `program` is: itself when it has a folder, else the first in `$PATH`.
     fn find(&self, program: &str) -> Option<PathBuf> {
+        if let Some(found) = &self.found {
+            return found.get(program).cloned();
+        }
         if program.contains('/') {
             let path = PathBuf::from(program);
             return runnable(&path).then_some(path);
@@ -127,6 +168,82 @@ fn default_app() -> Option<(Vec<String>, bool)> {
         .filter(|word| !(word.len() == 2 && word.starts_with('%')))
         .collect();
     let terminal = app.id().is_some_and(|id| wants_terminal(&id));
+    (!words.is_empty()).then_some((words, terminal))
+}
+
+/// What the computer's session says, `\0` after each: `$VISUAL`, `$EDITOR`, `$TERMINAL`, `$PATH`,
+/// then, when there is one, the id of the default app for Markdown or else text, and its desktop
+/// file.
+const SETTING: &str = r#"printf '%s\0' "${VISUAL-}" "${EDITOR-}" "${TERMINAL-}" "${PATH-}"
+id=$(xdg-mime query default text/markdown 2>/dev/null)
+[ -n "$id" ] || id=$(xdg-mime query default text/plain 2>/dev/null)
+[ -n "$id" ] || exit 0
+IFS=:
+for dir in "${XDG_DATA_HOME:-$HOME/.local/share}" ${XDG_DATA_DIRS:-/usr/local/share:/usr/share}; do
+    if [ -n "$dir" ] && [ -f "$dir/applications/$id" ]; then
+        printf '%s\0' "$id"
+        cat "$dir/applications/$id"
+        exit 0
+    fi
+done"#;
+
+/// Where each of the programs given is, as [`Setting::find`] would say: name, `\0`, path, `\0`.
+const FIND: &str = r#"for name; do
+    case $name in
+    */*) [ -f "$name" ] && [ -x "$name" ] && printf '%s\0%s\0' "$name" "$name" ;;
+    *) found=$(command -v -- "$name") && case $found in
+        /*) [ -f "$found" ] && [ -x "$found" ] && printf '%s\0%s\0' "$name" "$found" ;;
+        esac ;;
+    esac
+done
+exit 0"#;
+
+fn from_host(said: &[u8]) -> Setting {
+    let mut parts = said.splitn(6, |byte| *byte == 0);
+    let mut next = || {
+        let part = String::from_utf8_lossy(parts.next().unwrap_or_default()).into_owned();
+        (!part.trim().is_empty()).then_some(part)
+    };
+    let (visual, editor, terminal, path) = (next(), next(), next(), next());
+    let id = next();
+    let desktop = next();
+    Setting {
+        visual,
+        editor,
+        terminal,
+        path: path
+            .map(|path| std::env::split_paths(&path).collect())
+            .unwrap_or_default(),
+        default: id.zip(desktop).and_then(|(_, desktop)| app_of(&desktop)),
+        found: None,
+    }
+}
+
+fn found(said: &[u8]) -> HashMap<String, PathBuf> {
+    let mut parts = said.split(|byte| *byte == 0);
+    let mut found = HashMap::new();
+    while let (Some(name), Some(path)) = (parts.next(), parts.next()) {
+        if !name.is_empty() && path.starts_with(b"/") {
+            let name = String::from_utf8_lossy(name).into_owned();
+            found.insert(name, PathBuf::from(OsStr::from_bytes(path)));
+        }
+    }
+    found
+}
+
+/// The command of a desktop file, without its `%f` and the like, and whether it wants a terminal.
+fn app_of(desktop: &str) -> Option<(Vec<String>, bool)> {
+    let keys = glib::KeyFile::new();
+    keys.load_from_data(desktop, glib::KeyFileFlags::NONE)
+        .ok()?;
+    let line = keys.string("Desktop Entry", "Exec").ok()?;
+    let words = glib::shell_parse_argv(line.as_str()).ok()?;
+    let words: Vec<String> = words
+        .iter()
+        .map(|word| word.to_string_lossy().into_owned())
+        .filter(|word| !(word.len() == 2 && word.starts_with('%')))
+        .collect();
+    let terminal = keys.boolean("Desktop Entry", "Terminal").unwrap_or(false);
     (!words.is_empty()).then_some((words, terminal))
 }
 
@@ -281,11 +398,6 @@ pub fn marker(file: &Path) -> PathBuf {
     let mut name = file.as_os_str().to_owned();
     name.push(".open");
     PathBuf::from(name)
-}
-
-/// Whether an editor can be reached at all: not from inside a sandbox.
-pub fn reachable() -> bool {
-    !matches!(tern_ipc::home(), Home::Flatpak(_))
 }
 
 /// Where the files being edited are, readable only by the user.
@@ -628,5 +740,78 @@ mod tests {
         into_drafts(&mut drafts, "c1/p9", &empty, "in the thread");
         assert_eq!(drafts["c1/p9"].text, "in the thread");
         assert_eq!(drafts["c1"].text, "short, and then much longer");
+    }
+
+    #[test]
+    fn the_computer_says_its_setting() {
+        let desktop = "[Desktop Entry]\nName=Text\nExec=gnome-text-editor %U\nTerminal=false\n";
+        let said = format!("code --wait\0\0foot\0/usr/bin:/bin\0text.desktop\0{desktop}");
+        let setting = from_host(said.as_bytes());
+        assert_eq!(setting.visual.as_deref(), Some("code --wait"));
+        assert_eq!(setting.editor, None);
+        assert_eq!(setting.terminal.as_deref(), Some("foot"));
+        assert_eq!(
+            setting.path,
+            [PathBuf::from("/usr/bin"), PathBuf::from("/bin")]
+        );
+        assert_eq!(
+            setting.default,
+            Some((vec!["gnome-text-editor".into()], false))
+        );
+        let wanted = setting.wanted();
+        assert_eq!(wanted[..3], ["gnome-text-editor", "code", "foot"]);
+        assert!(wanted.iter().any(|name| name == "sh"));
+        let vim = "[Desktop Entry]\nExec=vim %F\nTerminal=true\n";
+        let said = format!("\0\0\0\0vim.desktop\0{vim}");
+        assert_eq!(
+            from_host(said.as_bytes()).default,
+            Some((vec!["vim".into()], true))
+        );
+        assert_eq!(from_host(b"\0\0\0\0").default, None);
+    }
+
+    #[test]
+    fn programs_are_where_the_computer_found_them() {
+        let folder = programs(&["nvim", "foot", "sh"]);
+        let bin = folder.path();
+        let names = ["nvim", "code", "foot", "sh"].map(String::from);
+        let given = bin.join("foot");
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", FIND, "sh"])
+            .args(&names)
+            .arg(&given)
+            .arg(bin.join("missing"))
+            .env("PATH", bin)
+            .output()
+            .unwrap();
+        let found = found(&out.stdout);
+        assert_eq!(found.get("nvim"), Some(&bin.join("nvim")));
+        assert_eq!(found.get("code"), None);
+        assert_eq!(found.get(given.to_str().unwrap()), Some(&given));
+        let setting = Setting {
+            editor: Some("nvim".into()),
+            found: Some(found),
+            ..Default::default()
+        };
+        let plan = plan(&setting, Path::new(FILE)).unwrap();
+        assert_eq!(said(&plan)[0], "foot");
+        assert!(said(&plan).iter().any(|word| word == "nvim"));
+    }
+
+    /// Inside the Flatpak: the computer's setting, and a file both see.
+    #[test]
+    #[ignore = "needs the Flatpak"]
+    fn from_the_flatpak_the_editor_is_the_computers() {
+        assert!(host::sandboxed());
+        let setting = Setting::on_host().expect("the computer's setting");
+        assert!(setting.find("sh").is_some_and(|sh| sh.is_absolute()));
+        let file = write(&folder(), "from the sandbox").unwrap();
+        let plan = plan(&setting, &file).expect("an editor");
+        eprintln!("would edit with {}: {:?}", plan.name, plan.command);
+        let appended = host::script(r#"printf ' and back' >>"$1""#, &[file.as_os_str()]);
+        assert!(appended.is_some());
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(text, "from the sandbox\n and back");
+        forget(&file, None);
     }
 }

@@ -1,5 +1,7 @@
 //! The private socket between the daemon and its clients: one JSON line each way.
 
+pub mod host;
+
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -232,6 +234,21 @@ pub fn program(name: &str) -> PathBuf {
         .filter(|path| path.exists())
         .unwrap_or_else(|| name.into())
 }
+
+/// Where the service keeps its own log, one file a day, where no journal keeps it: in the
+/// Flatpak, which systemd does not start. Named [`LOG_NAME`] with the day, as `2026-11-27`.
+pub fn log_folder() -> Option<PathBuf> {
+    let state = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|state| state.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
+        })?;
+    Some(state.join("tern/log"))
+}
+
+/// The start of the name of each day's log: `ternd-2026-11-27.log`.
+pub const LOG_NAME: &str = "ternd-";
 
 /// What lasts until the user logs out, for all of these programs.
 pub fn runtime_folder() -> io::Result<PathBuf> {
