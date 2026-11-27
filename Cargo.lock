@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "calling"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "base64 0.22.1",
  "chatsvc",
@@ -509,7 +509,7 @@ dependencies = [
 
 [[package]]
 name = "chatsvc"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1828,7 +1828,7 @@ dependencies = [
 
 [[package]]
 name = "graph"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -4379,7 +4379,7 @@ dependencies = [
 
 [[package]]
 name = "session"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
@@ -4550,7 +4550,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "store"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "chrono",
  "directories",
@@ -4702,7 +4702,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "teams-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "base64 0.22.1",
  "chatsvc",
@@ -4759,7 +4759,7 @@ dependencies = [
 
 [[package]]
 name = "tern"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "chrono",
  "emojis",
@@ -4781,7 +4781,7 @@ dependencies = [
 
 [[package]]
 name = "tern-auth"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "base64 0.22.1",
  "oo7",
@@ -4799,7 +4799,7 @@ dependencies = [
 
 [[package]]
 name = "tern-call"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "calling",
  "chatsvc",
@@ -4813,7 +4813,7 @@ dependencies = [
 
 [[package]]
 name = "tern-cli"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "chatsvc",
  "chrono",
@@ -4831,7 +4831,7 @@ dependencies = [
 
 [[package]]
 name = "tern-engine"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "chatsvc",
  "chrono",
@@ -4852,7 +4852,7 @@ dependencies = [
 
 [[package]]
 name = "tern-ipc"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -4861,7 +4861,7 @@ dependencies = [
 
 [[package]]
 name = "tern-login"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "gtk4",
  "libadwaita",
@@ -4872,7 +4872,7 @@ dependencies = [
 
 [[package]]
 name = "tern-presence"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "futures-util",
  "thiserror 2.0.21",
@@ -4885,7 +4885,7 @@ dependencies = [
 
 [[package]]
 name = "ternd"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "base64 0.22.1",
  "chatsvc",
